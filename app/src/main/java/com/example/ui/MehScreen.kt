@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
@@ -45,6 +44,7 @@ import com.example.ui.theme.ObsidianSurfaceElevated
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.VazirmatnFontFamily
 
 @Composable
 fun MehScreen(
@@ -129,10 +129,9 @@ fun MehScreen(
 
                         Text(
                             text = stageText,
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Bold
-                            ),
+                            fontFamily = VazirmatnFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
                             color = when {
                                 isConnected -> CyberEmerald
                                 isBusy -> AmberScan
@@ -146,7 +145,9 @@ fun MehScreen(
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 text = "${uiState.selectedServer.flagEmoji} ${uiState.selectedServer.countryNameFa}",
-                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = VazirmatnFontFamily,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp,
                                 color = TextPrimary,
                                 textAlign = TextAlign.Center,
                                 maxLines = 1

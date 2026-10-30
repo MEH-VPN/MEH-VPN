@@ -91,7 +91,12 @@ object V2RayParser {
         GeoLocationInfo("SG", "سنگاپور", "🇸🇬", 1.3521f, 103.8198f)
     )
 
-    fun parseSubscriptionPayload(payload: String, sourceRepo: String, maxLimit: Int = 25): List<V2RayConfig> {
+    fun parseSubscriptionPayload(
+        payload: String,
+        sourceRepo: String,
+        maxLimit: Int = 45,
+        filterPredicate: (V2RayConfig) -> Boolean = { true }
+    ): List<V2RayConfig> {
         val trimmed = payload.trim()
         if (trimmed.isEmpty()) return emptyList()
 
@@ -109,8 +114,8 @@ object V2RayParser {
             val line = rawLine.trim()
             if (line.isEmpty() || line.startsWith("#") || line.startsWith("//")) continue
             val parsed = parseSingleUri(line, sourceRepo) ?: continue
-            if (isValidHostAndPort(parsed.address, parsed.port)) {
-                val key = "${parsed.protocol}:${parsed.address.lowercase()}:${parsed.port}"
+            if (isValidHostAndPort(parsed.address, parsed.port) && filterPredicate(parsed)) {
+                val key = "${parsed.protocol}:${parsed.address.lowercase()}:${parsed.port}:${parsed.uuidOrPassword}"
                 if (seenKeys.add(key)) {
                     results.add(parsed)
                 }

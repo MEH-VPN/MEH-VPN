@@ -9,9 +9,10 @@ import androidx.compose.ui.unit.sp
 import com.example.R
 
 val VazirmatnFontFamily = FontFamily(
-    Font(R.font.vazirmatn, FontWeight.Normal),
-    Font(R.font.vazirmatn, FontWeight.Medium),
-    Font(R.font.vazirmatn, FontWeight.Bold)
+    Font(R.font.vazirmatn_regular, FontWeight.Normal),
+    Font(R.font.vazirmatn_medium, FontWeight.Medium),
+    Font(R.font.vazirmatn_bold, FontWeight.SemiBold),
+    Font(R.font.vazirmatn_bold, FontWeight.Bold)
 )
 
 val Typography = Typography(
@@ -36,8 +37,8 @@ val Typography = Typography(
     titleMedium = TextStyle(
         fontFamily = VazirmatnFontFamily,
         fontWeight = FontWeight.Medium,
-        fontSize = 15.sp,
-        lineHeight = 22.sp
+        fontSize = 16.sp,
+        lineHeight = 24.sp
     ),
     bodyLarge = TextStyle(
         fontFamily = VazirmatnFontFamily,
