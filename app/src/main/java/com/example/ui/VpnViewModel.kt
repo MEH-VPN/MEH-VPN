@@ -1,17 +1,19 @@
 package com.example.ui
 
-import android.app.Application
-import android.content.Context
-import android.content.Intent
-import android.os.Build
-import androidx.lifecycle.AndroidViewModel
+import android.content.SharedPreferences
+import android.os.Bundle
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.GitHubSubscriptionAggregator
+import com.example.data.MehFirebaseRepository
 import com.example.data.V2RayParser
 import com.example.model.ConnectionStage
 import com.example.model.V2RayConfig
-import com.example.vpn.MehVpnService
 import com.example.vpn.VpnStateBus
+import com.google.firebase.Firebase
+import com.google.firebase.analytics.FirebaseAnalytics
+import com.google.firebase.analytics.analytics
+import com.google.firebase.auth.auth
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,27 +27,27 @@ data class VpnUiState(
     val selectedServer: V2RayConfig? = null
 )
 
-class VpnViewModel(application: Application) : AndroidViewModel(application) {
+class VpnViewModel(
+    private val repository: MehFirebaseRepository,
+    private val prefs: SharedPreferences,
+    private val analytics: FirebaseAnalytics = Firebase.analytics
+) : ViewModel() {
 
-    private val prefs = application.getSharedPreferences("meh_fast_prefs", Context.MODE_PRIVATE)
     private val aggregator = GitHubSubscriptionAggregator()
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState.asStateFlow()
 
     private var scanJob: Job? = null
 
-    companion object {
-        private const val KEY_LAST_BEST_URI = "last_best_uri"
-        private const val KEY_LAST_BEST_SOURCE = "last_best_source"
-    }
-
     init {
+        logAnalyticsEvent("meh_app_opened")
         observeVpnRuntimeBus()
     }
 
     private fun observeVpnRuntimeBus() {
         viewModelScope.launch {
             VpnStateBus.runtimeStats.collect { runtime ->
+                val previousStage = _uiState.value.stage
                 _uiState.update { current ->
                     val resolvedStage = when {
                         runtime.stage == ConnectionStage.CONNECTED -> ConnectionStage.CONNECTED
@@ -59,6 +61,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         selectedServer = runtime.activeConfig ?: current.selectedServer
                     )
                 }
+
+                if (runtime.stage == ConnectionStage.CONNECTED && previousStage != ConnectionStage.CONNECTED) {
+                    val cfg = runtime.activeConfig ?: _uiState.value.selectedServer
+                    logAnalyticsEvent("meh_vpn_connected") {
+                        putString("country", cfg?.countryNameFa?.substringBefore("•")?.trim() ?: "unknown")
+                        putString("protocol", cfg?.protocol?.name ?: "unknown")
+                        putLong("ping_ms", (cfg?.pingMs ?: 0).toLong())
+                    }
+                }
             }
         }
     }
@@ -66,6 +77,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun findBestServerAndConnect(onReadyToStartService: (V2RayConfig) -> Unit) {
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
+            logAnalyticsEvent("meh_connect_clicked")
+
             // Stage 1: دریافت کانفیگ (Fetching configs from GitHub)
             _uiState.update { it.copy(stage = ConnectionStage.FETCHING_SUBSCRIPTIONS) }
             val configs = aggregator.fetchAllGitHubConfigs()
@@ -79,11 +92,27 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val resolvedBest = bestServer ?: run {
                 val cachedUri = prefs.getString(KEY_LAST_BEST_URI, null)
                 val cachedSource = prefs.getString(KEY_LAST_BEST_SOURCE, "SoliSpirit/v2ray-configs") ?: "GitHub"
-                if (!cachedUri.isNullOrBlank()) V2RayParser.parseSingleUri(cachedUri, cachedSource) else null
+                if (!cachedUri.isNullOrBlank()) {
+                    V2RayParser.parseSingleUri(cachedUri, cachedSource)
+                } else {
+                    null
+                }
             }
 
             if (resolvedBest != null) {
                 cacheBestServer(resolvedBest)
+                val countryOnly = resolvedBest.countryNameFa.substringBefore("•").trim()
+                if (Firebase.auth.currentUser != null) {
+                    viewModelScope.launch {
+                        repository.saveConnectionLog(
+                            countryNameFa = countryOnly,
+                            flagEmoji = resolvedBest.flagEmoji,
+                            rawUri = resolvedBest.rawUri,
+                            sourceRepo = resolvedBest.sourceRepo,
+                            pingMs = resolvedBest.pingMs.toLong()
+                        )
+                    }
+                }
                 // Stage 3: در حال اتصال (Connecting to best server)
                 _uiState.update {
                     it.copy(
@@ -93,6 +122,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 onReadyToStartService(resolvedBest)
             } else {
+                logAnalyticsEvent("meh_connect_failed")
                 _uiState.update { it.copy(stage = ConnectionStage.DISCONNECTED) }
             }
         }
@@ -105,30 +135,22 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             .apply()
     }
 
-    fun startVpnTunnelService(config: V2RayConfig) {
-        val app = getApplication<Application>()
-        val intent = Intent(app, MehVpnService::class.java).apply {
-            action = MehVpnService.ACTION_CONNECT
-            putExtra(MehVpnService.EXTRA_CONFIG_URI, config.rawUri)
-            putExtra(MehVpnService.EXTRA_SOURCE_REPO, config.sourceRepo)
-            putExtra(MehVpnService.EXTRA_INITIAL_PING, config.pingMs)
-        }
+    fun cancelScanAndReset() {
+        scanJob?.cancel()
+        logAnalyticsEvent("meh_vpn_disconnected")
+        VpnStateBus.resetDisconnected()
+    }
+
+    private fun logAnalyticsEvent(name: String, block: (Bundle.() -> Unit)? = null) {
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                app.startForegroundService(intent)
-            } else {
-                app.startService(intent)
-            }
+            val bundle = Bundle()
+            block?.invoke(bundle)
+            analytics.logEvent(name, bundle)
         }
     }
 
-    fun disconnectVpnTunnel() {
-        scanJob?.cancel()
-        val app = getApplication<Application>()
-        val intent = Intent(app, MehVpnService::class.java).apply {
-            action = MehVpnService.ACTION_DISCONNECT
-        }
-        runCatching { app.startService(intent) }
-        VpnStateBus.resetDisconnected()
+    private companion object {
+        const val KEY_LAST_BEST_URI = "last_best_uri"
+        const val KEY_LAST_BEST_SOURCE = "last_best_source"
     }
 }
