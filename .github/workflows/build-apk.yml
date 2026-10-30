@@ -13,7 +13,11 @@ permissions:
 jobs:
   build:
     name: Build debug APK
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: ubuntu-latest is migrating to Ubuntu 26 and its
+    # preinstalled sdkmanager broke the setup-android step in run #1.
+    # 24.04 already ships the Android SDK, so no setup-android step
+    # is needed at all.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -25,8 +29,10 @@ jobs:
           java-version: "17"
           distribution: temurin
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # No android-actions/setup-android step: on ubuntu-24.04 the
+      # Android SDK is preinstalled at $ANDROID_HOME, and v3 of that
+      # action fails here trying to install the obsolete "tools"
+      # package (sdkmanager exit code 1, run #1).
 
       # The repo has gradle/wrapper/gradle-wrapper.properties but no
       # gradlew script, so use the matching Gradle version directly
