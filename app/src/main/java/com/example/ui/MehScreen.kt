@@ -89,68 +89,83 @@ fun MehScreen(
                     .windowInsetsPadding(WindowInsets.safeDrawing),
                 contentAlignment = Alignment.Center
             ) {
-                val interactionSource = remember { MutableInteractionSource() }
-
-                // Single Central Circle with Power On/Off Icon and Stage Text Inside
-                Box(
-                    modifier = Modifier
-                        .size(210.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (isConnected) CyberEmerald.copy(alpha = 0.12f)
-                            else ObsidianSurfaceElevated
-                        )
-                        .border(
-                            width = if (isConnected) 3.dp else 2.dp,
-                            color = ringColor,
-                            shape = CircleShape
-                        )
-                        .clickable(
-                            interactionSource = interactionSource,
-                            indication = ripple(bounded = true, color = ringColor),
-                            onClick = onOneTapConnectToggle
-                        )
-                        .padding(16.dp)
-                        .testTag("one_tap_connect_button"),
-                    contentAlignment = Alignment.Center
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
+                    val interactionSource = remember { MutableInteractionSource() }
+
+                    // Central Circle with ONLY Power On/Off Icon and Connection Stage Inside
+                    Box(
+                        modifier = Modifier
+                            .size(200.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (isConnected) CyberEmerald.copy(alpha = 0.12f)
+                                else ObsidianSurfaceElevated
+                            )
+                            .border(
+                                width = if (isConnected) 3.dp else 2.dp,
+                                color = ringColor,
+                                shape = CircleShape
+                            )
+                            .clickable(
+                                interactionSource = interactionSource,
+                                indication = ripple(bounded = true, color = ringColor),
+                                onClick = onOneTapConnectToggle
+                            )
+                            .padding(16.dp)
+                            .testTag("one_tap_connect_button"),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            painter = painterResource(id = R.drawable.ic_power),
-                            contentDescription = stageText,
-                            tint = iconTint,
-                            modifier = Modifier.size(64.dp)
-                        )
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_power),
+                                contentDescription = stageText,
+                                tint = iconTint,
+                                modifier = Modifier.size(64.dp)
+                            )
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                            Spacer(modifier = Modifier.height(14.dp))
 
-                        Text(
-                            text = stageText,
-                            fontFamily = VazirmatnFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 17.sp,
-                            color = when {
-                                isConnected -> CyberEmerald
-                                isBusy -> AmberScan
-                                else -> TextSecondary
-                            },
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.testTag("connection_status_title")
-                        )
-
-                        if (isConnected && uiState.selectedServer != null) {
-                            Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "${uiState.selectedServer.flagEmoji} ${uiState.selectedServer.countryNameFa}",
+                                text = stageText,
                                 fontFamily = VazirmatnFontFamily,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 17.sp,
+                                color = when {
+                                    isConnected -> CyberEmerald
+                                    isBusy -> AmberScan
+                                    else -> TextSecondary
+                                },
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.testTag("connection_status_title")
+                            )
+                        }
+                    }
+
+                    // Outside the circle: show ONLY Flag Emoji and Country Name when connected
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Box(
+                        modifier = Modifier.height(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (isConnected && uiState.selectedServer != null) {
+                            val countryOnly = uiState.selectedServer.countryNameFa
+                                .substringBefore("•")
+                                .trim()
+                            Text(
+                                text = "${uiState.selectedServer.flagEmoji} $countryOnly",
+                                fontFamily = VazirmatnFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp,
                                 color = TextPrimary,
                                 textAlign = TextAlign.Center,
-                                maxLines = 1
+                                modifier = Modifier.testTag("connected_country_label")
                             )
                         }
                     }

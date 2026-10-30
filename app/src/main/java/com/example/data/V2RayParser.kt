@@ -18,31 +18,31 @@ object V2RayParser {
     private val knownGeoLocations = listOf(
         RegionRule(
             listOf("germany", "deutschland", "frankfurt", "falkenstein", "nuremberg", "berlin", "de-", "_de", "🇩🇪", " de "),
-            GeoLocationInfo("DE", "آلمان • فرانکفورت", "🇩🇪", 50.1109f, 8.6821f)
+            GeoLocationInfo("DE", "آلمان", "🇩🇪", 50.1109f, 8.6821f)
         ),
         RegionRule(
             listOf("netherlands", "amsterdam", "holland", "rotterdam", "nl-", "_nl", "🇳🇱", " nl "),
-            GeoLocationInfo("NL", "هلند • آمستردام", "🇳🇱", 52.3676f, 4.9041f)
+            GeoLocationInfo("NL", "هلند", "🇳🇱", 52.3676f, 4.9041f)
         ),
         RegionRule(
             listOf("finland", "helsinki", "fi-", "_fi", "🇫🇮", " fi "),
-            GeoLocationInfo("FI", "فنلاند • هلسینکی", "🇫🇮", 60.1699f, 24.9384f)
+            GeoLocationInfo("FI", "فنلاند", "🇫🇮", 60.1699f, 24.9384f)
         ),
         RegionRule(
             listOf("united states", "usa", "us-", "_us", "new york", "los angeles", "dallas", "seattle", "ashburn", "🇺🇸", " us "),
-            GeoLocationInfo("US", "آمریکا • نیویورک", "🇺🇸", 40.7128f, -74.0060f)
+            GeoLocationInfo("US", "آمریکا", "🇺🇸", 40.7128f, -74.0060f)
         ),
         RegionRule(
             listOf("united kingdom", "uk-", "_uk", "london", "england", "britain", "manchester", "🇬🇧", " gb ", " uk "),
-            GeoLocationInfo("GB", "انگلیس • لندن", "🇬🇧", 51.5072f, -0.1276f)
+            GeoLocationInfo("GB", "انگلیس", "🇬🇧", 51.5072f, -0.1276f)
         ),
         RegionRule(
             listOf("france", "paris", "strasbourg", "marseille", "fr-", "_fr", "🇫🇷", " fr "),
-            GeoLocationInfo("FR", "فرانسه • پاریس", "🇫🇷", 48.8566f, 2.3522f)
+            GeoLocationInfo("FR", "فرانسه", "🇫🇷", 48.8566f, 2.3522f)
         ),
         RegionRule(
             listOf("turkey", "istanbul", "ankara", "izmir", "tr-", "_tr", "🇹🇷", " tr "),
-            GeoLocationInfo("TR", "ترکیه • استانبول", "🇹🇷", 41.0082f, 28.9784f)
+            GeoLocationInfo("TR", "ترکیه", "🇹🇷", 41.0082f, 28.9784f)
         ),
         RegionRule(
             listOf("singapore", "sg-", "_sg", "🇸🇬", " sg "),
@@ -50,44 +50,44 @@ object V2RayParser {
         ),
         RegionRule(
             listOf("japan", "tokyo", "osaka", "jp-", "_jp", "🇯🇵", " jp "),
-            GeoLocationInfo("JP", "ژاپن • توکیو", "🇯🇵", 35.6762f, 139.6503f)
+            GeoLocationInfo("JP", "ژاپن", "🇯🇵", 35.6762f, 139.6503f)
         ),
         RegionRule(
             listOf("sweden", "stockholm", "se-", "_se", "🇸🇪", " se "),
-            GeoLocationInfo("SE", "سوئد • استکهلم", "🇸🇪", 59.3293f, 18.0686f)
+            GeoLocationInfo("SE", "سوئد", "🇸🇪", 59.3293f, 18.0686f)
         ),
         RegionRule(
             listOf("switzerland", "zurich", "geneva", "ch-", "_ch", "🇨🇭", " ch "),
-            GeoLocationInfo("CH", "سوئیس • زوریخ", "🇨🇭", 47.3769f, 8.5417f)
+            GeoLocationInfo("CH", "سوئیس", "🇨🇭", 47.3769f, 8.5417f)
         ),
         RegionRule(
             listOf("canada", "toronto", "montreal", "vancouver", "ca-", "_ca", "🇨🇦", " ca "),
-            GeoLocationInfo("CA", "کانادا • تورنتو", "🇨🇦", 43.6532f, -79.3832f)
+            GeoLocationInfo("CA", "کانادا", "🇨🇦", 43.6532f, -79.3832f)
         ),
         RegionRule(
             listOf("poland", "warsaw", "pl-", "_pl", "🇵🇱", " pl "),
-            GeoLocationInfo("PL", "لهستان • ورشو", "🇵🇱", 52.2297f, 21.0122f)
+            GeoLocationInfo("PL", "لهستان", "🇵🇱", 52.2297f, 21.0122f)
         ),
         RegionRule(
             listOf("austria", "vienna", "at-", "_at", "🇦🇹", " at "),
-            GeoLocationInfo("AT", "اتریش • وین", "🇦🇹", 48.2082f, 16.3738f)
+            GeoLocationInfo("AT", "اتریش", "🇦🇹", 48.2082f, 16.3738f)
         ),
         RegionRule(
             listOf("uae", "dubai", "emirates", "ae-", "_ae", "🇦🇪", " ae "),
-            GeoLocationInfo("AE", "امارات • دبی", "🇦🇪", 25.2048f, 55.2708f)
+            GeoLocationInfo("AE", "امارات", "🇦🇪", 25.2048f, 55.2708f)
         )
     )
 
     private val fallbackGeoPool = listOf(
-        GeoLocationInfo("DE", "آلمان • فرانکفورت", "🇩🇪", 50.1109f, 8.6821f),
-        GeoLocationInfo("NL", "هلند • آمستردام", "🇳🇱", 52.3676f, 4.9041f),
-        GeoLocationInfo("FI", "فنلاند • هلسینکی", "🇫🇮", 60.1699f, 24.9384f),
-        GeoLocationInfo("FR", "فرانسه • پاریس", "🇫🇷", 48.8566f, 2.3522f),
-        GeoLocationInfo("GB", "انگلیس • لندن", "🇬🇧", 51.5072f, -0.1276f),
-        GeoLocationInfo("SE", "سوئد • استکهلم", "🇸🇪", 59.3293f, 18.0686f),
-        GeoLocationInfo("CH", "سوئیس • زوریخ", "🇨🇭", 47.3769f, 8.5417f),
-        GeoLocationInfo("TR", "ترکیه • استانبول", "🇹🇷", 41.0082f, 28.9784f),
-        GeoLocationInfo("US", "آمریکا • نیویورک", "🇺🇸", 40.7128f, -74.0060f),
+        GeoLocationInfo("DE", "آلمان", "🇩🇪", 50.1109f, 8.6821f),
+        GeoLocationInfo("NL", "هلند", "🇳🇱", 52.3676f, 4.9041f),
+        GeoLocationInfo("FI", "فنلاند", "🇫🇮", 60.1699f, 24.9384f),
+        GeoLocationInfo("FR", "فرانسه", "🇫🇷", 48.8566f, 2.3522f),
+        GeoLocationInfo("GB", "انگلیس", "🇬🇧", 51.5072f, -0.1276f),
+        GeoLocationInfo("SE", "سوئد", "🇸🇪", 59.3293f, 18.0686f),
+        GeoLocationInfo("CH", "سوئیس", "🇨🇭", 47.3769f, 8.5417f),
+        GeoLocationInfo("TR", "ترکیه", "🇹🇷", 41.0082f, 28.9784f),
+        GeoLocationInfo("US", "آمریکا", "🇺🇸", 40.7128f, -74.0060f),
         GeoLocationInfo("SG", "سنگاپور", "🇸🇬", 1.3521f, 103.8198f)
     )
 
