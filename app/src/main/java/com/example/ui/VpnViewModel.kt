@@ -1,19 +1,21 @@
 package com.example.ui
 
-import android.content.SharedPreferences
+import android.app.Application
+import android.content.Context
 import android.os.Bundle
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.R
 import com.example.data.GitHubSubscriptionAggregator
 import com.example.data.MehFirebaseRepository
 import com.example.data.V2RayParser
 import com.example.model.ConnectionStage
 import com.example.model.V2RayConfig
 import com.example.vpn.VpnStateBus
-import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.analytics.FirebaseAnalytics
-import com.google.firebase.analytics.analytics
-import com.google.firebase.auth.auth
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,12 +29,9 @@ data class VpnUiState(
     val selectedServer: V2RayConfig? = null
 )
 
-class VpnViewModel(
-    private val repository: MehFirebaseRepository,
-    private val prefs: SharedPreferences,
-    private val analytics: FirebaseAnalytics = Firebase.analytics
-) : ViewModel() {
+class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val prefs = application.getSharedPreferences("meh_fast_prefs", Context.MODE_PRIVATE)
     private val aggregator = GitHubSubscriptionAggregator()
     private val _uiState = MutableStateFlow(VpnUiState())
     val uiState: StateFlow<VpnUiState> = _uiState.asStateFlow()
@@ -40,8 +39,18 @@ class VpnViewModel(
     private var scanJob: Job? = null
 
     init {
+        ensureFirebaseInitialized()
         logAnalyticsEvent("meh_app_opened")
         observeVpnRuntimeBus()
+    }
+
+    private fun ensureFirebaseInitialized() {
+        runCatching {
+            val appContext = getApplication<Application>()
+            if (FirebaseApp.getApps(appContext).isEmpty()) {
+                FirebaseApp.initializeApp(appContext)
+            }
+        }
     }
 
     private fun observeVpnRuntimeBus() {
@@ -102,9 +111,18 @@ class VpnViewModel(
             if (resolvedBest != null) {
                 cacheBestServer(resolvedBest)
                 val countryOnly = resolvedBest.countryNameFa.substringBefore("•").trim()
-                if (Firebase.auth.currentUser != null) {
-                    viewModelScope.launch {
-                        repository.saveConnectionLog(
+                logAnalyticsEvent("meh_server_selected") {
+                    putString("country", countryOnly)
+                    putString("source_repo", resolvedBest.sourceRepo)
+                    putLong("ping_ms", resolvedBest.pingMs.toLong())
+                }
+                runCatching {
+                    val app = getApplication<Application>()
+                    ensureFirebaseInitialized()
+                    if (FirebaseAuth.getInstance().currentUser != null) {
+                        val databaseId = app.getString(R.string.firestore_database_id)
+                        val db = FirebaseFirestore.getInstance(databaseId)
+                        MehFirebaseRepository(db).saveConnectionLog(
                             countryNameFa = countryOnly,
                             flagEmoji = resolvedBest.flagEmoji,
                             rawUri = resolvedBest.rawUri,
@@ -143,9 +161,11 @@ class VpnViewModel(
 
     private fun logAnalyticsEvent(name: String, block: (Bundle.() -> Unit)? = null) {
         runCatching {
+            val appContext = getApplication<Application>()
+            ensureFirebaseInitialized()
             val bundle = Bundle()
             block?.invoke(bundle)
-            analytics.logEvent(name, bundle)
+            FirebaseAnalytics.getInstance(appContext).logEvent(name, bundle)
         }
     }
 

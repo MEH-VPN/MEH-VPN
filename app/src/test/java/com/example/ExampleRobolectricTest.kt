@@ -9,6 +9,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
@@ -36,5 +37,11 @@ class ExampleRobolectricTest {
         val coreJson = parsed.toV2RayCoreJson()
         assertTrue(coreJson.contains("\"protocol\": \"vless\""))
         assertTrue(coreJson.contains("\"address\": \"1.1.1.1\""))
+    }
+
+    @Test
+    fun `mainActivity launches without crashing`() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        assertNotNull(controller.get())
     }
 }

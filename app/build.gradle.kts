@@ -15,7 +15,7 @@ android {
 
   defaultConfig {
     applicationId = "com.aistudio.v2pulsevpn.qrxm"
-    minSdk = 26
+    minSdk = 23
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"

@@ -1,6 +1,5 @@
 package com.example
 
-import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -12,44 +11,29 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.lifecycle.viewmodel.initializer
-import androidx.lifecycle.viewmodel.viewModelFactory
-import com.example.data.MehFirebaseRepository
 import com.example.model.ConnectionStage
 import com.example.model.V2RayConfig
 import com.example.ui.MehScreen
 import com.example.ui.VpnViewModel
 import com.example.ui.theme.MyApplicationTheme
 import com.example.vpn.MehVpnService
-import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.FirebaseApp
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        runCatching {
+            if (FirebaseApp.getApps(this).isEmpty()) {
+                FirebaseApp.initializeApp(this)
+            }
+        }
         enableEdgeToEdge()
         setContent {
             MyApplicationTheme {
                 val context = LocalContext.current
-                val vpnViewModel: VpnViewModel = viewModel(
-                    factory = viewModelFactory {
-                        initializer {
-                            val app = checkNotNull(this[APPLICATION_KEY]) {
-                                "APPLICATION_KEY missing from CreationExtras"
-                            }
-                            val databaseId = app.getString(R.string.firestore_database_id)
-                            val db = FirebaseFirestore.getInstance(databaseId)
-                            val prefs = app.getSharedPreferences("meh_fast_prefs", Context.MODE_PRIVATE)
-                            VpnViewModel(
-                                repository = MehFirebaseRepository(db),
-                                prefs = prefs
-                            )
-                        }
-                    }
-                )
-
+                val vpnViewModel: VpnViewModel = viewModel()
                 val uiState by vpnViewModel.uiState.collectAsStateWithLifecycle()
 
                 val startVpnService: (V2RayConfig) -> Unit = { config ->
