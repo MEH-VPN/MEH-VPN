@@ -154,7 +154,7 @@ class MehVpnService : VpnService() {
         )
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_power)
             .setContentTitle("مه (MEH) • متصل به ${config.flagEmoji} ${config.countryNameFa}")
             .setContentText("تونل فعال ${config.protocol.label} (${config.network.uppercase()})")
             .setContentIntent(pendingOpen)
