@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer glowing shield silhouette inside 66dp safe zone (21..87) -->
+    <path
+        android:fillColor="#FF00F5D4"
+        android:pathData="M54,24L30,34.5V52.5C30,68.2 40.2,82.8 54,87C67.8,82.8 78,68.2 78,52.5V34.5L54,24ZM54,30.6L72,38.5V52.5C72,65.1 64.3,76.8 54,80.7C43.7,76.8 36,65.1 36,52.5V38.5L54,30.6Z" />
+    <!-- Bold central lightning/pulse bolt -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M56.5,36L41,55.5H52.5L49.5,73L67,51.5H55L56.5,36Z" />
+</vector>

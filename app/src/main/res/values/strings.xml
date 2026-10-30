@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">MEH</string>
+    <string name="app_name_fa">مه</string>
+    <string name="status_off">خاموش</string>
+    <string name="status_fetching">دریافت کانفیگ...</string>
+    <string name="status_testing">تست کانفیگ...</string>
+    <string name="status_connecting">در حال اتصال...</string>
+    <string name="status_connected">متصل</string>
+</resources>

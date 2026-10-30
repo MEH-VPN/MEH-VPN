@@ -1,0 +1,6 @@
+{
+  "name": "MEH",
+  "description": "فیلترشکن سبک و پرسرعت مه (MEH) بر پایه V2Ray با اتصال تک‌کلیدی و دریافت خودکار بهترین سرور از گیت‌هاب.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
