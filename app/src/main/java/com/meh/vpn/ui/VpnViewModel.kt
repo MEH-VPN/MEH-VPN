@@ -23,6 +23,9 @@ import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -174,53 +177,72 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 val totalToTest = candidateQueue.size.coerceIn(1, MAX_TOTAL_TESTS)
 
                 var verifiedBest: V2RayConfig? = null
+                var testedSoFar = 0
 
-                for ((zeroIdx, candidate) in candidateQueue.withIndex()) {
+                for (batch in candidateQueue.chunked(3)) {
                     ensureActive()
                     if (scanSessionId.get() != sessionId) return@launch
 
-                    val testNumber = zeroIdx + 1
-                    val pct = (22 + (testNumber * 76) / totalToTest).coerceIn(24, 98)
-                    val stageForCandidate = when (candidate.protocol) {
+                    val leadCandidate = batch.first()
+                    val nextTestedCount = (testedSoFar + batch.size).coerceAtMost(totalToTest)
+                    val pct = (22 + (nextTestedCount * 76) / totalToTest).coerceIn(24, 98)
+                    val stageForCandidate = when (leadCandidate.protocol) {
                         V2RayProtocol.AETHER -> ConnectionStage.AETHER_FALLBACK
                         V2RayProtocol.SERVERLESS -> ConnectionStage.SERVERLESS_FALLBACK
                         V2RayProtocol.SNI_SPOOF -> ConnectionStage.SNI_SPOOF_FALLBACK
                         else -> ConnectionStage.TESTING_SERVERS
                     }
-                    val countryOnly = candidate.countryNameFa.substringBefore("•").trim()
-                    val methodName = when (candidate.protocol) {
+                    val countryOnly = leadCandidate.countryNameFa.substringBefore("•").trim()
+                    val methodName = when (leadCandidate.protocol) {
                         V2RayProtocol.AETHER -> "Aether"
                         V2RayProtocol.SERVERLESS -> "Serverless"
                         V2RayProtocol.SNI_SPOOF -> "SNI-Spoof"
-                        else -> candidate.protocol.name
+                        else -> leadCandidate.protocol.name
                     }
 
                     _uiState.update {
                         it.copy(
                             stage = stageForCandidate,
                             progressPercent = pct,
-                            testedCount = testNumber,
+                            testedCount = nextTestedCount,
                             maxTestCount = totalToTest,
                             discoveredCount = configs.size,
-                            scanDetailText = "تست $testNumber از $totalToTest • بررسی ${candidate.flagEmoji} $countryOnly ($methodName)"
+                            scanDetailText = "تست $nextTestedCount از $totalToTest • بررسی ${leadCandidate.flagEmoji} $countryOnly ($methodName)"
                         )
                     }
 
-                    val ping = withContext(Dispatchers.IO) {
-                        V2RayOutboundClient.verifyRealInternetConnectivity(candidate, null, 2000)
-                    }
+                    val verifiedBatch = withContext(Dispatchers.IO) {
+                        coroutineScope {
+                            batch.map { candidate ->
+                                async {
+                                    val ping = V2RayOutboundClient.verifyRealInternetConnectivity(
+                                        config = candidate,
+                                        vpnService = null,
+                                        timeoutMs = 3200
+                                    )
+                                    if (ping in 1..4999) candidate.copy(pingMs = ping) else null
+                                }
+                            }.awaitAll().filterNotNull()
+                        }
+                    }.sortedWith(
+                        compareBy<V2RayConfig> { it.countryCode.equals("TR", ignoreCase = true) }
+                            .thenBy { it.pingMs }
+                    )
 
+                    testedSoFar = nextTestedCount
                     ensureActive()
                     if (scanSessionId.get() != sessionId) return@launch
 
-                    if (ping in 1..4999) {
-                        verifiedBest = candidate.copy(pingMs = ping)
+                    if (verifiedBatch.isNotEmpty()) {
+                        val bestInBatch = verifiedBatch.first()
+                        val bestCountry = bestInBatch.countryNameFa.substringBefore("•").trim()
+                        verifiedBest = bestInBatch
                         _uiState.update {
                             it.copy(
                                 progressPercent = 100,
-                                testedCount = testNumber,
+                                testedCount = testedSoFar,
                                 maxTestCount = totalToTest,
-                                scanDetailText = "پیدا شد: ${candidate.flagEmoji} $countryOnly (${ping}ms)"
+                                scanDetailText = "پیدا شد: ${bestInBatch.flagEmoji} $bestCountry (${bestInBatch.pingMs}ms)"
                             )
                         }
                         break
@@ -289,7 +311,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Builds a bounded queue of at most [maxTests] (15) candidates in strict priority order:
-     * 1. Cached last-working server (if available and not blacklisted)
+     * 1. Cached last-working European server (if available and not blacklisted)
      * 2. Top TCP-reachable GitHub V2Ray configs (VLESS / Trojan)
      * 3. CluvexStudio/Aether gateways
      * 4. patterniha/Serverless-for-Iran candidates
@@ -301,12 +323,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     ): List<V2RayConfig> = withContext(Dispatchers.IO) {
         val queue = mutableListOf<V2RayConfig>()
 
-        // 1. Last working cached server for fast initial reconnection on Irancell
+        // 1. Last working cached server (excluding TR relays) for fast initial reconnection
         val cachedUri = prefs.getString(KEY_LAST_BEST_URI, null)
         val cachedSource = prefs.getString(KEY_LAST_BEST_SOURCE, "SoliSpirit/v2ray-configs") ?: "GitHub"
         if (!cachedUri.isNullOrBlank()) {
             val parsedCached = V2RayParser.parseSingleUri(cachedUri, cachedSource)
-            if (parsedCached != null && !V2RayOutboundClient.isNodeBlacklisted(parsedCached)) {
+            if (parsedCached != null &&
+                !parsedCached.countryCode.equals("TR", ignoreCase = true) &&
+                !V2RayOutboundClient.isNodeBlacklisted(parsedCached)
+            ) {
                 queue.add(parsedCached)
             }
         }
@@ -315,8 +340,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         if (githubConfigs.isNotEmpty()) {
             val tcpRanked = aggregator.rankTopTcpCandidates(
                 configs = githubConfigs,
-                maxCandidates = 9,
-                timeoutMs = 700
+                maxCandidates = 10,
+                timeoutMs = 1100
             )
             for (cfg in tcpRanked) {
                 if (queue.size < 10 && queue.none { it.address == cfg.address && it.port == cfg.port }) {

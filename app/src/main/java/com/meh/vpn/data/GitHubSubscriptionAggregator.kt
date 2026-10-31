@@ -172,14 +172,14 @@ class GitHubSubscriptionAggregator {
     suspend fun rankTopTcpCandidates(
         configs: List<V2RayConfig>,
         maxCandidates: Int = 10,
-        timeoutMs: Int = 700
+        timeoutMs: Int = 1100
     ): List<V2RayConfig> = withContext(Dispatchers.IO) {
         if (configs.isEmpty()) return@withContext emptyList()
 
         val candidatePool = configs.filterNot { V2RayOutboundClient.isNodeBlacklisted(it) }
             .ifEmpty { configs }
 
-        val tcpSemaphore = Semaphore(32)
+        val tcpSemaphore = Semaphore(16)
         val tcpTested = coroutineScope {
             candidatePool.map { config ->
                 async {

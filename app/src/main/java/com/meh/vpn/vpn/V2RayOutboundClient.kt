@@ -103,18 +103,14 @@ object V2RayOutboundClient {
     }
 
     /**
-     * Tests real end-to-end internet & Twitter/X connectivity THROUGH the server by:
-     * 1. Opening a tunnel stream to x.com:443
-     * 2. Completing a full TLS 1.2/1.3 handshake (SSLSocket) and verifying the peer X.509 certificate
-     *    (rejecting MCI/ISP transparent middleboxes or self-signed block pages)
-     * 3. Sending an encrypted HTTP HEAD request and verifying a genuine HTTP/1.1 response from x.com.
-     * This works on both Cloudflare Worker VLESS nodes and VPS nodes, while guaranteeing that neither
-     * broken Turkish relays nor MCI's 2KB Post-Handshake Freeze can produce a false Connected state.
+     * Tests real end-to-end internet connectivity THROUGH the server by opening a real
+     * VLESS/Trojan/Aether/Serverless/SNI-Spoof stream and verifying a fast 1-RTT HTTP 204 response.
+     * Tests cp.cloudflare.com:80 and falls back to connectivitycheck.gstatic.com:80 (for Cloudflare Worker VLESS nodes).
      */
     fun verifyRealInternetConnectivity(
         config: V2RayConfig,
         vpnService: VpnService? = null,
-        timeoutMs: Int = 2400
+        timeoutMs: Int = 3200
     ): Int {
         val isDirectBypass = config.protocol == V2RayProtocol.AETHER ||
             config.protocol == V2RayProtocol.SERVERLESS ||
@@ -136,68 +132,81 @@ object V2RayOutboundClient {
             }
         }
 
-        return try {
-            var validResponse = false
-            val elapsed = measureTimeMillis {
-                openTunnelStream(
-                    config = config,
-                    targetHost = "x.com",
-                    targetPort = 443,
-                    vpnService = vpnService,
-                    connectTimeoutMs = timeoutMs,
-                    isHealthProbe = true
-                ).use { stream ->
-                    val probeSocket = TunnelStreamSocket(stream, timeoutMs)
-                    val sslSocket = sslSocketFactory.createSocket(
-                        probeSocket,
-                        "x.com",
-                        443,
-                        false
-                    ) as SSLSocket
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        runCatching {
-                            val params = sslSocket.sslParameters
-                            params.serverNames = listOf(SNIHostName("x.com"))
-                            sslSocket.sslParameters = params
+        if (config.protocol == V2RayProtocol.AETHER) {
+            return try {
+                var validAether = false
+                val sni = config.sni.ifEmpty { "engage.cloudflareclient.com" }
+                val elapsed = measureTimeMillis {
+                    openAetherGatewayProbeStream(
+                        gatewayHost = config.address,
+                        gatewayPort = config.port,
+                        sniHost = sni,
+                        vpnService = vpnService,
+                        connectTimeoutMs = timeoutMs
+                    ).use { stream ->
+                        val traceReq =
+                            "GET /cdn-cgi/trace HTTP/1.1\r\nHost: $sni\r\nUser-Agent: Aether/1.0\r\nConnection: close\r\n\r\n"
+                        stream.output.write(traceReq.toByteArray(Charsets.US_ASCII))
+                        stream.output.flush()
+                        val buf = ByteArray(512)
+                        val read = stream.input.read(buf)
+                        if (read > 0) {
+                            val resp = String(buf, 0, read, Charsets.US_ASCII)
+                            if (resp.startsWith("HTTP/1.1 ") || resp.contains("colo=")) {
+                                validAether = true
+                            }
                         }
                     }
-                    sslSocket.soTimeout = timeoutMs
-                    sslSocket.startHandshake()
+                }
+                if (validAether) elapsed.toInt().coerceAtLeast(1) else Int.MAX_VALUE
+            } catch (_: Exception) {
+                Int.MAX_VALUE
+            }
+        }
 
-                    // Verify peer certificate is genuinely from x.com / twitter.com (not an ISP middlebox)
-                    val cert = sslSocket.session.peerCertificates.firstOrNull() as? X509Certificate
-                    val certInfo = "${cert?.subjectDN?.name.orEmpty()} ${cert?.issuerDN?.name.orEmpty()}".lowercase()
-                    val certSuspicious = certInfo.contains("peyvandha") ||
-                        certInfo.contains("mci.ir") ||
-                        certInfo.contains("irancell") ||
-                        certInfo.contains("fortinet") ||
-                        certInfo.contains("untangle")
+        val probeHosts = if (isDirectBypass) {
+            listOf("cp.cloudflare.com")
+        } else {
+            listOf("cp.cloudflare.com", "connectivitycheck.gstatic.com")
+        }
 
-                    if (!certSuspicious) {
-                        val req = "HEAD / HTTP/1.1\r\nHost: x.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
-                        val sslOut = sslSocket.outputStream
-                        sslOut.write(req.toByteArray(Charsets.US_ASCII))
-                        sslOut.flush()
+        for (probeHost in probeHosts) {
+            try {
+                var validResponse = false
+                val elapsed = measureTimeMillis {
+                    openTunnelStream(
+                        config = config,
+                        targetHost = probeHost,
+                        targetPort = 80,
+                        vpnService = vpnService,
+                        connectTimeoutMs = timeoutMs,
+                        isHealthProbe = true
+                    ).use { stream ->
+                        val httpProbe =
+                            "GET /generate_204 HTTP/1.1\r\nHost: $probeHost\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n"
+                        stream.output.write(httpProbe.toByteArray(Charsets.US_ASCII))
+                        stream.output.flush()
 
-                        val respBuf = ByteArray(256)
-                        val r = sslSocket.inputStream.read(respBuf)
-                        if (r > 0) {
-                            val headStr = String(respBuf, 0, r, Charsets.US_ASCII)
-                            if ((headStr.startsWith("HTTP/1.1 ") || headStr.startsWith("HTTP/2")) &&
-                                !headStr.contains("10.10.34.") &&
-                                !headStr.contains("peyvandha", ignoreCase = true)
+                        val buffer = ByteArray(256)
+                        val read = stream.input.read(buffer)
+                        if (read > 0) {
+                            val responseHead = String(buffer, 0, read, Charsets.US_ASCII)
+                            if (responseHead.startsWith("HTTP/1.1 204") ||
+                                responseHead.startsWith("HTTP/1.0 204") ||
+                                responseHead.startsWith("HTTP/1.1 200")
                             ) {
                                 validResponse = true
                             }
                         }
                     }
                 }
+                if (validResponse) {
+                    return elapsed.toInt().coerceAtLeast(1)
+                }
+            } catch (_: Exception) {
             }
-            if (validResponse) elapsed.toInt().coerceAtLeast(1) else Int.MAX_VALUE
-        } catch (_: Exception) {
-            Int.MAX_VALUE
         }
+        return Int.MAX_VALUE
     }
 
     internal fun buildTlsClientHelloProbe(sniHost: String): ByteArray {
@@ -358,24 +367,16 @@ object V2RayOutboundClient {
             if (vpnService != null) {
                 vpnService.protect(rawSocket)
             }
-            val serverAddress = if (isIpLiteral(config.address)) {
-                config.address
-            } else {
-                resolveDomainCleanly(config.address, vpnService)
-            }
-            rawSocket.connect(InetSocketAddress(serverAddress, config.port), connectTimeoutMs)
+            rawSocket.connect(InetSocketAddress(config.address, config.port), connectTimeoutMs)
 
             // 1. Wrap with TLS if security == tls
-            // Fragment the outer TLS ClientHello record via AetherFragmentingSocketWrapper so
-            // Hamrah-e-Aval (MCI) DPI cannot inspect the V2Ray server SNI or trigger Post-Handshake Freeze
             val transportSocket: Socket = if (config.tls.equals("tls", ignoreCase = true) || config.port == 443 || config.port == 2053 || config.port == 2083 || config.port == 2087 || config.port == 2096 || config.port == 8443) {
                 if (config.tls.equals("none", ignoreCase = true) && config.port != 443) {
                     rawSocket
                 } else {
                     val sniHost = config.sni.ifEmpty { config.hostHeader.ifEmpty { config.address } }
-                    val fragmentedOuterSocket = AetherFragmentingSocketWrapper(rawSocket)
                     val sslSocket = sslSocketFactory.createSocket(
-                        fragmentedOuterSocket,
+                        rawSocket,
                         sniHost,
                         config.port,
                         true
