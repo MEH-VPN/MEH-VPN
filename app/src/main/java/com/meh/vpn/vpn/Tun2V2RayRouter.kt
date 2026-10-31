@@ -37,9 +37,13 @@ class Tun2V2RayRouter(
     private val dnsIpToDomainCache = ConcurrentHashMap<String, String>()
     private val ipIdCounter = AtomicInteger(1000)
 
-    private var pooledDnsStream: V2RayTunnelStream? = null
-    private var pooledDnsConfig: V2RayConfig? = null
-    private val dnsTunnelLock = Any()
+    /**
+     * Hot-swaps the active tunnel configuration in-place without tearing down the TUN interface.
+     */
+    fun updateConfig(newConfig: V2RayConfig) {
+        if (activeConfig.rawUri == newConfig.rawUri) return
+        activeConfig = newConfig
+    }
 
     fun start(tunFd: FileDescriptor) {
         stop()
@@ -109,7 +113,23 @@ class Tun2V2RayRouter(
         if (payloadLen <= 12) return
 
         val dnsQuery = packet.copyOfRange(payloadOffset, packetLen)
-        val queriedDomain = parseDnsQueryDomain(dnsQuery)
+        val (queriedDomain, qType) = parseDnsQueryDomainAndType(dnsQuery)
+
+        // Block IPv6 (AAAA = 28) and HTTPS/SVCB QUIC hints (TYPE = 65) by returning an immediate
+        // RFC-compliant empty NOERROR response so Android & Twitter/X on Irancell never leak over
+        // censored mobile IPv6 or stall on QUIC/HTTP3.
+        if (qType == 28 || qType == 65) {
+            val emptyNoError = buildEmptyDnsNoErrorResponse(dnsQuery)
+            val udpRespPacket = buildIpv4UdpPacket(
+                srcIp = packet.copyOfRange(16, 20),
+                dstIp = packet.copyOfRange(12, 16),
+                srcPort = dstPort,
+                dstPort = readUInt16(packet, ihl),
+                payload = emptyNoError
+            )
+            writeTunPacket(udpRespPacket)
+            return
+        }
 
         routerScope.launch {
             runCatching {
@@ -131,90 +151,100 @@ class Tun2V2RayRouter(
         }
     }
 
-    private fun executeDnsQuery(dnsQuery: ByteArray): ByteArray? {
-        synchronized(dnsTunnelLock) {
-            for (attempt in 0..1) {
-                try {
-                    val stream = getOrCreateDnsTunnelLocked()
-                    val framedReq = ByteArray(dnsQuery.size + 2)
-                    framedReq[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
-                    framedReq[1] = (dnsQuery.size and 0xFF).toByte()
-                    System.arraycopy(dnsQuery, 0, framedReq, 2, dnsQuery.size)
+    private fun buildEmptyDnsNoErrorResponse(dnsQuery: ByteArray): ByteArray {
+        val resp = dnsQuery.copyOf()
+        if (resp.size >= 12) {
+            // QR=1 (Response), Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=0 (NOERROR)
+            resp[2] = 0x81.toByte()
+            resp[3] = 0x80.toByte()
+            // ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0
+            resp[6] = 0
+            resp[7] = 0
+            resp[8] = 0
+            resp[9] = 0
+            resp[10] = 0
+            resp[11] = 0
+        }
+        return resp
+    }
 
+    private fun executeDnsQuery(dnsQuery: ByteArray): ByteArray? {
+        val framedReq = ByteArray(dnsQuery.size + 2)
+        framedReq[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
+        framedReq[1] = (dnsQuery.size and 0xFF).toByte()
+        System.arraycopy(dnsQuery, 0, framedReq, 2, dnsQuery.size)
+
+        // 1. Try resolving through the active V2Ray tunnel over TCP to 8.8.8.8:53 and 1.1.1.1:53
+        // with strict anti-poisoning verification (rejecting 10.10.34.x on Hamrah-e-Aval)
+        for (dnsHost in listOf("8.8.8.8", "1.1.1.1")) {
+            try {
+                V2RayOutboundClient.openTunnelStream(
+                    config = activeConfig,
+                    targetHost = dnsHost,
+                    targetPort = 53,
+                    vpnService = vpnService,
+                    connectTimeoutMs = 2000,
+                    isHealthProbe = true
+                ).use { stream ->
                     stream.output.write(framedReq)
                     stream.output.flush()
 
                     val hi = stream.input.read()
                     val lo = stream.input.read()
-                    if (hi == -1 || lo == -1) {
-                        closeDnsTunnelLocked()
-                        continue
+                    if (hi != -1 && lo != -1) {
+                        val respLen = (hi shl 8) or lo
+                        if (respLen in 12..4096) {
+                            val dnsResp = ByteArray(respLen)
+                            var total = 0
+                            while (total < respLen) {
+                                val r = stream.input.read(dnsResp, total, respLen - total)
+                                if (r == -1) break
+                                total += r
+                            }
+                            if (total == respLen && !V2RayOutboundClient.containsPoisonedARecord(dnsResp)) {
+                                return dnsResp
+                            }
+                        }
                     }
-                    val respLen = (hi shl 8) or lo
-                    if (respLen !in 12..4096) {
-                        closeDnsTunnelLocked()
-                        continue
-                    }
-
-                    val dnsResp = ByteArray(respLen)
-                    var total = 0
-                    while (total < respLen) {
-                        val r = stream.input.read(dnsResp, total, respLen - total)
-                        if (r == -1) break
-                        total += r
-                    }
-                    if (total == respLen) {
-                        return dnsResp
-                    }
-                    closeDnsTunnelLocked()
-                } catch (_: Exception) {
-                    closeDnsTunnelLocked()
                 }
+            } catch (_: Exception) {
             }
-            return null
         }
-    }
 
-    private fun getOrCreateDnsTunnelLocked(): V2RayTunnelStream {
-        val current = pooledDnsStream
-        if (current != null && pooledDnsConfig == activeConfig) {
-            return current
+        // 2. Resolve via DNS-over-HTTPS (RFC 8484) on port 443 (8.8.8.8:443) INSIDE the tunnel
+        // (essential for Cloudflare Worker VLESS nodes & Hamrah-e-Aval where port 53/853 is blocked)
+        V2RayOutboundClient.executeTunnelDohQuery(activeConfig, dnsQuery, vpnService)?.let {
+            return it
         }
-        closeDnsTunnelLocked()
-        val newStream = V2RayOutboundClient.openTunnelStream(
-            config = activeConfig,
-            targetHost = "1.1.1.1",
-            targetPort = 53,
-            vpnService = vpnService,
-            connectTimeoutMs = 3500
-        )
-        pooledDnsStream = newStream
-        pooledDnsConfig = activeConfig
-        return newStream
+
+        // 3. Fallback to encrypted DNS-over-TLS (1.1.1.1:853 / 8.8.8.8:853) + anti-poisoning check
+        return V2RayOutboundClient.executeCleanDnsQueryRaw(dnsQuery, vpnService)
     }
 
-    private fun closeDnsTunnelLocked() {
-        runCatching { pooledDnsStream?.close() }
-        pooledDnsStream = null
-        pooledDnsConfig = null
-    }
-
-    private fun parseDnsQueryDomain(dnsBytes: ByteArray): String? {
+    private fun parseDnsQueryDomainAndType(dnsBytes: ByteArray): Pair<String?, Int> {
         return try {
             var pos = 12
             val labels = mutableListOf<String>()
             while (pos < dnsBytes.size) {
                 val len = dnsBytes[pos].toInt() and 0xFF
-                if (len == 0) break
-                if ((len and 0xC0) != 0) break
+                if (len == 0) {
+                    pos++
+                    break
+                }
+                if ((len and 0xC0) != 0) {
+                    pos += 2
+                    break
+                }
                 pos++
-                if (pos + len > dnsBytes.size) return null
+                if (pos + len > dnsBytes.size) return null to -1
                 labels.add(String(dnsBytes, pos, len, Charsets.US_ASCII))
                 pos += len
             }
-            if (labels.isEmpty()) null else labels.joinToString(".").lowercase()
+            val qType = if (pos + 2 <= dnsBytes.size) readUInt16(dnsBytes, pos) else -1
+            val domain = if (labels.isEmpty()) null else labels.joinToString(".").lowercase()
+            domain to qType
         } catch (_: Exception) {
-            null
+            null to -1
         }
     }
 
@@ -242,7 +272,9 @@ class Tun2V2RayRouter(
                 if (rType == 1 && rdLen == 4 && pos + 4 <= dnsResp.size) {
                     val ipStr =
                         "${dnsResp[pos].toInt() and 0xFF}.${dnsResp[pos + 1].toInt() and 0xFF}.${dnsResp[pos + 2].toInt() and 0xFF}.${dnsResp[pos + 3].toInt() and 0xFF}"
-                    dnsIpToDomainCache[ipStr] = domain
+                    if (!V2RayOutboundClient.isPoisonedOrPrivateIp(ipStr)) {
+                        dnsIpToDomainCache[ipStr] = domain
+                    }
                 }
                 pos += rdLen
             }
@@ -415,6 +447,11 @@ class Tun2V2RayRouter(
                 pendingPayloads.write(data)
                 if (connectJob == null) {
                     val buffered = pendingPayloads.toByteArray()
+                    // If this is a multi-segment TLS 1.3 ClientHello (e.g. Twitter/X or Chrome with 1600B Kyber key share),
+                    // wait for the second TCP segment so the entire ClientHello record is reassembled before extracting SNI!
+                    if (isIncompleteTlsClientHelloRecord(buffered)) {
+                        return
+                    }
                     val sniOrHost = extractTlsSni(buffered)
                         ?: extractHttpHost(buffered)
                         ?: dnsIpToDomainCache[serverIpStr]
@@ -422,6 +459,16 @@ class Tun2V2RayRouter(
                     startRemoteTunnel(sniOrHost)
                 }
             }
+        }
+
+        private fun isIncompleteTlsClientHelloRecord(buf: ByteArray): Boolean {
+            if (buf.size < 6 || buf.size > 3600) return false
+            val isHandshake = (buf[0].toInt() and 0xFF) == 0x16 &&
+                (buf[1].toInt() and 0xFF) == 0x03 &&
+                (buf[5].toInt() and 0xFF) == 0x01
+            if (!isHandshake) return false
+            val recordLen = ((buf[3].toInt() and 0xFF) shl 8) or (buf[4].toInt() and 0xFF)
+            return recordLen in 64..4096 && buf.size < (5 + recordLen)
         }
 
         private fun startRemoteTunnel(targetHost: String) {
@@ -452,7 +499,8 @@ class Tun2V2RayRouter(
                     }
 
                     // Downlink loop: read from V2Ray tunnel and inject TCP PSH+ACK segments into TUN
-                    val readBuf = ByteArray(1360) // Safe MSS inside 1500 MTU
+                    // Clamped to 1200 bytes to prevent cellular GTP/MTU blackholing on Irancell
+                    val readBuf = ByteArray(1200)
                     while (isActive && !closed) {
                         val r = stream.input.read(readBuf)
                         if (r == -1) break
@@ -735,11 +783,12 @@ class Tun2V2RayRouter(
         out[39] = 0
 
         if (isSyn) {
-            // TCP Option: Maximum Segment Size (Kind=2, Len=4, MSS=1360 = 0x0550)
+            // TCP Option: Maximum Segment Size (Kind=2, Len=4, MSS=1200 = 0x04B0)
+            // Clamped for Irancell/MCI cellular MTU + VLESS/WS/TLS overhead
             out[40] = 2
             out[41] = 4
-            out[42] = 0x05
-            out[43] = 0x50
+            out[42] = 0x04
+            out[43] = 0xB0.toByte()
         }
 
         if (payload.isNotEmpty()) {
@@ -845,9 +894,6 @@ class Tun2V2RayRouter(
         tcpSessions.values.forEach { it.closeQuietly() }
         tcpSessions.clear()
         tunOutStream = null
-        synchronized(dnsTunnelLock) {
-            closeDnsTunnelLocked()
-        }
     }
 
     fun destroy() {

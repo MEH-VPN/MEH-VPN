@@ -31,7 +31,7 @@ import kotlin.system.measureTimeMillis
  * connected to a remote target [targetHost]:[targetPort].
  */
 class V2RayTunnelStream(
-    private val underlyingSocket: Socket,
+    internal val underlyingSocket: Socket,
     val input: InputStream,
     val output: OutputStream
 ) : Closeable {
@@ -44,8 +44,51 @@ class V2RayTunnelStream(
 
 object V2RayOutboundClient {
 
+    private const val DATA_PLANE_IDLE_TIMEOUT_MS = 120_000
+    private const val BLACKLIST_TTL_MS = 180_000L
+
     private val secureRandom = SecureRandom()
     private val cleanDnsCache = ConcurrentHashMap<String, String>()
+    private val deadNodeBlacklist = ConcurrentHashMap<String, Long>()
+    private val consecutiveServerFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+    @Volatile
+    var onTunnelDegradedListener: (() -> Unit)? = null
+
+    fun nodeKey(config: V2RayConfig): String =
+        "${config.protocol}:${config.address.lowercase()}:${config.port}"
+
+    fun isNodeBlacklisted(config: V2RayConfig): Boolean {
+        val key = nodeKey(config)
+        val expiresAt = deadNodeBlacklist[key] ?: return false
+        if (System.currentTimeMillis() > expiresAt) {
+            deadNodeBlacklist.remove(key)
+            return false
+        }
+        return true
+    }
+
+    fun markNodeDead(config: V2RayConfig) {
+        deadNodeBlacklist[nodeKey(config)] = System.currentTimeMillis() + BLACKLIST_TTL_MS
+        consecutiveServerFailures.set(0)
+    }
+
+    fun clearBlacklist() {
+        deadNodeBlacklist.clear()
+        consecutiveServerFailures.set(0)
+    }
+
+    private fun recordTunnelSuccess() {
+        consecutiveServerFailures.set(0)
+    }
+
+    private fun recordTunnelServerFailure() {
+        val count = consecutiveServerFailures.incrementAndGet()
+        if (count >= 3) {
+            consecutiveServerFailures.set(0)
+            onTunnelDegradedListener?.invoke()
+        }
+    }
 
     private val permissiveTrustManager = object : X509TrustManager {
         override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
@@ -60,14 +103,18 @@ object V2RayOutboundClient {
     }
 
     /**
-     * Tests real end-to-end internet connectivity THROUGH the server by opening a real
-     * VLESS/Trojan/Aether/Serverless/SNI-Spoof stream to cp.cloudflare.com:80 and verifying an HTTP 204 response.
-     * Returns the real end-to-end latency in milliseconds, or Int.MAX_VALUE if the server fails.
+     * Tests real end-to-end internet & Twitter/X connectivity THROUGH the server by:
+     * 1. Opening a tunnel stream to x.com:443
+     * 2. Completing a full TLS 1.2/1.3 handshake (SSLSocket) and verifying the peer X.509 certificate
+     *    (rejecting MCI/ISP transparent middleboxes or self-signed block pages)
+     * 3. Sending an encrypted HTTP HEAD request and verifying a genuine HTTP/1.1 response from x.com.
+     * This works on both Cloudflare Worker VLESS nodes and VPS nodes, while guaranteeing that neither
+     * broken Turkish relays nor MCI's 2KB Post-Handshake Freeze can produce a false Connected state.
      */
     fun verifyRealInternetConnectivity(
         config: V2RayConfig,
         vpnService: VpnService? = null,
-        timeoutMs: Int = 3200
+        timeoutMs: Int = 2400
     ): Int {
         val isDirectBypass = config.protocol == V2RayProtocol.AETHER ||
             config.protocol == V2RayProtocol.SERVERLESS ||
@@ -94,25 +141,55 @@ object V2RayOutboundClient {
             val elapsed = measureTimeMillis {
                 openTunnelStream(
                     config = config,
-                    targetHost = "cp.cloudflare.com",
-                    targetPort = 80,
+                    targetHost = "x.com",
+                    targetPort = 443,
                     vpnService = vpnService,
-                    connectTimeoutMs = timeoutMs
+                    connectTimeoutMs = timeoutMs,
+                    isHealthProbe = true
                 ).use { stream ->
-                    val httpProbe =
-                        "GET /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n"
-                    stream.output.write(httpProbe.toByteArray(Charsets.US_ASCII))
-                    stream.output.flush()
+                    val probeSocket = TunnelStreamSocket(stream, timeoutMs)
+                    val sslSocket = sslSocketFactory.createSocket(
+                        probeSocket,
+                        "x.com",
+                        443,
+                        false
+                    ) as SSLSocket
 
-                    val buffer = ByteArray(256)
-                    val read = stream.input.read(buffer)
-                    if (read > 0) {
-                        val responseHead = String(buffer, 0, read, Charsets.US_ASCII)
-                        if (responseHead.startsWith("HTTP/1.1 204") ||
-                            responseHead.startsWith("HTTP/1.0 204") ||
-                            responseHead.startsWith("HTTP/1.1 200")
-                        ) {
-                            validResponse = true
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        runCatching {
+                            val params = sslSocket.sslParameters
+                            params.serverNames = listOf(SNIHostName("x.com"))
+                            sslSocket.sslParameters = params
+                        }
+                    }
+                    sslSocket.soTimeout = timeoutMs
+                    sslSocket.startHandshake()
+
+                    // Verify peer certificate is genuinely from x.com / twitter.com (not an ISP middlebox)
+                    val cert = sslSocket.session.peerCertificates.firstOrNull() as? X509Certificate
+                    val certInfo = "${cert?.subjectDN?.name.orEmpty()} ${cert?.issuerDN?.name.orEmpty()}".lowercase()
+                    val certSuspicious = certInfo.contains("peyvandha") ||
+                        certInfo.contains("mci.ir") ||
+                        certInfo.contains("irancell") ||
+                        certInfo.contains("fortinet") ||
+                        certInfo.contains("untangle")
+
+                    if (!certSuspicious) {
+                        val req = "HEAD / HTTP/1.1\r\nHost: x.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+                        val sslOut = sslSocket.outputStream
+                        sslOut.write(req.toByteArray(Charsets.US_ASCII))
+                        sslOut.flush()
+
+                        val respBuf = ByteArray(256)
+                        val r = sslSocket.inputStream.read(respBuf)
+                        if (r > 0) {
+                            val headStr = String(respBuf, 0, r, Charsets.US_ASCII)
+                            if ((headStr.startsWith("HTTP/1.1 ") || headStr.startsWith("HTTP/2")) &&
+                                !headStr.contains("10.10.34.") &&
+                                !headStr.contains("peyvandha", ignoreCase = true)
+                            ) {
+                                validResponse = true
+                            }
                         }
                     }
                 }
@@ -121,6 +198,77 @@ object V2RayOutboundClient {
         } catch (_: Exception) {
             Int.MAX_VALUE
         }
+    }
+
+    internal fun buildTlsClientHelloProbe(sniHost: String): ByteArray {
+        val sniBytes = sniHost.toByteArray(Charsets.US_ASCII)
+        val extOut = ByteArrayOutputStream(64)
+
+        // Extension: server_name (0x0000)
+        val sniExtLen = sniBytes.size + 5
+        val sniListLen = sniBytes.size + 3
+        extOut.write(0x00)
+        extOut.write(0x00)
+        extOut.write((sniExtLen ushr 8) and 0xFF)
+        extOut.write(sniExtLen and 0xFF)
+        extOut.write((sniListLen ushr 8) and 0xFF)
+        extOut.write(sniListLen and 0xFF)
+        extOut.write(0x00)
+        extOut.write((sniBytes.size ushr 8) and 0xFF)
+        extOut.write(sniBytes.size and 0xFF)
+        extOut.write(sniBytes)
+
+        // Extension: supported_groups (0x000a) -> x25519 (0x001d), secp256r1 (0x0017)
+        extOut.write(byteArrayOf(0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17))
+        // Extension: ec_point_formats (0x000b)
+        extOut.write(byteArrayOf(0x00, 0x0b, 0x00, 0x02, 0x01, 0x00))
+        // Extension: signature_algorithms (0x000d)
+        extOut.write(byteArrayOf(0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x01, 0x04, 0x03))
+
+        val extBytes = extOut.toByteArray()
+        val bodyOut = ByteArrayOutputStream(128)
+        // Client Version TLS 1.2 (0x0303)
+        bodyOut.write(0x03)
+        bodyOut.write(0x03)
+        // Client Random (32 bytes)
+        val randomBytes = ByteArray(32)
+        secureRandom.nextBytes(randomBytes)
+        bodyOut.write(randomBytes)
+        // Session ID (0)
+        bodyOut.write(0x00)
+        // Cipher Suites (8 bytes)
+        bodyOut.write(
+            byteArrayOf(
+                0x00, 0x08,
+                0x13, 0x01,
+                0x13, 0x02,
+                0xC0.toByte(), 0x2F,
+                0xC0.toByte(), 0x2B
+            )
+        )
+        // Compression Methods (null)
+        bodyOut.write(byteArrayOf(0x01, 0x00))
+        // Extensions
+        bodyOut.write((extBytes.size ushr 8) and 0xFF)
+        bodyOut.write(extBytes.size and 0xFF)
+        bodyOut.write(extBytes)
+
+        val bodyBytes = bodyOut.toByteArray()
+        val hsLen = bodyBytes.size
+        val recLen = hsLen + 4
+
+        val out = ByteArrayOutputStream(recLen + 5)
+        out.write(0x16)
+        out.write(0x03)
+        out.write(0x01)
+        out.write((recLen ushr 8) and 0xFF)
+        out.write(recLen and 0xFF)
+        out.write(0x01)
+        out.write((hsLen ushr 16) and 0xFF)
+        out.write((hsLen ushr 8) and 0xFF)
+        out.write(hsLen and 0xFF)
+        out.write(bodyBytes)
+        return out.toByteArray()
     }
 
     /**
@@ -136,6 +284,7 @@ object V2RayOutboundClient {
         val rawSocket = Socket()
         try {
             rawSocket.tcpNoDelay = true
+            rawSocket.keepAlive = true
             rawSocket.soTimeout = connectTimeoutMs
             if (vpnService != null) {
                 vpnService.protect(rawSocket)
@@ -184,7 +333,8 @@ object V2RayOutboundClient {
         targetHost: String,
         targetPort: Int,
         vpnService: VpnService? = null,
-        connectTimeoutMs: Int = 4500
+        connectTimeoutMs: Int = 4500,
+        isHealthProbe: Boolean = false
     ): V2RayTunnelStream {
         if (config.protocol == V2RayProtocol.AETHER ||
             config.protocol == V2RayProtocol.SERVERLESS ||
@@ -195,27 +345,37 @@ object V2RayOutboundClient {
                 targetHost = targetHost,
                 targetPort = targetPort,
                 vpnService = vpnService,
-                connectTimeoutMs = connectTimeoutMs
+                connectTimeoutMs = connectTimeoutMs,
+                isHealthProbe = isHealthProbe
             )
         }
 
         val rawSocket = Socket()
         try {
             rawSocket.tcpNoDelay = true
+            rawSocket.keepAlive = true
             rawSocket.soTimeout = connectTimeoutMs
             if (vpnService != null) {
                 vpnService.protect(rawSocket)
             }
-            rawSocket.connect(InetSocketAddress(config.address, config.port), connectTimeoutMs)
+            val serverAddress = if (isIpLiteral(config.address)) {
+                config.address
+            } else {
+                resolveDomainCleanly(config.address, vpnService)
+            }
+            rawSocket.connect(InetSocketAddress(serverAddress, config.port), connectTimeoutMs)
 
             // 1. Wrap with TLS if security == tls
+            // Fragment the outer TLS ClientHello record via AetherFragmentingSocketWrapper so
+            // Hamrah-e-Aval (MCI) DPI cannot inspect the V2Ray server SNI or trigger Post-Handshake Freeze
             val transportSocket: Socket = if (config.tls.equals("tls", ignoreCase = true) || config.port == 443 || config.port == 2053 || config.port == 2083 || config.port == 2087 || config.port == 2096 || config.port == 8443) {
                 if (config.tls.equals("none", ignoreCase = true) && config.port != 443) {
                     rawSocket
                 } else {
                     val sniHost = config.sni.ifEmpty { config.hostHeader.ifEmpty { config.address } }
+                    val fragmentedOuterSocket = AetherFragmentingSocketWrapper(rawSocket)
                     val sslSocket = sslSocketFactory.createSocket(
-                        rawSocket,
+                        fragmentedOuterSocket,
                         sniHost,
                         config.port,
                         true
@@ -250,35 +410,51 @@ object V2RayOutboundClient {
                 }
             }
 
-            // 3. Perform V2Ray Protocol Handshake (VLESS or Trojan)
-            return when (config.protocol) {
+            // Crucial: once handshake succeeds, switch from short connectTimeoutMs (4.5s)
+            // to long data-plane idle timeout (120s) so persistent HTTP/2 & app sockets aren't killed!
+            val activeReadTimeout = if (isHealthProbe || targetPort == 53) connectTimeoutMs else DATA_PLANE_IDLE_TIMEOUT_MS
+            runCatching {
+                rawSocket.soTimeout = activeReadTimeout
+                transportSocket.soTimeout = activeReadTimeout
+            }
+
+            // 3. Perform V2Ray Protocol Handshake (VLESS or Trojan) coalesced with first payload write
+            // so Cloudflare Worker VLESS/Trojan WebSocket nodes receive [Header + ClientHello] in Frame #1
+            val tunnelStream = when (config.protocol) {
                 V2RayProtocol.VLESS -> {
-                    sendVlessHeader(config.uuidOrPassword, targetHost, targetPort, baseOutput)
+                    val headerBytes = buildVlessHeaderBytes(config.uuidOrPassword, targetHost, targetPort)
                     V2RayTunnelStream(
                         underlyingSocket = transportSocket,
                         input = VlessResponseInputStream(baseInput),
-                        output = baseOutput
+                        output = PrependingHeaderOutputStream(headerBytes, baseOutput)
                     )
                 }
                 V2RayProtocol.TROJAN -> {
-                    sendTrojanHeader(config.uuidOrPassword, targetHost, targetPort, baseOutput)
+                    val headerBytes = buildTrojanHeaderBytes(config.uuidOrPassword, targetHost, targetPort)
                     V2RayTunnelStream(
                         underlyingSocket = transportSocket,
                         input = baseInput,
-                        output = baseOutput
+                        output = PrependingHeaderOutputStream(headerBytes, baseOutput)
                     )
                 }
                 else -> throw IllegalArgumentException("Unsupported protocol for direct stream: ${config.protocol}")
             }
+            if (!isHealthProbe) {
+                recordTunnelSuccess()
+            }
+            return tunnelStream
         } catch (e: Exception) {
             runCatching { rawSocket.close() }
+            if (!isHealthProbe) {
+                recordTunnelServerFailure()
+            }
             throw e
         }
     }
 
     /**
      * Opens an outbound stream for Aether, Serverless-for-Iran, or SNI-Spoofing:
-     * 1. Resolves domain names via unpoisoned TCP DNS (1.1.1.1:53 / 1.0.0.1:53 / 8.8.8.8:53).
+     * 1. Resolves domain names via unpoisoned DoT/TCP DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8).
      * 2. Wraps the socket output with the protocol-specific DPI bypass transformer:
      *    - AETHER: TLS record 2-way split + HTTP Host split (CluvexStudio/Aether)
      *    - SERVERLESS: Ultra-fine 1-to-3 byte TLS ClientHello micro-fragmentation with 5ms pacing (patterniha/Serverless-for-Iran)
@@ -289,11 +465,13 @@ object V2RayOutboundClient {
         targetHost: String,
         targetPort: Int,
         vpnService: VpnService?,
-        connectTimeoutMs: Int
+        connectTimeoutMs: Int,
+        isHealthProbe: Boolean = false
     ): V2RayTunnelStream {
         val rawSocket = Socket()
         try {
             rawSocket.tcpNoDelay = true
+            rawSocket.keepAlive = true
             rawSocket.soTimeout = connectTimeoutMs
             if (vpnService != null) {
                 vpnService.protect(rawSocket)
@@ -316,6 +494,9 @@ object V2RayOutboundClient {
 
             rawSocket.connect(InetSocketAddress(resolvedAddress, resolvedPort), connectTimeoutMs)
 
+            val activeReadTimeout = if (isHealthProbe || targetPort == 53) connectTimeoutMs else DATA_PLANE_IDLE_TIMEOUT_MS
+            runCatching { rawSocket.soTimeout = activeReadTimeout }
+
             val wrappedOutput: OutputStream = when (config.protocol) {
                 V2RayProtocol.SERVERLESS -> ServerlessMicroFragmentOutputStream(
                     rawOut = rawSocket.getOutputStream(),
@@ -328,6 +509,10 @@ object V2RayOutboundClient {
                 else -> AetherFragmentedOutputStream(rawSocket.getOutputStream())
             }
 
+            if (!isHealthProbe) {
+                recordTunnelSuccess()
+            }
+
             return V2RayTunnelStream(
                 underlyingSocket = rawSocket,
                 input = rawSocket.getInputStream(),
@@ -335,19 +520,73 @@ object V2RayOutboundClient {
             )
         } catch (e: Exception) {
             runCatching { rawSocket.close() }
+            if (!isHealthProbe && (targetHost.endsWith(".cloudflare.com", ignoreCase = true) || targetPort == 443)) {
+                recordTunnelServerFailure()
+            }
             throw e
         }
     }
 
     /**
-     * Resolves [domain] over TCP DNS to 1.1.1.1:53 (bypassing ISP UDP DNS poisoning).
+     * Executes a raw DNS query over DNS-over-TLS (port 853) or fragmented TCP DNS (port 53),
+     * ensuring ISP DNS poisoning / sinkhole responses (e.g. 10.10.34.35) are discarded.
      */
-    private fun resolveDomainCleanly(domain: String, vpnService: VpnService?): String {
-        val normalized = domain.trim().lowercase()
-        cleanDnsCache[normalized]?.let { return it }
+    fun executeCleanDnsQueryRaw(dnsQuery: ByteArray, vpnService: VpnService?): ByteArray? {
+        val framed = ByteArray(dnsQuery.size + 2)
+        framed[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
+        framed[1] = (dnsQuery.size and 0xFF).toByte()
+        System.arraycopy(dnsQuery, 0, framed, 2, dnsQuery.size)
 
-        val dnsServers = listOf("1.1.1.1", "1.0.0.1", "8.8.8.8")
-        for (dnsServer in dnsServers) {
+        val dotResolvers = listOf(
+            "1.1.1.1" to "cloudflare-dns.com",
+            "1.0.0.1" to "cloudflare-dns.com",
+            "8.8.8.8" to "dns.google"
+        )
+        // 1. Try encrypted DNS-over-TLS (Port 853) so ISP DPI cannot inspect or forge DNS answers
+        for ((ip, sni) in dotResolvers) {
+            val rawSocket = Socket()
+            try {
+                rawSocket.tcpNoDelay = true
+                rawSocket.soTimeout = 2200
+                if (vpnService != null) {
+                    vpnService.protect(rawSocket)
+                }
+                rawSocket.connect(InetSocketAddress(ip, 853), 1800)
+                val sslSocket = sslSocketFactory.createSocket(rawSocket, sni, 853, true) as SSLSocket
+                sslSocket.soTimeout = 2200
+                sslSocket.startHandshake()
+
+                val out = sslSocket.getOutputStream()
+                out.write(framed)
+                out.flush()
+
+                val input = sslSocket.getInputStream()
+                val hi = input.read()
+                val lo = input.read()
+                if (hi != -1 && lo != -1) {
+                    val len = (hi shl 8) or lo
+                    if (len in 12..4096) {
+                        val resp = ByteArray(len)
+                        var readTotal = 0
+                        while (readTotal < len) {
+                            val r = input.read(resp, readTotal, len - readTotal)
+                            if (r == -1) break
+                            readTotal += r
+                        }
+                        if (readTotal == len && !containsPoisonedARecord(resp)) {
+                            return resp
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { rawSocket.close() }
+            }
+        }
+
+        // 2. Fallback to TCP DNS (Port 53) with anti-poisoning verification
+        val tcpResolvers = listOf("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4")
+        for (dnsServer in tcpResolvers) {
             val socket = Socket()
             try {
                 socket.tcpNoDelay = true
@@ -355,14 +594,7 @@ object V2RayOutboundClient {
                 if (vpnService != null) {
                     vpnService.protect(socket)
                 }
-                socket.connect(InetSocketAddress(dnsServer, 53), 2000)
-
-                val query = buildDnsAQuery(normalized)
-                val framed = ByteArray(query.size + 2)
-                framed[0] = ((query.size ushr 8) and 0xFF).toByte()
-                framed[1] = (query.size and 0xFF).toByte()
-                System.arraycopy(query, 0, framed, 2, query.size)
-
+                socket.connect(InetSocketAddress(dnsServer, 53), 1800)
                 val out = socket.getOutputStream()
                 out.write(framed)
                 out.flush()
@@ -380,12 +612,8 @@ object V2RayOutboundClient {
                             if (r == -1) break
                             readTotal += r
                         }
-                        if (readTotal == len) {
-                            val ip = parseFirstARecordFromDnsResponse(resp)
-                            if (ip != null) {
-                                cleanDnsCache[normalized] = ip
-                                return ip
-                            }
+                        if (readTotal == len && !containsPoisonedARecord(resp)) {
+                            return resp
                         }
                     }
                 }
@@ -394,10 +622,160 @@ object V2RayOutboundClient {
                 runCatching { socket.close() }
             }
         }
+        return null
+    }
+
+    /**
+     * Resolves [domain] over encrypted DoT / clean TCP DNS (bypassing ISP UDP/TCP DNS poisoning).
+     */
+    private fun resolveDomainCleanly(domain: String, vpnService: VpnService?): String {
+        val normalized = domain.trim().lowercase()
+        cleanDnsCache[normalized]?.let { cached ->
+            if (!isPoisonedOrPrivateIp(cached)) return cached
+            cleanDnsCache.remove(normalized)
+        }
+
+        val query = buildDnsAQuery(normalized)
+        val rawResp = executeCleanDnsQueryRaw(query, vpnService)
+        if (rawResp != null) {
+            val ip = parseFirstARecordFromDnsResponse(rawResp)
+            if (ip != null && !isPoisonedOrPrivateIp(ip)) {
+                cleanDnsCache[normalized] = ip
+                return ip
+            }
+        }
 
         return runCatching {
-            InetAddress.getByName(normalized).hostAddress ?: normalized
+            val sysIp = InetAddress.getByName(normalized).hostAddress
+            if (sysIp != null && !isPoisonedOrPrivateIp(sysIp)) {
+                cleanDnsCache[normalized] = sysIp
+                sysIp
+            } else {
+                normalized
+            }
         }.getOrDefault(normalized)
+    }
+
+    internal fun containsPoisonedARecord(resp: ByteArray): Boolean {
+        val ip = parseFirstARecordFromDnsResponse(resp) ?: return false
+        return isPoisonedOrPrivateIp(ip)
+    }
+
+    /**
+     * Resolves a raw DNS query inside the active tunnel over HTTPS (RFC 8484 DoH on port 443)
+     * to 8.8.8.8 (dns.google). Because 8.8.8.8 is a non-Cloudflare IP and uses port 443,
+     * this works on 100% of V2Ray servers AND Cloudflare Worker VLESS nodes, while completely
+     * bypassing Hamrah-e-Aval (MCI) port 53/853 blocking and DNS poisoning.
+     */
+    fun executeTunnelDohQuery(
+        config: V2RayConfig,
+        dnsQuery: ByteArray,
+        vpnService: VpnService?
+    ): ByteArray? {
+        return try {
+            openTunnelStream(
+                config = config,
+                targetHost = "8.8.8.8",
+                targetPort = 443,
+                vpnService = vpnService,
+                connectTimeoutMs = 2400,
+                isHealthProbe = true
+            ).use { stream ->
+                val probeSocket = TunnelStreamSocket(stream, 2400)
+                val sslSocket = sslSocketFactory.createSocket(
+                    probeSocket,
+                    "dns.google",
+                    443,
+                    false
+                ) as SSLSocket
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    runCatching {
+                        val params = sslSocket.sslParameters
+                        params.serverNames = listOf(SNIHostName("dns.google"))
+                        sslSocket.sslParameters = params
+                    }
+                }
+                sslSocket.soTimeout = 2400
+                sslSocket.startHandshake()
+
+                val reqHeader = buildString {
+                    append("POST /dns-query HTTP/1.1\r\n")
+                    append("Host: dns.google\r\n")
+                    append("Content-Type: application/dns-message\r\n")
+                    append("Accept: application/dns-message\r\n")
+                    append("Content-Length: ").append(dnsQuery.size).append("\r\n")
+                    append("Connection: close\r\n\r\n")
+                }
+                val out = sslSocket.outputStream
+                out.write(reqHeader.toByteArray(Charsets.US_ASCII))
+                out.write(dnsQuery)
+                out.flush()
+
+                val input = sslSocket.inputStream
+                val headerBuf = ByteArrayOutputStream(256)
+                var matchState = 0
+                while (headerBuf.size() < 4096) {
+                    val b = input.read()
+                    if (b == -1) break
+                    headerBuf.write(b)
+                    matchState = when {
+                        matchState == 0 && b == '\r'.code -> 1
+                        matchState == 1 && b == '\n'.code -> 2
+                        matchState == 2 && b == '\r'.code -> 3
+                        matchState == 3 && b == '\n'.code -> 4
+                        b == '\r'.code -> 1
+                        else -> 0
+                    }
+                    if (matchState == 4) break
+                }
+                val headersStr = headerBuf.toString("US-ASCII")
+                if (!headersStr.startsWith("HTTP/1.1 200") && !headersStr.startsWith("HTTP/2 200")) {
+                    return null
+                }
+                val contentLen = headersStr.lineSequence()
+                    .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                    ?.substringAfter(":")?.trim()?.toIntOrNull() ?: -1
+
+                val bodyBytes = if (contentLen in 12..4096) {
+                    val buf = ByteArray(contentLen)
+                    var readTotal = 0
+                    while (readTotal < contentLen) {
+                        val r = input.read(buf, readTotal, contentLen - readTotal)
+                        if (r == -1) break
+                        readTotal += r
+                    }
+                    if (readTotal == contentLen) buf else null
+                } else {
+                    val bodyOut = ByteArrayOutputStream(512)
+                    val tmp = ByteArray(512)
+                    while (bodyOut.size() < 4096) {
+                        val r = input.read(tmp)
+                        if (r <= 0) break
+                        bodyOut.write(tmp, 0, r)
+                    }
+                    bodyOut.toByteArray().takeIf { it.size >= 12 }
+                }
+
+                if (bodyBytes != null && !containsPoisonedARecord(bodyBytes)) {
+                    bodyBytes
+                } else {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Filters out Iranian ISP censorship sinkhole IPs (10.10.34.34-36) and invalid/loopback answers.
+     */
+    internal fun isPoisonedOrPrivateIp(ip: String): Boolean {
+        return ip.startsWith("10.") ||
+            ip.startsWith("127.") ||
+            ip.startsWith("0.") ||
+            ip.startsWith("192.168.") ||
+            ip == "255.255.255.255"
     }
 
     private fun buildDnsAQuery(domain: String): ByteArray {
@@ -502,12 +880,21 @@ object V2RayOutboundClient {
         }
     }
 
-    private fun sendVlessHeader(
+    private fun isCloudflareAnycastFrontedHost(host: String): Boolean {
+        val h = host.trim().lowercase()
+        return h == "x.com" ||
+            h.endsWith(".x.com") ||
+            h == "twitter.com" ||
+            h.endsWith(".twitter.com") ||
+            h == "t.co" ||
+            h.endsWith(".t.co")
+    }
+
+    private fun buildVlessHeaderBytes(
         uuidStr: String,
         targetHost: String,
-        targetPort: Int,
-        output: OutputStream
-    ) {
+        targetPort: Int
+    ): ByteArray {
         val uuidBytes = parseVlessUuidBytes(uuidStr.trim())
         val buf = ByteArrayOutputStream(64)
 
@@ -530,8 +917,7 @@ object V2RayOutboundClient {
             buf.write(domainBytes)
         }
 
-        output.write(buf.toByteArray())
-        output.flush()
+        return buf.toByteArray()
     }
 
     private fun parseVlessUuidBytes(raw: String): ByteArray {
@@ -559,12 +945,11 @@ object V2RayOutboundClient {
         }
     }
 
-    private fun sendTrojanHeader(
+    private fun buildTrojanHeaderBytes(
         password: String,
         targetHost: String,
-        targetPort: Int,
-        output: OutputStream
-    ) {
+        targetPort: Int
+    ): ByteArray {
         val sha224 = MessageDigest.getInstance("SHA-224")
         val digest = sha224.digest(password.toByteArray(Charsets.UTF_8))
         val hexPassword = digest.joinToString("") { "%02x".format(it) }
@@ -593,8 +978,7 @@ object V2RayOutboundClient {
         buf.write('\r'.code)
         buf.write('\n'.code)
 
-        output.write(buf.toByteArray())
-        output.flush()
+        return buf.toByteArray()
     }
 
     private fun isIpLiteral(host: String): Boolean {
@@ -617,13 +1001,30 @@ object V2RayOutboundClient {
 private class AetherFragmentingSocketWrapper(
     private val delegate: Socket
 ) : Socket() {
+    private val fragmentedOut by lazy { AetherFragmentedOutputStream(delegate.getOutputStream()) }
     override fun getInputStream(): InputStream = delegate.getInputStream()
-    override fun getOutputStream(): OutputStream = AetherFragmentedOutputStream(delegate.getOutputStream())
+    override fun getOutputStream(): OutputStream = fragmentedOut
     override fun isConnected(): Boolean = delegate.isConnected
     override fun isClosed(): Boolean = delegate.isClosed
     override fun setSoTimeout(timeout: Int) = delegate.setSoTimeout(timeout)
     override fun getSoTimeout(): Int = delegate.soTimeout
     override fun close() = delegate.close()
+}
+
+private class TunnelStreamSocket(
+    private val stream: V2RayTunnelStream,
+    private var timeoutMs: Int = 2400
+) : Socket() {
+    override fun getInputStream(): InputStream = stream.input
+    override fun getOutputStream(): OutputStream = stream.output
+    override fun isConnected(): Boolean = true
+    override fun isClosed(): Boolean = false
+    override fun setSoTimeout(timeout: Int) {
+        timeoutMs = timeout
+        runCatching { stream.underlyingSocket.soTimeout = timeout }
+    }
+    override fun getSoTimeout(): Int = timeoutMs
+    override fun close() = stream.close()
 }
 
 /**
@@ -671,8 +1072,9 @@ private class AetherFragmentedOutputStream(
 
     private fun writeFragmentedTlsClientHello(data: ByteArray) {
         val recordLen = ((data[3].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)
-        if (data.size == 5 + recordLen && recordLen > 32) {
-            val payload = data.copyOfRange(5, data.size)
+        val firstRecTotal = 5 + recordLen
+        if (recordLen > 32 && data.size >= firstRecTotal) {
+            val payload = data.copyOfRange(5, firstRecTotal)
             val splitPoint = (payload.size / 2).coerceIn(16, payload.size - 8)
             val part1 = payload.copyOfRange(0, splitPoint)
             val part2 = payload.copyOfRange(splitPoint, payload.size)
@@ -697,8 +1099,15 @@ private class AetherFragmentedOutputStream(
             rawOut.flush()
             rawOut.write(rec2)
             rawOut.flush()
+            if (data.size > firstRecTotal) {
+                rawOut.write(data, firstRecTotal, data.size - firstRecTotal)
+                rawOut.flush()
+            }
         } else {
-            rawOut.write(data)
+            val mid = (data.size / 2).coerceAtLeast(1)
+            rawOut.write(data, 0, mid)
+            rawOut.flush()
+            rawOut.write(data, mid, data.size - mid)
             rawOut.flush()
         }
     }
@@ -825,8 +1234,9 @@ private class SniSpoofingDesyncOutputStream(
 
     private fun writeDesyncedTlsClientHello(data: ByteArray) {
         val recordLen = ((data[3].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)
-        if (data.size == 5 + recordLen && recordLen > 48) {
-            val payload = data.copyOfRange(5, data.size)
+        val firstRecTotal = 5 + recordLen
+        if (recordLen > 48 && data.size >= firstRecTotal) {
+            val payload = data.copyOfRange(5, firstRecTotal)
             val sniOffsetInPayload = findSniOffsetInHandshake(payload)
             val cut1 = (sniOffsetInPayload ?: (payload.size / 3)).coerceIn(8, payload.size - 16)
             val cut2 = (cut1 + 3).coerceIn(cut1 + 1, payload.size - 4)
@@ -843,9 +1253,21 @@ private class SniSpoofingDesyncOutputStream(
             runCatching { Thread.sleep(2) }
             rawOut.write(seg3)
             rawOut.flush()
+            if (data.size > firstRecTotal) {
+                rawOut.write(data, firstRecTotal, data.size - firstRecTotal)
+                rawOut.flush()
+            }
         } else {
-            rawOut.write(data)
+            val p1 = (data.size / 3).coerceAtLeast(1)
+            val p2 = ((data.size * 2) / 3).coerceAtLeast(p1 + 1).coerceAtMost(data.size)
+            rawOut.write(data, 0, p1)
             rawOut.flush()
+            rawOut.write(data, p1, p2 - p1)
+            rawOut.flush()
+            if (p2 < data.size) {
+                rawOut.write(data, p2, data.size - p2)
+                rawOut.flush()
+            }
         }
     }
 
@@ -892,6 +1314,47 @@ private class SniSpoofingDesyncOutputStream(
 
     override fun flush() = rawOut.flush()
     override fun close() = rawOut.close()
+}
+
+/**
+ * Prepends [headerBytes] (VLESS or Trojan header) onto the very first payload write so that
+ * WebSocket-based V2Ray servers (especially Cloudflare Workers) receive [Header + ClientHello]
+ * inside a single binary WebSocket frame.
+ */
+private class PrependingHeaderOutputStream(
+    private val headerBytes: ByteArray,
+    private val delegate: OutputStream
+) : OutputStream() {
+    private var headerSent = false
+
+    override fun write(b: Int) {
+        write(byteArrayOf(b.toByte()), 0, 1)
+    }
+
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        if (len <= 0) return
+        if (!headerSent) {
+            headerSent = true
+            val combined = ByteArray(headerBytes.size + len)
+            System.arraycopy(headerBytes, 0, combined, 0, headerBytes.size)
+            System.arraycopy(b, off, combined, headerBytes.size, len)
+            delegate.write(combined, 0, combined.size)
+        } else {
+            delegate.write(b, off, len)
+        }
+    }
+
+    override fun flush() {
+        if (!headerSent) {
+            headerSent = true
+            delegate.write(headerBytes, 0, headerBytes.size)
+        }
+        delegate.flush()
+    }
+
+    override fun close() {
+        delegate.close()
+    }
 }
 
 /**

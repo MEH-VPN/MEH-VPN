@@ -83,10 +83,12 @@ class MainActivity : ComponentActivity() {
 
                 val vpnPermissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.StartActivityForResult()
-                ) { _ ->
+                ) { result ->
                     val target = uiState.selectedServer
-                    if (target != null) {
+                    if (result.resultCode == RESULT_OK && target != null) {
                         startVpnService(target)
+                    } else {
+                        vpnViewModel.cancelScanAndReset()
                     }
                 }
 

@@ -39,6 +39,10 @@ class V2RayLocalProxyServer(
     var listeningPort: Int = 10809
         private set
 
+    fun updateConfig(newConfig: V2RayConfig) {
+        activeConfig = newConfig
+    }
+
     fun start(): Int {
         stop()
         val boundSocket = runCatching {

@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ProxyInfo
@@ -14,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import com.meh.vpn.MainActivity
 import com.meh.vpn.R
 import com.meh.vpn.data.AetherGatewayEngine
+import com.meh.vpn.data.GitHubSubscriptionAggregator
 import com.meh.vpn.data.PatternihaBypassEngine
 import com.meh.vpn.data.V2RayParser
 import com.meh.vpn.model.ConnectionStage
@@ -24,16 +26,28 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MehVpnService : VpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val aggregator = GitHubSubscriptionAggregator()
     private var vpnInterface: ParcelFileDescriptor? = null
     private var localProxyServer: V2RayLocalProxyServer? = null
     private var tunRouter: Tun2V2RayRouter? = null
     private var tunnelJob: Job? = null
+    private var watchdogJob: Job? = null
+
+    @Volatile
+    private var currentActiveConfig: V2RayConfig? = null
+    private val isHealing = AtomicBoolean(false)
+    private val healTriggerChannel = Channel<Unit>(Channel.CONFLATED)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -50,8 +64,12 @@ class MehVpnService : VpnService() {
                     startTunnel(parsed)
                 } else {
                     serviceScope.launch {
-                        val fallbackConfig = resolveCascadeFallback(null)
-                        startTunnel(fallbackConfig)
+                        val fallbackConfig = resolveCascadeFallbackOrNull(null)
+                        if (fallbackConfig != null) {
+                            startTunnel(fallbackConfig)
+                        } else {
+                            stopTunnel()
+                        }
                     }
                 }
             }
@@ -59,7 +77,37 @@ class MehVpnService : VpnService() {
         return START_STICKY
     }
 
-    private suspend fun resolveCascadeFallback(failedConfig: V2RayConfig?): V2RayConfig {
+    /**
+     * Resolves a new working configuration across all 4 stages when the current config drops or fails:
+     * 1. GitHub V2Ray Configs (VLESS/Trojan) excluding blacklisted/dead nodes
+     * 2. CluvexStudio/Aether
+     * 3. patterniha/Serverless-for-Iran
+     * 4. patterniha/SNI-Spoofing
+     * Returns null if all tested nodes fail verification so the VPN can auto-disconnect cleanly.
+     */
+    private suspend fun findNextHealthyConfigOrNull(failedConfig: V2RayConfig?): V2RayConfig? {
+        if (failedConfig != null) {
+            V2RayOutboundClient.markNodeDead(failedConfig)
+        }
+
+        // Method 1: Fresh GitHub V2Ray Configs (excluding the dead server)
+        VpnStateBus.updateStage(ConnectionStage.TESTING_SERVERS, failedConfig)
+        val githubConfigs = runCatching { aggregator.fetchAllGitHubConfigs() }.getOrDefault(emptyList())
+        if (githubConfigs.isNotEmpty()) {
+            val (bestV2Ray, _) = aggregator.findFastestServer(githubConfigs)
+            if (bestV2Ray != null) {
+                return bestV2Ray
+            }
+        }
+
+        return resolveCascadeFallbackOrNull(failedConfig)
+    }
+
+    private suspend fun resolveCascadeFallbackOrNull(failedConfig: V2RayConfig?): V2RayConfig? {
+        if (failedConfig != null) {
+            V2RayOutboundClient.markNodeDead(failedConfig)
+        }
+
         // Method 2: CluvexStudio/Aether
         VpnStateBus.updateStage(ConnectionStage.AETHER_FALLBACK, failedConfig)
         val aether = AetherGatewayEngine.discoverAndValidateGatewayOrNull()
@@ -72,39 +120,35 @@ class MehVpnService : VpnService() {
 
         // Method 4: patterniha/SNI-Spoofing
         VpnStateBus.updateStage(ConnectionStage.SNI_SPOOF_FALLBACK, failedConfig)
-        return PatternihaBypassEngine.discoverAndValidateSniSpoofing()
+        return PatternihaBypassEngine.discoverAndValidateSniSpoofingOrNull()
     }
 
     private fun startTunnel(initialConfig: V2RayConfig) {
         VpnStateBus.updateStage(ConnectionStage.CONNECTING, initialConfig)
         startVpnForegroundNotification(initialConfig)
 
+        watchdogJob?.cancel()
         tunnelJob?.cancel()
         tunnelJob = serviceScope.launch {
-            val isDirectEngine = initialConfig.protocol == V2RayProtocol.AETHER ||
-                initialConfig.protocol == V2RayProtocol.SERVERLESS ||
-                initialConfig.protocol == V2RayProtocol.SNI_SPOOF
-
-            val activeConfig = if (!isDirectEngine) {
-                val livePing = V2RayOutboundClient.verifyRealInternetConnectivity(
-                    config = initialConfig,
-                    vpnService = this@MehVpnService,
-                    timeoutMs = 2400
-                )
-                if (livePing in 1..4999) {
-                    initialConfig.copy(pingMs = livePing)
-                } else {
-                    resolveCascadeFallback(initialConfig)
-                }
+            val livePing = V2RayOutboundClient.verifyRealInternetConnectivity(
+                config = initialConfig,
+                vpnService = this@MehVpnService,
+                timeoutMs = 2600
+            )
+            val activeConfig: V2RayConfig? = if (livePing in 1..4999) {
+                initialConfig.copy(pingMs = livePing)
             } else {
-                initialConfig
+                findNextHealthyConfigOrNull(initialConfig)
             }
 
+            if (activeConfig == null) {
+                stopTunnel()
+                return@launch
+            }
+
+            currentActiveConfig = activeConfig
+            persistActiveConfig(activeConfig)
             startVpnForegroundNotification(activeConfig)
-
-            runCatching {
-                File(filesDir, "meh_v2ray_active_config.json").writeText(activeConfig.toV2RayCoreJson())
-            }
 
             // 1. Start local V2Ray / Aether / Serverless / SNI-Spoof HTTP/HTTPS CONNECT & SOCKS5 Proxy Server
             localProxyServer?.destroy()
@@ -119,7 +163,8 @@ class MehVpnService : VpnService() {
 
                 val builder = Builder()
                     .setSession("MEH (مه) • ${activeConfig.countryNameFa}")
-                    .setMtu(1500)
+                    // 1360 MTU prevents cellular GTP packet fragmentation on Irancell/MCI when loading Twitter/X
+                    .setMtu(1360)
                     .addAddress("10.0.0.2", 24)
                     .addDnsServer("1.1.1.1")
                     .addDnsServer("8.8.8.8")
@@ -144,12 +189,106 @@ class MehVpnService : VpnService() {
             }.getOrDefault(false)
 
             VpnStateBus.updateConnected(config = activeConfig, tunEstablished = tunEstablished)
+
+            // 3. Start Continuous Self-Healing Watchdog to detect mid-session config drops
+            startWatchdogLoop(tunEstablished)
+        }
+    }
+
+    /**
+     * Continuously monitors the active VPN tunnel every 15 seconds (or immediately when
+     * 3 consecutive outbound stream failures occur) and seamlessly hot-swaps to a new live
+     * config if open internet access drops.
+     */
+    private fun startWatchdogLoop(tunEstablished: Boolean) {
+        watchdogJob?.cancel()
+        V2RayOutboundClient.onTunnelDegradedListener = {
+            healTriggerChannel.trySend(Unit)
+        }
+
+        watchdogJob = serviceScope.launch {
+            while (isActive) {
+                // Wait either 15 seconds OR until an immediate tunnel degradation signal arrives
+                withTimeoutOrNull(15_000L) {
+                    healTriggerChannel.receive()
+                }
+                if (!isActive) break
+
+                val configToCheck = currentActiveConfig ?: continue
+                if (isHealing.get()) continue
+
+                val isAlive = verifyConfigStillAlive(configToCheck)
+                if (!isAlive && isActive) {
+                    performHotSwapAutoHeal(configToCheck, tunEstablished)
+                }
+            }
+        }
+    }
+
+    /**
+     * Double-checks real internet connectivity through [config] so a single transient packet loss
+     * does not trigger an unnecessary server switch, while genuine config drops are caught fast.
+     */
+    private fun verifyConfigStillAlive(config: V2RayConfig): Boolean {
+        for (attempt in 0..1) {
+            val ping = V2RayOutboundClient.verifyRealInternetConnectivity(
+                config = config,
+                vpnService = this@MehVpnService,
+                timeoutMs = 2600
+            )
+            if (ping in 1..4999) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Hot-swaps the dead configuration with a newly verified live server without dropping the TUN interface,
+     * or disconnects cleanly if all fallback tests fail.
+     */
+    private suspend fun performHotSwapAutoHeal(deadConfig: V2RayConfig, tunEstablished: Boolean) {
+        if (!isHealing.compareAndSet(false, true)) return
+        try {
+            val newConfig = findNextHealthyConfigOrNull(deadConfig)
+            if (newConfig == null) {
+                stopTunnel()
+                return
+            }
+            currentActiveConfig = newConfig
+            persistActiveConfig(newConfig)
+
+            // Hot-swap config in-place on both the local proxy and TUN router
+            localProxyServer?.updateConfig(newConfig)
+            tunRouter?.updateConfig(newConfig)
+
+            startVpnForegroundNotification(newConfig)
+            VpnStateBus.updateConnected(config = newConfig, tunEstablished = tunEstablished)
+            delay(1500)
+        } finally {
+            isHealing.set(false)
+        }
+    }
+
+    private fun persistActiveConfig(config: V2RayConfig) {
+        runCatching {
+            File(filesDir, "meh_v2ray_active_config.json").writeText(config.toV2RayCoreJson())
+            getSharedPreferences("meh_fast_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putString("last_best_uri", config.rawUri)
+                .putString("last_best_source", config.sourceRepo)
+                .apply()
         }
     }
 
     private fun stopTunnel() {
+        V2RayOutboundClient.onTunnelDegradedListener = null
+        watchdogJob?.cancel()
+        watchdogJob = null
         tunnelJob?.cancel()
         tunnelJob = null
+        currentActiveConfig = null
+        isHealing.set(false)
         runCatching { tunRouter?.destroy() }
         tunRouter = null
         runCatching { localProxyServer?.destroy() }

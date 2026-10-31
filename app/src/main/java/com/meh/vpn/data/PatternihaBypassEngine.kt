@@ -82,7 +82,10 @@ object PatternihaBypassEngine {
                         }
                     }
                 }.awaitAll()
-            }.filterNotNull().sortedBy { it.pingMs }
+            }.filterNotNull().sortedWith(
+                compareBy<V2RayConfig> { V2RayOutboundClient.isNodeBlacklisted(it) }
+                    .thenBy { it.pingMs }
+            )
 
             if (verifiedRepoConfigs.isNotEmpty()) {
                 return@withContext verifiedRepoConfigs.first()
@@ -110,7 +113,10 @@ object PatternihaBypassEngine {
                     }
                 }
             }.awaitAll()
-        }.filterNotNull().sortedBy { it.pingMs }
+        }.filterNotNull().sortedWith(
+            compareBy<V2RayConfig> { V2RayOutboundClient.isNodeBlacklisted(it) }
+                .thenBy { it.pingMs }
+        )
 
         validated.firstOrNull()
     }
@@ -191,7 +197,7 @@ object PatternihaBypassEngine {
     // Method 4: patterniha/SNI-Spoofing
     // =========================================================================
 
-    suspend fun discoverAndValidateSniSpoofing(): V2RayConfig = withContext(Dispatchers.IO) {
+    suspend fun discoverAndValidateSniSpoofingOrNull(): V2RayConfig? = withContext(Dispatchers.IO) {
         val spoofDomain = fetchDynamicSpoofDomain() ?: defaultSpoofDomains.first()
         val semaphore = Semaphore(8)
 
@@ -215,12 +221,19 @@ object PatternihaBypassEngine {
                     }
                 }
             }.awaitAll()
-        }.filterNotNull().sortedBy { it.pingMs }
+        }.filterNotNull().sortedWith(
+            compareBy<V2RayConfig> { V2RayOutboundClient.isNodeBlacklisted(it) }
+                .thenBy { it.pingMs }
+        )
 
-        if (validated.isNotEmpty()) {
-            return@withContext validated.first()
-        }
+        validated.firstOrNull()
+    }
 
+    suspend fun discoverAndValidateSniSpoofing(): V2RayConfig = withContext(Dispatchers.IO) {
+        discoverAndValidateSniSpoofingOrNull()?.let { return@withContext it }
+
+        val spoofDomain = defaultSpoofDomains.first()
+        val semaphore = Semaphore(8)
         // TCP handshake fallback across candidates so SNI-Spoofing always establishes a tunnel
         val tcpVerified = coroutineScope {
             defaultServerlessCandidates.map { candidate ->
@@ -241,7 +254,10 @@ object PatternihaBypassEngine {
                     }
                 }
             }.awaitAll()
-        }.filterNotNull().sortedBy { it.pingMs }
+        }.filterNotNull().sortedWith(
+            compareBy<V2RayConfig> { V2RayOutboundClient.isNodeBlacklisted(it) }
+                .thenBy { it.pingMs }
+        )
 
         tcpVerified.firstOrNull() ?: buildSniSpoofConfig(
             address = "104.16.132.229",

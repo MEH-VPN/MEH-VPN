@@ -41,7 +41,7 @@ object V2RayParser {
             GeoLocationInfo("FR", "فرانسه", "🇫🇷", 48.8566f, 2.3522f)
         ),
         RegionRule(
-            listOf("turkey", "istanbul", "ankara", "izmir", "ist", "tr-", "_tr", "🇹🇷", " tr "),
+            listOf("turkey", "türkiye", "istanbul", "ankara", "izmir", "tr-", "_tr", "-tr-", "🇹🇷", " tr "),
             GeoLocationInfo("TR", "ترکیه", "🇹🇷", 41.0082f, 28.9784f)
         ),
         RegionRule(
@@ -50,7 +50,7 @@ object V2RayParser {
         ),
         RegionRule(
             listOf("japan", "tokyo", "osaka", "nrt", "kix", "jp-", "_jp", "🇯🇵", " jp "),
-            GeoLocationInfo("JP", "ژاپن", "🇯🇵", 35.6762f, 139.6503f)
+            GeoLocationInfo("JP", "ژاپن", "🇯🇵", 35.6762f, 39.6503f)
         ),
         RegionRule(
             listOf("sweden", "stockholm", "arn", "se-", "_se", "🇸🇪", " se "),
@@ -85,10 +85,7 @@ object V2RayParser {
         GeoLocationInfo("FR", "فرانسه", "🇫🇷", 48.8566f, 2.3522f),
         GeoLocationInfo("GB", "انگلیس", "🇬🇧", 51.5072f, -0.1276f),
         GeoLocationInfo("SE", "سوئد", "🇸🇪", 59.3293f, 18.0686f),
-        GeoLocationInfo("CH", "سوئیس", "🇨🇭", 47.3769f, 8.5417f),
-        GeoLocationInfo("TR", "ترکیه", "🇹🇷", 41.0082f, 28.9784f),
-        GeoLocationInfo("US", "آمریکا", "🇺🇸", 40.7128f, -74.0060f),
-        GeoLocationInfo("SG", "سنگاپور", "🇸🇬", 1.3521f, 103.8198f)
+        GeoLocationInfo("CH", "سوئیس", "🇨🇭", 47.3769f, 8.5417f)
     )
 
     fun geoForCountryCode(code: String): GeoLocationInfo {

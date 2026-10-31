@@ -10,12 +10,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -71,7 +74,7 @@ fun MehScreen(
         else -> TextMuted
     }
 
-    val stageText = when (uiState.stage) {
+    val baseStageText = when (uiState.stage) {
         ConnectionStage.DISCONNECTED -> "خاموش"
         ConnectionStage.FETCHING_SUBSCRIPTIONS -> "دریافت کانفیگ..."
         ConnectionStage.TESTING_SERVERS -> "تست کانفیگ..."
@@ -80,6 +83,12 @@ fun MehScreen(
         ConnectionStage.SNI_SPOOF_FALLBACK -> "اتصال SNI Spoof..."
         ConnectionStage.CONNECTING -> "در حال اتصال..."
         ConnectionStage.CONNECTED -> "متصل"
+    }
+
+    val stageText = if (isBusy && uiState.progressPercent > 0) {
+        "$baseStageText (${uiState.progressPercent}٪)"
+    } else {
+        baseStageText
     }
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -97,7 +106,8 @@ fun MehScreen(
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier.padding(horizontal = 24.dp)
                 ) {
                     val interactionSource = remember { MutableInteractionSource() }
 
@@ -151,24 +161,75 @@ fun MehScreen(
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Below status text: show Flag Emoji and Country Name when connected
+                    // Progress bar & detail text outside the circle during fetching/testing,
+                    // or Flag Emoji + Country Name when connected
                     Box(
-                        modifier = Modifier.height(32.dp),
-                        contentAlignment = Alignment.Center
+                        modifier = Modifier.height(56.dp),
+                        contentAlignment = Alignment.TopCenter
                     ) {
-                        if (isConnected && uiState.selectedServer != null) {
-                            val countryOnly = uiState.selectedServer.countryNameFa
-                                .substringBefore("•")
-                                .trim()
-                            Text(
-                                text = "${uiState.selectedServer.flagEmoji} $countryOnly",
-                                fontFamily = VazirmatnFontFamily,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 18.sp,
-                                color = TextPrimary,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.testTag("connected_country_label")
-                            )
+                        when {
+                            isConnected && uiState.selectedServer != null -> {
+                                val countryOnly = uiState.selectedServer.countryNameFa
+                                    .substringBefore("•")
+                                    .trim()
+                                Text(
+                                    text = "${uiState.selectedServer.flagEmoji} $countryOnly",
+                                    fontFamily = VazirmatnFontFamily,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp,
+                                    color = TextPrimary,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.testTag("connected_country_label")
+                                )
+                            }
+                            isBusy -> {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    // Sleek progress bar outside the circle
+                                    val fraction = (uiState.progressPercent.coerceIn(0, 100)) / 100f
+                                    Box(
+                                        modifier = Modifier
+                                            .width(180.dp)
+                                            .height(6.dp)
+                                            .clip(RoundedCornerShape(3.dp))
+                                            .background(ObsidianSurfaceElevated)
+                                            .testTag("scan_progress_bar")
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth(fraction)
+                                                .height(6.dp)
+                                                .clip(RoundedCornerShape(3.dp))
+                                                .background(AmberScan)
+                                        )
+                                    }
+
+                                    if (uiState.scanDetailText.isNotEmpty()) {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Text(
+                                            text = uiState.scanDetailText,
+                                            fontFamily = VazirmatnFontFamily,
+                                            fontWeight = FontWeight.Medium,
+                                            fontSize = 13.sp,
+                                            color = TextSecondary,
+                                            textAlign = TextAlign.Center,
+                                            modifier = Modifier.testTag("scan_progress_detail")
+                                        )
+                                    }
+                                }
+                            }
+                            uiState.scanDetailText.isNotEmpty() -> {
+                                Text(
+                                    text = uiState.scanDetailText,
+                                    fontFamily = VazirmatnFontFamily,
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 13.sp,
+                                    color = TextMuted,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.testTag("scan_progress_detail")
+                                )
+                            }
                         }
                     }
                 }

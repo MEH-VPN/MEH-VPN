@@ -80,7 +80,10 @@ object AetherGatewayEngine {
                     }
                 }
             }.awaitAll()
-        }.filterNotNull().sortedBy { it.pingMs }
+        }.filterNotNull().sortedWith(
+            compareBy<V2RayConfig> { V2RayOutboundClient.isNodeBlacklisted(it) }
+                .thenBy { it.pingMs }
+        )
 
         validated.firstOrNull()
     }
@@ -145,14 +148,23 @@ object AetherGatewayEngine {
             pingMs = -1
         )
         return try {
+            // Must pass real filtered-site HTTPS verification (not just unblocked /cdn-cgi/trace on MCI)
+            val realPing = V2RayOutboundClient.verifyRealInternetConnectivity(
+                config = baseConfig,
+                vpnService = null,
+                timeoutMs = 2200
+            )
+            if (realPing !in 1..4999) {
+                return null
+            }
+
             var detectedColoOrCountry = candidate.defaultCountryCode
-            var validDataPlane = false
-            val elapsed = measureTimeMillis {
+            runCatching {
                 V2RayOutboundClient.openAetherGatewayProbeStream(
                     gatewayHost = candidate.address,
                     gatewayPort = candidate.port,
                     sniHost = candidate.sni,
-                    connectTimeoutMs = 2000
+                    connectTimeoutMs = 1500
                 ).use { stream ->
                     val traceReq = buildString {
                         append("GET /cdn-cgi/trace HTTP/1.1\r\n")
@@ -167,39 +179,27 @@ object AetherGatewayEngine {
                     val read = stream.input.read(buf)
                     if (read > 0) {
                         val resp = String(buf, 0, read, Charsets.US_ASCII)
-                        if (resp.startsWith("HTTP/1.1 200") ||
-                            resp.startsWith("HTTP/1.1 204") ||
-                            resp.startsWith("HTTP/1.1 400") ||
-                            resp.startsWith("HTTP/1.1 403") ||
-                            resp.contains("colo=") ||
-                            resp.contains("cloudflare", ignoreCase = true)
-                        ) {
-                            validDataPlane = true
-                            val coloLine = resp.lineSequence().firstOrNull { it.startsWith("colo=") }
-                            val colo = coloLine?.substringAfter("colo=")?.trim().orEmpty()
-                            if (colo.length == 3) {
-                                detectedColoOrCountry = mapCloudflareColoToCountry(colo)
-                            }
+                        val coloLine = resp.lineSequence().firstOrNull { it.startsWith("colo=") }
+                        val colo = coloLine?.substringAfter("colo=")?.trim().orEmpty()
+                        if (colo.length == 3) {
+                            detectedColoOrCountry = mapCloudflareColoToCountry(colo)
                         }
                     }
                 }
             }
-            if (validDataPlane) {
-                val geo = V2RayParser.geoForCountryCode(detectedColoOrCountry)
-                val uri = "aether://masque-fragment@${candidate.address}:${candidate.port}?sni=${candidate.sni}&cc=${geo.countryCode}&fragment=2-5#Aether-${geo.countryCode}"
-                baseConfig.copy(
-                    rawUri = uri,
-                    remark = geo.countryNameFa,
-                    countryCode = geo.countryCode,
-                    countryNameFa = geo.countryNameFa,
-                    flagEmoji = geo.flagEmoji,
-                    latitude = geo.latitude,
-                    longitude = geo.longitude,
-                    pingMs = elapsed.toInt().coerceAtLeast(1)
-                )
-            } else {
-                null
-            }
+
+            val geo = V2RayParser.geoForCountryCode(detectedColoOrCountry)
+            val uri = "aether://masque-fragment@${candidate.address}:${candidate.port}?sni=${candidate.sni}&cc=${geo.countryCode}&fragment=2-5#Aether-${geo.countryCode}"
+            baseConfig.copy(
+                rawUri = uri,
+                remark = geo.countryNameFa,
+                countryCode = geo.countryCode,
+                countryNameFa = geo.countryNameFa,
+                flagEmoji = geo.flagEmoji,
+                latitude = geo.latitude,
+                longitude = geo.longitude,
+                pingMs = realPing.coerceAtLeast(1)
+            )
         } catch (_: Exception) {
             null
         }

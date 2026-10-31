@@ -22,11 +22,15 @@ import kotlin.system.measureTimeMillis
 class GitHubSubscriptionAggregator {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(4000, TimeUnit.MILLISECONDS)
-        .readTimeout(5000, TimeUnit.MILLISECONDS)
+        .connectTimeout(2500, TimeUnit.MILLISECONDS)
+        .readTimeout(3000, TimeUnit.MILLISECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
+
+    fun cancelAllRequests() {
+        runCatching { httpClient.dispatcher.cancelAll() }
+    }
 
     val defaultGitHubSources = listOf(
         GitHubSubscriptionSource(
@@ -34,9 +38,9 @@ class GitHubSubscriptionAggregator {
             repoName = "SoliSpirit/v2ray-configs",
             repoUrl = "https://github.com/SoliSpirit/v2ray-configs",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
                 "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
                 "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
-                "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt",
                 "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Subscriptions/Sub1.txt"
             )
         ),
@@ -45,10 +49,9 @@ class GitHubSubscriptionAggregator {
             repoName = "MohammadBahemmat/V2ray-Collector",
             repoUrl = "https://github.com/MohammadBahemmat/V2ray-Collector",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/vless.txt",
                 "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/vless.txt",
-                "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/sub.txt",
-                "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/all_configs.txt",
-                "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/master/sub.txt"
+                "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/sub.txt"
             )
         ),
         GitHubSubscriptionSource(
@@ -56,6 +59,7 @@ class GitHubSubscriptionAggregator {
             repoName = "barry-far/V2ray-Configs",
             repoUrl = "https://github.com/barry-far/V2ray-Configs",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/barry-far/V2ray-Configs@main/Splitted-By-Protocol/vless.txt",
                 "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Splitted-By-Protocol/vless.txt",
                 "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt"
             )
@@ -65,6 +69,7 @@ class GitHubSubscriptionAggregator {
             repoName = "Epodonios/v2ray-configs",
             repoUrl = "https://github.com/Epodonios/v2ray-configs",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/Epodonios/v2ray-configs@main/Splitted-By-Protocol/vless.txt",
                 "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
                 "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt"
             )
@@ -74,6 +79,7 @@ class GitHubSubscriptionAggregator {
             repoName = "mahdibland/V2RayAggregator",
             repoUrl = "https://github.com/mahdibland/V2RayAggregator",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/mahdibland/V2RayAggregator@master/sub/splitted/vless.txt",
                 "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/splitted/vless.txt",
                 "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt"
             )
@@ -83,6 +89,7 @@ class GitHubSubscriptionAggregator {
             repoName = "yebekhe/TVC",
             repoUrl = "https://github.com/yebekhe/TVC",
             candidateRawUrls = listOf(
+                "https://cdn.jsdelivr.net/gh/yebekhe/TVC@main/subscriptions/xray/normal/vless",
                 "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless",
                 "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/mix"
             )
@@ -91,18 +98,25 @@ class GitHubSubscriptionAggregator {
 
     /**
      * Fetches V2Ray configs from all configured GitHub repositories concurrently,
-     * prioritizing tunnel-compatible VLESS and Trojan nodes (TCP/WS/TLS).
+     * prioritizing tunnel-compatible VLESS and Trojan nodes (TCP/WS/TLS) and reporting live progress.
      */
     suspend fun fetchAllGitHubConfigs(
         sources: List<GitHubSubscriptionSource> = defaultGitHubSources,
-        maxNodesPerSource: Int = 35
+        maxNodesPerSource: Int = 30,
+        onSourceProgress: ((completedSources: Int, totalSources: Int, totalFound: Int) -> Unit)? = null
     ): List<V2RayConfig> = withContext(Dispatchers.IO) {
         coroutineScope {
             val activeSources = sources.filter { it.isEnabled }
+            val completedCounter = java.util.concurrent.atomic.AtomicInteger(0)
+            val discoveredCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
             val fetchedLists = activeSources.map { source ->
                 async {
-                    fetchConfigsFromSource(source, maxNodesPerSource)
+                    val list = fetchConfigsFromSource(source, maxNodesPerSource)
+                    val done = completedCounter.incrementAndGet()
+                    val totalNow = discoveredCounter.addAndGet(list.size)
+                    onSourceProgress?.invoke(done, activeSources.size, totalNow)
+                    list
                 }
             }.awaitAll()
 
@@ -118,7 +132,7 @@ class GitHubSubscriptionAggregator {
                 }
             }
 
-            mergedMap.values.take(110)
+            mergedMap.values.take(90)
         }
     }
 
@@ -148,61 +162,26 @@ class GitHubSubscriptionAggregator {
                 }
             }
         }
-        return discoverSubscriptionFromRepoApi(source.repoName, maxNodes)
-    }
-
-    private fun discoverSubscriptionFromRepoApi(repoFullName: String, maxNodes: Int): List<V2RayConfig> {
-        return try {
-            val contentsUrl = "https://api.github.com/repos/$repoFullName/contents"
-            val jsonStr = fetchUrlText(contentsUrl)
-            if (!jsonStr.trim().startsWith("[")) return emptyList()
-
-            val array = JSONArray(jsonStr)
-            for (i in 0 until array.length()) {
-                val obj = array.optJSONObject(i) ?: continue
-                val name = obj.optString("name", "").lowercase()
-                val type = obj.optString("type", "")
-                val downloadUrl = obj.optString("download_url", "")
-
-                if (type == "file" && downloadUrl.isNotEmpty() &&
-                    (name.endsWith(".txt") || name.contains("sub") || name.contains("vless") || name.contains("config")) &&
-                    !name.contains("readme") && !name.contains("license")
-                ) {
-                    val content = fetchUrlText(downloadUrl)
-                    val parsed = V2RayParser.parseSubscriptionPayload(
-                        payload = content,
-                        sourceRepo = repoFullName,
-                        maxLimit = maxNodes,
-                        filterPredicate = ::isDirectTunnelSupported
-                    )
-                    if (parsed.isNotEmpty()) {
-                        return parsed
-                    }
-                }
-            }
-            emptyList()
-        } catch (_: Exception) {
-            emptyList()
-        }
+        return emptyList()
     }
 
     /**
-     * Two-stage smart server verification:
-     * 1. Fast TCP reachability scan across all fetched GitHub servers.
-     * 2. Real V2Ray Tunnel HTTP 204 verification (sending an actual HTTP 204 request through
-     *    the VLESS/Trojan tunnel to cp.cloudflare.com) so we ONLY select a server that genuinely
-     *    provides open internet access!
+     * Quickly pre-filters [configs] by TCP handshake latency and returns up to [maxCandidates]
+     * lowest-latency reachable servers.
      */
-    suspend fun findFastestServer(
+    suspend fun rankTopTcpCandidates(
         configs: List<V2RayConfig>,
-        timeoutMs: Int = 900
-    ): Pair<V2RayConfig?, List<V2RayConfig>> = withContext(Dispatchers.IO) {
-        if (configs.isEmpty()) return@withContext null to emptyList()
+        maxCandidates: Int = 10,
+        timeoutMs: Int = 700
+    ): List<V2RayConfig> = withContext(Dispatchers.IO) {
+        if (configs.isEmpty()) return@withContext emptyList()
 
-        // Stage 1: Fast TCP Handshake Pre-Filter
+        val candidatePool = configs.filterNot { V2RayOutboundClient.isNodeBlacklisted(it) }
+            .ifEmpty { configs }
+
         val tcpSemaphore = Semaphore(32)
         val tcpTested = coroutineScope {
-            configs.map { config ->
+            candidatePool.map { config ->
                 async {
                     tcpSemaphore.withPermit {
                         val tcpPing = measureTcpHandshakeMs(config.address, config.port, timeoutMs)
@@ -212,41 +191,51 @@ class GitHubSubscriptionAggregator {
             }.awaitAll()
         }
 
-        val tcpReachable = tcpTested
+        tcpTested
             .filter { it.isReachable }
-            .sortedBy { it.pingMs }
+            // Prioritize European Tier-1 nodes (DE, NL, FI, FR, GB, SE, CH) ahead of TR transit relays on MCI
+            .sortedWith(
+                compareBy<V2RayConfig> { it.countryCode.equals("TR", ignoreCase = true) }
+                    .thenBy { it.pingMs }
+            )
+            .take(maxCandidates)
+    }
 
-        if (tcpReachable.isEmpty()) {
+    /**
+     * Two-stage smart server verification with bounded test count (max 12 V2Ray candidates)
+     * and early-exit as soon as a verified open-internet server is found.
+     */
+    suspend fun findFastestServer(
+        configs: List<V2RayConfig>,
+        timeoutMs: Int = 700
+    ): Pair<V2RayConfig?, List<V2RayConfig>> = withContext(Dispatchers.IO) {
+        val topCandidates = rankTopTcpCandidates(configs, maxCandidates = 10, timeoutMs = timeoutMs)
+        if (topCandidates.isEmpty()) {
             return@withContext null to emptyList()
         }
 
-        // Stage 2: Verify real end-to-end Open Internet (HTTP 204 through V2Ray tunnel) on top 24 TCP-reachable servers
-        val topCandidates = tcpReachable.take(24)
-        val tunnelSemaphore = Semaphore(12)
-        val tunnelVerified = coroutineScope {
-            topCandidates.map { candidate ->
-                async {
-                    tunnelSemaphore.withPermit {
+        val workingServers = mutableListOf<V2RayConfig>()
+        // Test in fast batches of 4 so we connect immediately when the first working server responds
+        for (batch in topCandidates.chunked(4)) {
+            val verifiedBatch = coroutineScope {
+                batch.map { candidate ->
+                    async {
                         val realHttpPing = V2RayOutboundClient.verifyRealInternetConnectivity(
                             config = candidate,
                             vpnService = null,
-                            timeoutMs = 2800
+                            timeoutMs = 2200
                         )
                         candidate.copy(pingMs = realHttpPing)
                     }
-                }
-            }.awaitAll()
+                }.awaitAll()
+            }.filter { it.isReachable }.sortedBy { it.pingMs }
+
+            if (verifiedBatch.isNotEmpty()) {
+                workingServers.addAll(verifiedBatch)
+                return@withContext workingServers.first() to workingServers
+            }
         }
 
-        val workingInternetServers = tunnelVerified
-            .filter { it.isReachable }
-            .sortedBy { it.pingMs }
-
-        if (workingInternetServers.isNotEmpty()) {
-            return@withContext workingInternetServers.first() to workingInternetServers
-        }
-
-        // No V2Ray server passed real end-to-end internet verification -> return null so Method 2 (CluvexStudio/Aether) activates
         return@withContext null to emptyList()
     }
 
