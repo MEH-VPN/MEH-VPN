@@ -64,17 +64,16 @@ class Tun2V2RayRouter(
                 if (readLen < ihl) continue
 
                 val protocol = packetBuf[9].toInt() and 0xFF
-                val packetCopy = packetBuf.copyOfRange(0, readLen)
 
                 when (protocol) {
                     17 -> { // UDP
                         if (readLen >= ihl + 8) {
-                            handleUdpPacket(packetCopy, ihl)
+                            handleUdpPacket(packetBuf, readLen, ihl)
                         }
                     }
                     6 -> { // TCP
                         if (readLen >= ihl + 20) {
-                            handleTcpPacket(packetCopy, ihl)
+                            handleTcpPacket(packetBuf, readLen, ihl)
                         }
                     }
                 }
@@ -96,20 +95,20 @@ class Tun2V2RayRouter(
     // UDP DNS Handler (Port 53 over V2Ray TCP Tunnel + DNS IP->Domain Sniffer)
     // =========================================================================
 
-    private fun handleUdpPacket(packet: ByteArray, ihl: Int) {
+    private fun handleUdpPacket(packet: ByteArray, packetLen: Int, ihl: Int) {
         val dstPort = readUInt16(packet, ihl + 2)
         if (dstPort != 53) {
             // Answer unhandled UDP (e.g. QUIC on 443) with ICMP Port Unreachable so browsers
             // fail over to TCP immediately instead of waiting for their UDP socket timeout.
-            writeTunPacket(buildIcmpPortUnreachablePacket(packet, ihl))
+            writeTunPacket(buildIcmpPortUnreachablePacket(packet, packetLen, ihl))
             return
         }
 
         val payloadOffset = ihl + 8
-        val payloadLen = packet.size - payloadOffset
+        val payloadLen = packetLen - payloadOffset
         if (payloadLen <= 12) return
 
-        val dnsQuery = packet.copyOfRange(payloadOffset, packet.size)
+        val dnsQuery = packet.copyOfRange(payloadOffset, packetLen)
         val queriedDomain = parseDnsQueryDomain(dnsQuery)
 
         routerScope.launch {
@@ -269,7 +268,7 @@ class Tun2V2RayRouter(
     // TCP NAT Stack (Handles SYN, ACK, PSH+ACK, FIN, RST + TLS SNI Extraction)
     // =========================================================================
 
-    private fun handleTcpPacket(packet: ByteArray, ihl: Int) {
+    private fun handleTcpPacket(packet: ByteArray, packetLen: Int, ihl: Int) {
         val srcIpBytes = packet.copyOfRange(12, 16)
         val dstIpBytes = packet.copyOfRange(16, 20)
         val srcIpStr = formatIpv4(srcIpBytes)
@@ -288,7 +287,7 @@ class Tun2V2RayRouter(
         val isRst = (flags and TCP_FLAG_RST) != 0
 
         val payloadOffset = ihl + dataOffset
-        val payloadLen = (packet.size - payloadOffset).coerceAtLeast(0)
+        val payloadLen = (packetLen - payloadOffset).coerceAtLeast(0)
         val sessionKey = "$srcIpStr:$srcPort->$dstIpStr:$dstPort"
 
         if (isRst) {
@@ -316,7 +315,7 @@ class Tun2V2RayRouter(
         val session = tcpSessions[sessionKey] ?: return
 
         if (payloadLen > 0) {
-            val payload = packet.copyOfRange(payloadOffset, packet.size)
+            val payload = packet.copyOfRange(payloadOffset, packetLen)
             session.onClientDataReceived(seqNum, payload)
         } else if (isAck && !isFin) {
             session.onPureAckReceived(ackNum)
@@ -649,8 +648,8 @@ class Tun2V2RayRouter(
      * Builds an RFC 792 ICMP Destination Unreachable / Port Unreachable (Type 3, Code 3)
      * quoting the original IP header plus the first 8 bytes of its UDP header.
      */
-    private fun buildIcmpPortUnreachablePacket(originalPacket: ByteArray, ihl: Int): ByteArray {
-        val quotedLen = (ihl + 8).coerceAtMost(originalPacket.size)
+    private fun buildIcmpPortUnreachablePacket(originalPacket: ByteArray, originalLen: Int, ihl: Int): ByteArray {
+        val quotedLen = (ihl + 8).coerceAtMost(originalLen)
         val icmpLen = 8 + quotedLen
         val totalLen = 20 + icmpLen
         val out = ByteArray(totalLen)
