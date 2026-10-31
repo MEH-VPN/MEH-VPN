@@ -94,7 +94,12 @@ class Tun2V2RayRouter(
 
     private fun handleUdpPacket(packet: ByteArray, ihl: Int) {
         val dstPort = readUInt16(packet, ihl + 2)
-        if (dstPort != 53) return
+        if (dstPort != 53) {
+            // Answer unhandled UDP (e.g. QUIC on 443) with ICMP Port Unreachable so browsers
+            // fail over to TCP immediately instead of waiting for their UDP socket timeout.
+            writeTunPacket(buildIcmpPortUnreachablePacket(packet, ihl))
+            return
+        }
 
         val payloadOffset = ihl + 8
         val payloadLen = packet.size - payloadOffset
@@ -594,6 +599,56 @@ class Tun2V2RayRouter(
         out[27] = 0
 
         System.arraycopy(payload, 0, out, 28, payload.size)
+        return out
+    }
+
+    /**
+     * Builds an RFC 792 ICMP Destination Unreachable / Port Unreachable (Type 3, Code 3)
+     * quoting the original IP header plus the first 8 bytes of its UDP header.
+     */
+    private fun buildIcmpPortUnreachablePacket(originalPacket: ByteArray, ihl: Int): ByteArray {
+        val quotedLen = (ihl + 8).coerceAtMost(originalPacket.size)
+        val icmpLen = 8 + quotedLen
+        val totalLen = 20 + icmpLen
+        val out = ByteArray(totalLen)
+
+        writeIpv4Header(
+            out = out,
+            totalLen = totalLen,
+            protocol = 1, // ICMP
+            srcIp = originalPacket.copyOfRange(16, 20),
+            dstIp = originalPacket.copyOfRange(12, 16)
+        )
+
+        // ICMP header: Type (3), Code (3), Checksum, 4 unused bytes
+        out[20] = 3
+        out[21] = 3
+        out[22] = 0
+        out[23] = 0
+        out[24] = 0
+        out[25] = 0
+        out[26] = 0
+        out[27] = 0
+
+        System.arraycopy(originalPacket, 0, out, 28, quotedLen)
+
+        // ICMP checksum over message header + quoted payload (no pseudo-header)
+        var sum = 0
+        var offset = 20
+        while (offset < totalLen - 1) {
+            sum += readUInt16(out, offset)
+            offset += 2
+        }
+        if (offset < totalLen) {
+            sum += (out[offset].toInt() and 0xFF) shl 8
+        }
+        while ((sum ushr 16) != 0) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
+        }
+        val checksum = sum.inv() and 0xFFFF
+        out[22] = ((checksum ushr 8) and 0xFF).toByte()
+        out[23] = (checksum and 0xFF).toByte()
+
         return out
     }
 
