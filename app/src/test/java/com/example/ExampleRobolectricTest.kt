@@ -2,6 +2,8 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.AetherGatewayEngine
+import com.example.data.PatternihaBypassEngine
 import com.example.data.V2RayParser
 import com.example.model.V2RayProtocol
 import org.junit.Assert.assertEquals
@@ -37,6 +39,47 @@ class ExampleRobolectricTest {
         val coreJson = parsed.toV2RayCoreJson()
         assertTrue(coreJson.contains("\"protocol\": \"vless\""))
         assertTrue(coreJson.contains("\"address\": \"1.1.1.1\""))
+    }
+
+    @Test
+    fun `aether and patterniha serverless and sni spoofing configs build and parse cleanly`() {
+        val aetherCfg = AetherGatewayEngine.buildAetherConfig(
+            address = "162.159.198.1",
+            port = 443,
+            sni = "engage.cloudflareclient.com",
+            countryCode = "DE",
+            pingMs = 48
+        )
+        val parsedAether = V2RayParser.parseSingleUri(aetherCfg.rawUri, aetherCfg.sourceRepo)
+        assertNotNull(parsedAether)
+        assertEquals(V2RayProtocol.AETHER, parsedAether!!.protocol)
+        assertTrue(parsedAether.toV2RayCoreJson().replace("\\/", "/").contains("CluvexStudio/Aether"))
+
+        val serverlessCfg = PatternihaBypassEngine.buildServerlessConfig(
+            address = "104.16.132.229",
+            port = 443,
+            sni = "cp.cloudflare.com",
+            countryCode = "NL",
+            pingMs = 52
+        )
+        val parsedServerless = V2RayParser.parseSingleUri(serverlessCfg.rawUri, serverlessCfg.sourceRepo)
+        assertNotNull(parsedServerless)
+        assertEquals(V2RayProtocol.SERVERLESS, parsedServerless!!.protocol)
+        assertEquals("🇳🇱", parsedServerless.flagEmoji)
+        assertTrue(parsedServerless.toV2RayCoreJson().replace("\\/", "/").contains("patterniha/Serverless-for-Iran"))
+
+        val sniSpoofCfg = PatternihaBypassEngine.buildSniSpoofConfig(
+            address = "172.64.155.209",
+            port = 443,
+            fakeSni = "speedtest.net",
+            countryCode = "FI",
+            pingMs = 59
+        )
+        val parsedSniSpoof = V2RayParser.parseSingleUri(sniSpoofCfg.rawUri, sniSpoofCfg.sourceRepo)
+        assertNotNull(parsedSniSpoof)
+        assertEquals(V2RayProtocol.SNI_SPOOF, parsedSniSpoof!!.protocol)
+        assertEquals("🇫🇮", parsedSniSpoof.flagEmoji)
+        assertTrue(parsedSniSpoof.toV2RayCoreJson().replace("\\/", "/").contains("patterniha/SNI-Spoofing"))
     }
 
     @Test

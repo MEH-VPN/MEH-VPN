@@ -54,6 +54,9 @@ fun MehScreen(
     val isConnected = uiState.stage == ConnectionStage.CONNECTED
     val isBusy = uiState.stage == ConnectionStage.FETCHING_SUBSCRIPTIONS ||
         uiState.stage == ConnectionStage.TESTING_SERVERS ||
+        uiState.stage == ConnectionStage.AETHER_FALLBACK ||
+        uiState.stage == ConnectionStage.SERVERLESS_FALLBACK ||
+        uiState.stage == ConnectionStage.SNI_SPOOF_FALLBACK ||
         uiState.stage == ConnectionStage.CONNECTING
 
     val ringColor = when {
@@ -72,6 +75,9 @@ fun MehScreen(
         ConnectionStage.DISCONNECTED -> "خاموش"
         ConnectionStage.FETCHING_SUBSCRIPTIONS -> "دریافت کانفیگ..."
         ConnectionStage.TESTING_SERVERS -> "تست کانفیگ..."
+        ConnectionStage.AETHER_FALLBACK -> "اتصال Aether..."
+        ConnectionStage.SERVERLESS_FALLBACK -> "اتصال Serverless..."
+        ConnectionStage.SNI_SPOOF_FALLBACK -> "اتصال SNI Spoof..."
         ConnectionStage.CONNECTING -> "در حال اتصال..."
         ConnectionStage.CONNECTED -> "متصل"
     }
@@ -135,9 +141,9 @@ fun MehScreen(
                                 text = stageText,
                                 fontFamily = VazirmatnFontFamily,
                                 fontWeight = FontWeight.Bold,
-                                fontSize = 17.sp,
+                                fontSize = 16.sp,
                                 color = when {
-                                    isConnected -> CyberEmerald
+                                     isConnected -> CyberEmerald
                                     isBusy -> AmberScan
                                     else -> TextSecondary
                                 },

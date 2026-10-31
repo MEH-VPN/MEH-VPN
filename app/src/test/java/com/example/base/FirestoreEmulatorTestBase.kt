@@ -40,7 +40,7 @@ abstract class FirestoreEmulatorTestBase {
             val newApp = FirebaseApp.initializeApp(
                 context,
                 FirebaseOptions.Builder()
-                    .setApplicationId("com.aistudio.v2pulsevpn.qrxm")
+                    .setApplicationId("com.meh.vpn")
                     .setProjectId(PROJECT_ID)
                     .setApiKey("fake-api-key-for-emulator")
                     .build()

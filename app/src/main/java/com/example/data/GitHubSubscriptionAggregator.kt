@@ -246,8 +246,8 @@ class GitHubSubscriptionAggregator {
             return@withContext workingInternetServers.first() to workingInternetServers
         }
 
-        // Fallback to fastest TCP-reachable V2Ray server if HTTP 204 probe timed out
-        return@withContext tcpReachable.first() to tcpReachable
+        // No V2Ray server passed real end-to-end internet verification -> return null so Method 2 (CluvexStudio/Aether) activates
+        return@withContext null to emptyList()
     }
 
     fun measureTcpHandshakeMs(host: String, port: Int, timeoutMs: Int = 900): Int {

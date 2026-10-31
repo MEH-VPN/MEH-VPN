@@ -6,16 +6,21 @@ import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.R
+import com.example.data.AetherGatewayEngine
 import com.example.data.GitHubSubscriptionAggregator
 import com.example.data.MehFirebaseRepository
+import com.example.data.PatternihaBypassEngine
 import com.example.data.V2RayParser
 import com.example.model.ConnectionStage
 import com.example.model.V2RayConfig
+import com.example.model.V2RayProtocol
+import com.example.vpn.V2RayOutboundClient
 import com.example.vpn.VpnStateBus
 import com.google.firebase.FirebaseApp
 import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +28,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class VpnUiState(
     val stage: ConnectionStage = ConnectionStage.DISCONNECTED,
@@ -60,9 +66,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { current ->
                     val resolvedStage = when {
                         runtime.stage == ConnectionStage.CONNECTED -> ConnectionStage.CONNECTED
+                        runtime.stage == ConnectionStage.AETHER_FALLBACK -> ConnectionStage.AETHER_FALLBACK
+                        runtime.stage == ConnectionStage.SERVERLESS_FALLBACK -> ConnectionStage.SERVERLESS_FALLBACK
+                        runtime.stage == ConnectionStage.SNI_SPOOF_FALLBACK -> ConnectionStage.SNI_SPOOF_FALLBACK
                         runtime.stage == ConnectionStage.CONNECTING -> ConnectionStage.CONNECTING
                         current.stage == ConnectionStage.FETCHING_SUBSCRIPTIONS ||
-                            current.stage == ConnectionStage.TESTING_SERVERS -> current.stage
+                            current.stage == ConnectionStage.TESTING_SERVERS ||
+                            current.stage == ConnectionStage.AETHER_FALLBACK ||
+                            current.stage == ConnectionStage.SERVERLESS_FALLBACK ||
+                            current.stage == ConnectionStage.SNI_SPOOF_FALLBACK -> current.stage
                         else -> ConnectionStage.DISCONNECTED
                     }
                     current.copy(
@@ -76,6 +88,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     logAnalyticsEvent("meh_vpn_connected") {
                         putString("country", cfg?.countryNameFa?.substringBefore("•")?.trim() ?: "unknown")
                         putString("protocol", cfg?.protocol?.name ?: "unknown")
+                        putString("source_repo", cfg?.sourceRepo ?: "unknown")
                         putLong("ping_ms", (cfg?.pingMs ?: 0).toLong())
                     }
                 }
@@ -88,61 +101,100 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         scanJob = viewModelScope.launch {
             logAnalyticsEvent("meh_connect_clicked")
 
-            // Stage 1: دریافت کانفیگ (Fetching configs from GitHub)
+            // =========================================================================
+            // Method 1: دریافت کانفیگ و تست کانفیگ از گیت‌هاب (GitHub V2Ray Configs)
+            // =========================================================================
             _uiState.update { it.copy(stage = ConnectionStage.FETCHING_SUBSCRIPTIONS) }
             val configs = aggregator.fetchAllGitHubConfigs()
-            delay(250)
+            delay(200)
 
-            // Stage 2: تست کانفیگ (Testing configs to pick the fastest server)
-            _uiState.update { it.copy(stage = ConnectionStage.TESTING_SERVERS) }
-            val (bestServer, _) = aggregator.findFastestServer(configs)
-            delay(250)
+            var selectedConfig: V2RayConfig? = null
+            if (configs.isNotEmpty()) {
+                _uiState.update { it.copy(stage = ConnectionStage.TESTING_SERVERS) }
+                val (bestServer, _) = aggregator.findFastestServer(configs)
+                selectedConfig = bestServer
+            }
 
-            val resolvedBest = bestServer ?: run {
+            if (selectedConfig == null) {
                 val cachedUri = prefs.getString(KEY_LAST_BEST_URI, null)
                 val cachedSource = prefs.getString(KEY_LAST_BEST_SOURCE, "SoliSpirit/v2ray-configs") ?: "GitHub"
                 if (!cachedUri.isNullOrBlank()) {
-                    V2RayParser.parseSingleUri(cachedUri, cachedSource)
-                } else {
-                    null
+                    val parsedCached = V2RayParser.parseSingleUri(cachedUri, cachedSource)
+                    if (parsedCached != null &&
+                        (parsedCached.protocol == V2RayProtocol.VLESS || parsedCached.protocol == V2RayProtocol.TROJAN)
+                    ) {
+                        val ping = withContext(Dispatchers.IO) {
+                            V2RayOutboundClient.verifyRealInternetConnectivity(parsedCached, null, 2000)
+                        }
+                        if (ping in 1..4999) {
+                            selectedConfig = parsedCached.copy(pingMs = ping)
+                        }
+                    }
                 }
             }
 
-            if (resolvedBest != null) {
-                cacheBestServer(resolvedBest)
-                val countryOnly = resolvedBest.countryNameFa.substringBefore("•").trim()
-                logAnalyticsEvent("meh_server_selected") {
-                    putString("country", countryOnly)
-                    putString("source_repo", resolvedBest.sourceRepo)
-                    putLong("ping_ms", resolvedBest.pingMs.toLong())
-                }
-                runCatching {
-                    val app = getApplication<Application>()
-                    ensureFirebaseInitialized()
-                    if (FirebaseAuth.getInstance().currentUser != null) {
-                        val databaseId = app.getString(R.string.firestore_database_id)
-                        val db = FirebaseFirestore.getInstance(databaseId)
-                        MehFirebaseRepository(db).saveConnectionLog(
-                            countryNameFa = countryOnly,
-                            flagEmoji = resolvedBest.flagEmoji,
-                            rawUri = resolvedBest.rawUri,
-                            sourceRepo = resolvedBest.sourceRepo,
-                            pingMs = resolvedBest.pingMs.toLong()
-                        )
-                    }
-                }
-                // Stage 3: در حال اتصال (Connecting to best server)
-                _uiState.update {
-                    it.copy(
-                        stage = ConnectionStage.CONNECTING,
-                        selectedServer = resolvedBest
+            // =========================================================================
+            // Method 2: CluvexStudio/Aether (در صورت وصل نشدن روش اول)
+            // =========================================================================
+            if (selectedConfig == null) {
+                logAnalyticsEvent("meh_aether_fallback_started")
+                _uiState.update { it.copy(stage = ConnectionStage.AETHER_FALLBACK) }
+                delay(200)
+                selectedConfig = AetherGatewayEngine.discoverAndValidateGatewayOrNull()
+            }
+
+            // =========================================================================
+            // Method 3: patterniha/Serverless-for-Iran (در صورت وصل نشدن روش دوم)
+            // =========================================================================
+            if (selectedConfig == null) {
+                logAnalyticsEvent("meh_serverless_fallback_started")
+                _uiState.update { it.copy(stage = ConnectionStage.SERVERLESS_FALLBACK) }
+                delay(200)
+                selectedConfig = PatternihaBypassEngine.discoverAndValidateServerlessOrNull()
+            }
+
+            // =========================================================================
+            // Method 4: patterniha/SNI-Spoofing (در صورت وصل نشدن روش سوم)
+            // =========================================================================
+            val resolvedBest: V2RayConfig = selectedConfig ?: run {
+                logAnalyticsEvent("meh_sni_spoof_fallback_started")
+                _uiState.update { it.copy(stage = ConnectionStage.SNI_SPOOF_FALLBACK) }
+                delay(200)
+                PatternihaBypassEngine.discoverAndValidateSniSpoofing()
+            }
+
+            cacheBestServer(resolvedBest)
+            val countryOnly = resolvedBest.countryNameFa.substringBefore("•").trim()
+            logAnalyticsEvent("meh_server_selected") {
+                putString("country", countryOnly)
+                putString("protocol", resolvedBest.protocol.name)
+                putString("source_repo", resolvedBest.sourceRepo)
+                putLong("ping_ms", resolvedBest.pingMs.toLong())
+            }
+            runCatching {
+                val app = getApplication<Application>()
+                ensureFirebaseInitialized()
+                if (FirebaseAuth.getInstance().currentUser != null) {
+                    val databaseId = app.getString(R.string.firestore_database_id)
+                    val db = FirebaseFirestore.getInstance(databaseId)
+                    MehFirebaseRepository(db).saveConnectionLog(
+                        countryNameFa = countryOnly,
+                        flagEmoji = resolvedBest.flagEmoji,
+                        rawUri = resolvedBest.rawUri,
+                        sourceRepo = resolvedBest.sourceRepo,
+                        pingMs = resolvedBest.pingMs.toLong()
                     )
                 }
-                onReadyToStartService(resolvedBest)
-            } else {
-                logAnalyticsEvent("meh_connect_failed")
-                _uiState.update { it.copy(stage = ConnectionStage.DISCONNECTED) }
             }
+
+            // Final Stage: در حال اتصال -> متصل
+            _uiState.update {
+                it.copy(
+                    stage = ConnectionStage.CONNECTING,
+                    selectedServer = resolvedBest
+                )
+            }
+            onReadyToStartService(resolvedBest)
         }
     }
 

@@ -13,9 +13,12 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.AetherGatewayEngine
+import com.example.data.PatternihaBypassEngine
 import com.example.data.V2RayParser
 import com.example.model.ConnectionStage
 import com.example.model.V2RayConfig
+import com.example.model.V2RayProtocol
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,26 +49,66 @@ class MehVpnService : VpnService() {
                 if (parsed != null) {
                     startTunnel(parsed)
                 } else {
-                    stopTunnel()
+                    serviceScope.launch {
+                        val fallbackConfig = resolveCascadeFallback(null)
+                        startTunnel(fallbackConfig)
+                    }
                 }
             }
         }
         return START_STICKY
     }
 
-    private fun startTunnel(config: V2RayConfig) {
-        VpnStateBus.updateStage(ConnectionStage.CONNECTING, config)
-        startVpnForegroundNotification(config)
+    private suspend fun resolveCascadeFallback(failedConfig: V2RayConfig?): V2RayConfig {
+        // Method 2: CluvexStudio/Aether
+        VpnStateBus.updateStage(ConnectionStage.AETHER_FALLBACK, failedConfig)
+        val aether = AetherGatewayEngine.discoverAndValidateGatewayOrNull()
+        if (aether != null) return aether
+
+        // Method 3: patterniha/Serverless-for-Iran
+        VpnStateBus.updateStage(ConnectionStage.SERVERLESS_FALLBACK, failedConfig)
+        val serverless = PatternihaBypassEngine.discoverAndValidateServerlessOrNull()
+        if (serverless != null) return serverless
+
+        // Method 4: patterniha/SNI-Spoofing
+        VpnStateBus.updateStage(ConnectionStage.SNI_SPOOF_FALLBACK, failedConfig)
+        return PatternihaBypassEngine.discoverAndValidateSniSpoofing()
+    }
+
+    private fun startTunnel(initialConfig: V2RayConfig) {
+        VpnStateBus.updateStage(ConnectionStage.CONNECTING, initialConfig)
+        startVpnForegroundNotification(initialConfig)
 
         tunnelJob?.cancel()
         tunnelJob = serviceScope.launch {
-            runCatching {
-                File(filesDir, "meh_v2ray_active_config.json").writeText(config.toV2RayCoreJson())
+            val isDirectEngine = initialConfig.protocol == V2RayProtocol.AETHER ||
+                initialConfig.protocol == V2RayProtocol.SERVERLESS ||
+                initialConfig.protocol == V2RayProtocol.SNI_SPOOF
+
+            val activeConfig = if (!isDirectEngine) {
+                val livePing = V2RayOutboundClient.verifyRealInternetConnectivity(
+                    config = initialConfig,
+                    vpnService = this@MehVpnService,
+                    timeoutMs = 2400
+                )
+                if (livePing in 1..4999) {
+                    initialConfig.copy(pingMs = livePing)
+                } else {
+                    resolveCascadeFallback(initialConfig)
+                }
+            } else {
+                initialConfig
             }
 
-            // 1. Start local V2Ray HTTP/HTTPS CONNECT & SOCKS5 Proxy Server
+            startVpnForegroundNotification(activeConfig)
+
+            runCatching {
+                File(filesDir, "meh_v2ray_active_config.json").writeText(activeConfig.toV2RayCoreJson())
+            }
+
+            // 1. Start local V2Ray / Aether / Serverless / SNI-Spoof HTTP/HTTPS CONNECT & SOCKS5 Proxy Server
             localProxyServer?.destroy()
-            val proxy = V2RayLocalProxyServer(this@MehVpnService, config)
+            val proxy = V2RayLocalProxyServer(this@MehVpnService, activeConfig)
             val boundProxyPort = proxy.start()
             localProxyServer = proxy
 
@@ -75,7 +118,7 @@ class MehVpnService : VpnService() {
                 vpnInterface?.close()
 
                 val builder = Builder()
-                    .setSession("MEH (مه) • ${config.countryNameFa}")
+                    .setSession("MEH (مه) • ${activeConfig.countryNameFa}")
                     .setMtu(1500)
                     .addAddress("10.0.0.2", 24)
                     .addDnsServer("1.1.1.1")
@@ -87,20 +130,20 @@ class MehVpnService : VpnService() {
                     builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", boundProxyPort))
                 }
 
-                // Prevent our own app's outbound V2Ray sockets from looping back into TUN
+                // Prevent our own app's outbound sockets from looping back into TUN
                 runCatching { builder.addDisallowedApplication(packageName) }
 
                 val establishedPfd = builder.establish()
                 vpnInterface = establishedPfd
                 if (establishedPfd != null) {
-                    val router = Tun2V2RayRouter(this@MehVpnService, config)
+                    val router = Tun2V2RayRouter(this@MehVpnService, activeConfig)
                     router.start(establishedPfd.fileDescriptor)
                     tunRouter = router
                 }
                 establishedPfd != null
             }.getOrDefault(false)
 
-            VpnStateBus.updateConnected(config = config, tunEstablished = tunEstablished)
+            VpnStateBus.updateConnected(config = activeConfig, tunEstablished = tunEstablished)
         }
     }
 

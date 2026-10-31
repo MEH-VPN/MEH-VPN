@@ -7,13 +7,19 @@ enum class V2RayProtocol(val label: String) {
     VLESS("VLESS"),
     VMESS("VMess"),
     TROJAN("Trojan"),
-    SHADOWSOCKS("SS")
+    SHADOWSOCKS("SS"),
+    AETHER("Aether"),
+    SERVERLESS("Serverless"),
+    SNI_SPOOF("SNI-Spoof")
 }
 
 enum class ConnectionStage {
     DISCONNECTED,
     FETCHING_SUBSCRIPTIONS,
     TESTING_SERVERS,
+    AETHER_FALLBACK,
+    SERVERLESS_FALLBACK,
+    SNI_SPOOF_FALLBACK,
     CONNECTING,
     CONNECTED
 }
@@ -63,7 +69,7 @@ data class V2RayConfig(
         get() = "$flagEmoji $countryNameFa"
 
     /**
-     * Generates a valid Xray / V2Ray-Core JSON configuration for this server node.
+     * Generates a valid Xray / V2Ray-Core / Aether / Serverless-for-Iran / SNI-Spoofing JSON configuration.
      */
     fun toV2RayCoreJson(): String {
         val root = JSONObject()
@@ -74,6 +80,7 @@ data class V2RayConfig(
 
         root.put("dns", JSONObject().apply {
             put("servers", JSONArray().apply {
+                put("https://cloudflare-dns.com/dns-query")
                 put("1.1.1.1")
                 put("8.8.8.8")
             })
@@ -82,7 +89,7 @@ data class V2RayConfig(
         val inbounds = JSONArray()
         inbounds.put(JSONObject().apply {
             put("tag", "socks-in")
-            put("port", 10808)
+            put("port", 1819)
             put("listen", "127.0.0.1")
             put("protocol", "socks")
             put("settings", JSONObject().apply {
@@ -99,9 +106,13 @@ data class V2RayConfig(
         root.put("inbounds", inbounds)
 
         val outbounds = JSONArray()
+        val isFreedomBased = protocol == V2RayProtocol.AETHER ||
+            protocol == V2RayProtocol.SERVERLESS ||
+            protocol == V2RayProtocol.SNI_SPOOF
+
         val proxyOutbound = JSONObject().apply {
             put("tag", "proxy")
-            put("protocol", protocol.name.lowercase())
+            put("protocol", if (isFreedomBased) "freedom" else protocol.name.lowercase())
 
             val settings = JSONObject()
             when (protocol) {
@@ -153,6 +164,41 @@ data class V2RayConfig(
                     })
                     settings.put("servers", servers)
                 }
+                V2RayProtocol.AETHER -> {
+                    settings.put("domainStrategy", "UseIPv4")
+                    settings.put("fragment", JSONObject().apply {
+                        put("packets", "tlshello")
+                        put("length", "2-5")
+                        put("interval", "2-5")
+                        put("gateway", "$address:$port")
+                        put("engine", "CluvexStudio/Aether")
+                    })
+                }
+                V2RayProtocol.SERVERLESS -> {
+                    settings.put("domainStrategy", "UseIPv4")
+                    settings.put("fragment", JSONObject().apply {
+                        put("packets", "tlshello")
+                        put("length", "1-3")
+                        put("interval", "5")
+                        put("engine", "patterniha/Serverless-for-Iran")
+                    })
+                    settings.put("noises", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("type", "rand")
+                            put("packet", "10-20")
+                            put("delay", "10-16")
+                        })
+                    })
+                }
+                V2RayProtocol.SNI_SPOOF -> {
+                    settings.put("domainStrategy", "UseIPv4")
+                    settings.put("sniSpoofing", JSONObject().apply {
+                        put("fakeSni", sni.ifEmpty { "speedtest.net" })
+                        put("desync", "tls-record-split")
+                        put("gateway", "$address:$port")
+                        put("engine", "patterniha/SNI-Spoofing")
+                    })
+                }
             }
             put("settings", settings)
 
@@ -163,6 +209,12 @@ data class V2RayConfig(
                     put("tlsSettings", JSONObject().apply {
                         put("serverName", sni.ifEmpty { address })
                         put("allowInsecure", false)
+                    })
+                }
+                if (isFreedomBased) {
+                    put("sockopt", JSONObject().apply {
+                        put("tcpNoDelay", true)
+                        put("domainStrategy", "UseIPv4")
                     })
                 }
                 if (network == "ws") {
