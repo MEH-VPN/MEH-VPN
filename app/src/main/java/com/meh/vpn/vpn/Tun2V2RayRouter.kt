@@ -66,6 +66,12 @@ class Tun2V2RayRouter(
                 if (readLen <= 20) continue
 
                 val version = (packetBuf[0].toInt() ushr 4) and 0x0F
+                if (version == 6) {
+                    if (readLen >= 40) {
+                        handleIpv6Packet(packetBuf, readLen)
+                    }
+                    continue
+                }
                 if (version != 4) continue // IPv4 only
 
                 val ihl = (packetBuf[0].toInt() and 0x0F) * 4
@@ -205,8 +211,8 @@ class Tun2V2RayRouter(
     private fun buildEmptyDnsNoErrorResponse(dnsQuery: ByteArray, questionEndPos: Int): ByteArray {
         val safeEnd = questionEndPos.coerceIn(12, dnsQuery.size)
         val resp = dnsQuery.copyOfRange(0, safeEnd)
-        // QR=1 (Response), Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=0 (NOERROR)
-        resp[2] = 0x81.toByte()
+        // QR=1 (Response), Opcode=0, AA=0, TC=0, RD=from query, RA=1, RCODE=0 (NOERROR)
+        resp[2] = (0x80 or (dnsQuery[2].toInt() and 0x01)).toByte()
         resp[3] = 0x80.toByte()
         // QDCOUNT = 1, ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0
         resp[4] = 0
@@ -233,8 +239,8 @@ class Tun2V2RayRouter(
         val resp = ByteArray(safeEnd + 16)
         System.arraycopy(dnsQuery, 0, resp, 0, safeEnd)
 
-        // QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=0 (NOERROR)
-        resp[2] = 0x81.toByte()
+        // QR=1, Opcode=0, AA=0, TC=0, RD=from query, RA=1, RCODE=0 (NOERROR)
+        resp[2] = (0x80 or (dnsQuery[2].toInt() and 0x01)).toByte()
         resp[3] = 0x80.toByte()
         // QDCOUNT = 1, ANCOUNT = 1, NSCOUNT = 0, ARCOUNT = 0
         resp[4] = 0
@@ -256,11 +262,11 @@ class Tun2V2RayRouter(
         // CLASS = IN (1)
         resp[p++] = 0x00
         resp[p++] = 0x01
-        // TTL = 60 seconds
+        // TTL = 10 seconds
         resp[p++] = 0x00
         resp[p++] = 0x00
         resp[p++] = 0x00
-        resp[p++] = 0x3C
+        resp[p++] = 0x0A
         // RDLENGTH = 4
         resp[p++] = 0x00
         resp[p++] = 0x04
@@ -536,6 +542,13 @@ class Tun2V2RayRouter(
                 pendingPayloads.write(freshData)
                 if (connectJob == null) {
                     val buffered = pendingPayloads.toByteArray()
+
+                    // Captive portal / generate_204 check:
+                    if (serverPort == 80 && isCaptivePortalProbe(buffered)) {
+                        handleLocalCaptivePortalSuccess()
+                        return
+                    }
+
                     val sni = extractTlsSni(buffered)
                     val httpHost = if (sni == null) extractHttpHost(buffered) else null
                     val cachedDomain = dnsIpToDomainCache[serverIpStr]
@@ -557,6 +570,36 @@ class Tun2V2RayRouter(
             }
         }
 
+        private fun handleLocalCaptivePortalSuccess() {
+            val http204 = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            val pshAck = buildIpv4TcpPacket(
+                srcIp = serverIp,
+                dstIp = clientIp,
+                srcPort = serverPort,
+                dstPort = clientPort,
+                seq = mySeq,
+                ack = clientNextSeq,
+                flags = TCP_FLAG_PSH or TCP_FLAG_ACK,
+                payload = http204
+            )
+            mySeq = (mySeq + http204.size) and 0xFFFFFFFFL
+            writeTunPacket(pshAck)
+
+            val finAck = buildIpv4TcpPacket(
+                srcIp = serverIp,
+                dstIp = clientIp,
+                srcPort = serverPort,
+                dstPort = clientPort,
+                seq = mySeq,
+                ack = clientNextSeq,
+                flags = TCP_FLAG_FIN or TCP_FLAG_ACK,
+                payload = ByteArray(0)
+            )
+            mySeq = (mySeq + 1) and 0xFFFFFFFFL
+            writeTunPacket(finAck)
+            closeQuietly()
+        }
+
         private fun isIncompleteTlsClientHelloRecord(buf: ByteArray): Boolean {
             if (buf.size < 6 || buf.size > 3600) return false
             val isHandshake = (buf[0].toInt() and 0xFF) == 0x16 &&
@@ -568,6 +611,10 @@ class Tun2V2RayRouter(
         }
 
         private fun startRemoteTunnel(targetHost: String) {
+            if (targetHost.startsWith("198.18.")) {
+                sendResetAndClose()
+                return
+            }
             connectJob = routerScope.launch {
                 var uplinkWorker: Job? = null
                 try {
@@ -772,6 +819,21 @@ class Tun2V2RayRouter(
             null
         } catch (_: Exception) {
             null
+        }
+    }
+
+    private fun isCaptivePortalProbe(data: ByteArray): Boolean {
+        return try {
+            val headLen = minOf(data.size, 512)
+            if (headLen < 14) return false
+            val str = String(data, 0, headLen, Charsets.US_ASCII)
+            str.startsWith("GET ") && (
+                str.contains("/generate_204") ||
+                str.contains("/gen_204") ||
+                str.contains("connectivitycheck")
+            )
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -1024,6 +1086,215 @@ class Tun2V2RayRouter(
 
     private fun formatIpv4(ip: ByteArray): String {
         return "${ip[0].toInt() and 0xFF}.${ip[1].toInt() and 0xFF}.${ip[2].toInt() and 0xFF}.${ip[3].toInt() and 0xFF}"
+    }
+
+    // =========================================================================
+    // IPv6 Handlers & Builders (Prevents dual-stack leakage on Irancell & MCI)
+    // =========================================================================
+
+    private fun handleIpv6Packet(packet: ByteArray, packetLen: Int) {
+        val nextHeader = packet[6].toInt() and 0xFF
+        when (nextHeader) {
+            6 -> { // TCP
+                if (packetLen >= 60) {
+                    val flags = packet[53].toInt() and 0x3F
+                    val isSyn = (flags and TCP_FLAG_SYN) != 0
+                    if (isSyn) {
+                        val srcPort = readUInt16(packet, 40)
+                        val dstPort = readUInt16(packet, 42)
+                        val seqNum = readUInt32(packet, 44)
+                        val rstPacket = buildIpv6TcpRstPacket(
+                            srcIp = packet.copyOfRange(24, 40),
+                            dstIp = packet.copyOfRange(8, 24),
+                            srcPort = dstPort,
+                            dstPort = srcPort,
+                            ack = (seqNum + 1) and 0xFFFFFFFFL
+                        )
+                        writeTunPacket(rstPacket)
+                    }
+                }
+            }
+            17 -> { // UDP
+                if (packetLen >= 48) {
+                    val dstPort = readUInt16(packet, 42)
+                    if (dstPort == 53) {
+                        handleIpv6UdpDns(packet, packetLen)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleIpv6UdpDns(packet: ByteArray, packetLen: Int) {
+        val payloadOffset = 48
+        val payloadLen = packetLen - payloadOffset
+        if (payloadLen <= 12) return
+
+        val dnsQuery = packet.copyOfRange(payloadOffset, packetLen)
+        val parsedDns = parseDnsQueryQuestion(dnsQuery)
+        val queriedDomain = parsedDns.domain
+        val qType = parsedDns.qType
+        val questionEndPos = parsedDns.questionEndPos
+
+        if (questionEndPos <= 12) return
+
+        // Block IPv6 AAAA (28) and HTTPS/SVCB (65) queries with RFC-compliant empty NOERROR
+        if (qType == 28 || qType == 65) {
+            val emptyResp = buildEmptyDnsNoErrorResponse(dnsQuery, questionEndPos)
+            val udpRespPacket = buildIpv6UdpPacket(
+                srcIp = packet.copyOfRange(24, 40),
+                dstIp = packet.copyOfRange(8, 24),
+                srcPort = readUInt16(packet, 42),
+                dstPort = readUInt16(packet, 40),
+                payload = emptyResp
+            )
+            writeTunPacket(udpRespPacket)
+            return
+        }
+
+        // For Type A queries over IPv6 DNS: return FakeDNS Type A answer immediately
+        if (qType == 1 && !queriedDomain.isNullOrEmpty()) {
+            val fakeIpBytes = allocateFakeIpBytesForDomain(queriedDomain)
+            val fakeDnsResp = buildFakeDnsAResponse(dnsQuery, questionEndPos, fakeIpBytes)
+            val udpRespPacket = buildIpv6UdpPacket(
+                srcIp = packet.copyOfRange(24, 40),
+                dstIp = packet.copyOfRange(8, 24),
+                srcPort = readUInt16(packet, 42),
+                dstPort = readUInt16(packet, 40),
+                payload = fakeDnsResp
+            )
+            writeTunPacket(udpRespPacket)
+            return
+        }
+
+        val emptyResp = buildEmptyDnsNoErrorResponse(dnsQuery, questionEndPos)
+        val udpRespPacket = buildIpv6UdpPacket(
+            srcIp = packet.copyOfRange(24, 40),
+            dstIp = packet.copyOfRange(8, 24),
+            srcPort = readUInt16(packet, 42),
+            dstPort = readUInt16(packet, 40),
+            payload = emptyResp
+        )
+        writeTunPacket(udpRespPacket)
+    }
+
+    private fun buildIpv6TcpRstPacket(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        srcPort: Int,
+        dstPort: Int,
+        ack: Long
+    ): ByteArray {
+        val totalLen = 60
+        val out = ByteArray(totalLen)
+
+        // IPv6 Header (40 bytes)
+        out[0] = 0x60 // Version 6
+        out[1] = 0
+        out[2] = 0
+        out[3] = 0
+        out[4] = 0 // Payload length hi (20)
+        out[5] = 20 // Payload length lo
+        out[6] = 6 // Next Header = TCP
+        out[7] = 64 // Hop Limit
+
+        System.arraycopy(srcIp, 0, out, 8, 16)
+        System.arraycopy(dstIp, 0, out, 24, 16)
+
+        // TCP Header (20 bytes)
+        out[40] = ((srcPort ushr 8) and 0xFF).toByte()
+        out[41] = (srcPort and 0xFF).toByte()
+        out[42] = ((dstPort ushr 8) and 0xFF).toByte()
+        out[43] = (dstPort and 0xFF).toByte()
+
+        writeUInt32(out, 44, 0L)
+        writeUInt32(out, 48, ack)
+
+        out[52] = 0x50 // Data offset 5 (20 bytes)
+        out[53] = (TCP_FLAG_RST or TCP_FLAG_ACK).toByte()
+
+        // IPv6 TCP Pseudo-header Checksum
+        var sum = 0
+        for (i in 8 until 40 step 2) {
+            sum += readUInt16(out, i)
+        }
+        sum += 20 // Upper-layer length
+        sum += 6  // Next Header
+
+        for (i in 40 until 60 step 2) {
+            sum += readUInt16(out, i)
+        }
+        while ((sum ushr 16) != 0) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
+        }
+        val tcpChecksum = sum.inv() and 0xFFFF
+        out[56] = ((tcpChecksum ushr 8) and 0xFF).toByte()
+        out[57] = (tcpChecksum and 0xFF).toByte()
+
+        return out
+    }
+
+    private fun buildIpv6UdpPacket(
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        srcPort: Int,
+        dstPort: Int,
+        payload: ByteArray
+    ): ByteArray {
+        val udpLen = 8 + payload.size
+        val totalLen = 40 + udpLen
+        val out = ByteArray(totalLen)
+
+        // IPv6 Header (40 bytes)
+        out[0] = 0x60
+        out[1] = 0
+        out[2] = 0
+        out[3] = 0
+        out[4] = ((udpLen ushr 8) and 0xFF).toByte()
+        out[5] = (udpLen and 0xFF).toByte()
+        out[6] = 17 // Next Header = UDP
+        out[7] = 64 // Hop Limit
+
+        System.arraycopy(srcIp, 0, out, 8, 16)
+        System.arraycopy(dstIp, 0, out, 24, 16)
+
+        // UDP Header (8 bytes)
+        out[40] = ((srcPort ushr 8) and 0xFF).toByte()
+        out[41] = (srcPort and 0xFF).toByte()
+        out[42] = ((dstPort ushr 8) and 0xFF).toByte()
+        out[43] = (dstPort and 0xFF).toByte()
+        out[44] = ((udpLen ushr 8) and 0xFF).toByte()
+        out[45] = (udpLen and 0xFF).toByte()
+        out[46] = 0
+        out[47] = 0
+
+        System.arraycopy(payload, 0, out, 48, payload.size)
+
+        // IPv6 UDP Pseudo-header Checksum
+        var sum = 0
+        for (i in 8 until 40 step 2) {
+            sum += readUInt16(out, i)
+        }
+        sum += udpLen
+        sum += 17 // Next Header = UDP
+
+        var i = 0
+        while (i < udpLen - 1) {
+            sum += readUInt16(out, 40 + i)
+            i += 2
+        }
+        if (i < udpLen) {
+            sum += (out[40 + i].toInt() and 0xFF) shl 8
+        }
+        while ((sum ushr 16) != 0) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
+        }
+        var udpChecksum = sum.inv() and 0xFFFF
+        if (udpChecksum == 0) udpChecksum = 0xFFFF
+        out[46] = ((udpChecksum ushr 8) and 0xFF).toByte()
+        out[47] = (udpChecksum and 0xFF).toByte()
+
+        return out
     }
 
     fun stop() {

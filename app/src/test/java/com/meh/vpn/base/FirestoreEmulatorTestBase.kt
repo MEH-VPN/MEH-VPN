@@ -37,7 +37,7 @@ abstract class FirestoreEmulatorTestBase {
         databaseId = if (resId != 0) context.getString(resId) else "demo-database"
 
         val app = if (FirebaseApp.getApps(context).isEmpty()) {
-            val newApp = FirebaseApp.initializeApp(
+            FirebaseApp.initializeApp(
                 context,
                 FirebaseOptions.Builder()
                     .setApplicationId("com.meh.vpn")
@@ -45,21 +45,22 @@ abstract class FirestoreEmulatorTestBase {
                     .setApiKey("fake-api-key-for-emulator")
                     .build()
             )
-            val newFirestore = FirebaseFirestore.getInstance(newApp, databaseId)
-            newFirestore.useEmulator(EMULATOR_HOST, FIRESTORE_PORT)
-            newFirestore.firestoreSettings = FirebaseFirestoreSettings.Builder()
-                .setLocalCacheSettings(MemoryCacheSettings.newBuilder().build())
-                .build()
-
-            val newAuth = FirebaseAuth.getInstance(newApp)
-            newAuth.useEmulator(EMULATOR_HOST, AUTH_PORT)
-            newApp
         } else {
             FirebaseApp.getInstance()
         }
 
         firestore = FirebaseFirestore.getInstance(app, databaseId)
         auth = FirebaseAuth.getInstance(app)
+
+        val emulatorAvailable = try {
+            java.net.Socket().use { it.connect(java.net.InetSocketAddress(EMULATOR_HOST, FIRESTORE_PORT), 300); true }
+        } catch (_: Exception) {
+            false
+        }
+        org.junit.Assume.assumeTrue("Firebase emulator is not running locally", emulatorAvailable)
+
+        runCatching { firestore.useEmulator(EMULATOR_HOST, FIRESTORE_PORT) }
+        runCatching { auth.useEmulator(EMULATOR_HOST, AUTH_PORT) }
     }
 
     @After

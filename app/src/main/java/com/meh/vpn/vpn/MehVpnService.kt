@@ -136,11 +136,18 @@ class MehVpnService : VpnService() {
                     // 1360 MTU prevents cellular GTP packet fragmentation on Irancell/MCI
                     .setMtu(1360)
                     .addAddress("10.0.0.2", 24)
-                    // Use internal virtual VPN gateway IP (10.0.0.1) as DNS server so Android netd
-                    // never triggers Opportunistic DNS-over-TLS (port 853) and sends all DNS over UDP 53 to TUN
-                    .addDnsServer("10.0.0.1")
-                    // Route all IPv4 traffic through the VPN TUN interface (just like Telegram)
+                    // Explicitly route FakeDNS IPv4 range
+                    .addRoute("198.18.0.0", 15)
+                    // Route all IPv4 traffic through the VPN TUN interface
                     .addRoute("0.0.0.0", 0)
+                    // IPv6 ULA address and default route (::/0) to capture dual-stack mobile data on Irancell & MCI
+                    // This is CRITICAL: without this, cellular rmnet0 handles IPv6 and leaks all traffic outside VPN!
+                    .addAddress("fd00:1::2", 128)
+                    .addRoute("::", 0)
+                    // Configure well-known trusted public DNS servers so Android netd accepts them without RFC 1918 Private DNS rejection
+                    .addDnsServer("8.8.8.8")
+                    .addDnsServer("1.1.1.1")
+                    .addDnsServer("2001:4860:4860::8888")
 
                 // Prevent our own app's outbound sockets from looping back into TUN
                 runCatching { builder.addDisallowedApplication(packageName) }
