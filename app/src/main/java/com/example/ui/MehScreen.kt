@@ -101,7 +101,7 @@ fun MehScreen(
                 ) {
                     val interactionSource = remember { MutableInteractionSource() }
 
-                    // Central Circle with ONLY Power On/Off Icon and Connection Stage Inside
+                    // Central Circle with ONLY the Power On/Off Icon Inside
                     Box(
                         modifier = Modifier
                             .size(200.dp)
@@ -124,38 +124,34 @@ fun MehScreen(
                             .testTag("one_tap_connect_button"),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                painter = painterResource(id = R.drawable.ic_power),
-                                contentDescription = stageText,
-                                tint = iconTint,
-                                modifier = Modifier.size(64.dp)
-                            )
-
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            Text(
-                                text = stageText,
-                                fontFamily = VazirmatnFontFamily,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 16.sp,
-                                color = when {
-                                     isConnected -> CyberEmerald
-                                    isBusy -> AmberScan
-                                    else -> TextSecondary
-                                },
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.testTag("connection_status_title")
-                            )
-                        }
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_power),
+                            contentDescription = stageText,
+                            tint = iconTint,
+                            modifier = Modifier.size(72.dp)
+                        )
                     }
 
-                    // Outside the circle: show ONLY Flag Emoji and Country Name when connected
+                    // Outside the circle: show all connection statuses below the circle
                     Spacer(modifier = Modifier.height(24.dp))
 
+                    Text(
+                        text = stageText,
+                        fontFamily = VazirmatnFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                        color = when {
+                            isConnected -> CyberEmerald
+                            isBusy -> AmberScan
+                            else -> TextSecondary
+                        },
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.testTag("connection_status_title")
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Below status text: show Flag Emoji and Country Name when connected
                     Box(
                         modifier = Modifier.height(32.dp),
                         contentAlignment = Alignment.Center
