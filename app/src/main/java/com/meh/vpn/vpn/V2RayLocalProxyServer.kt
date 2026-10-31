@@ -406,7 +406,7 @@ class V2RayLocalProxyServer(
                 }
             } catch (_: Exception) {
             } finally {
-                runCatching { tunnel.close() }
+                runCatching { tunnel.output.flush() }
             }
         }
 

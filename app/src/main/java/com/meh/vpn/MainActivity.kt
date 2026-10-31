@@ -108,10 +108,7 @@ class MainActivity : ComponentActivity() {
                             ConnectionStage.CONNECTED,
                             ConnectionStage.CONNECTING,
                             ConnectionStage.FETCHING_SUBSCRIPTIONS,
-                            ConnectionStage.TESTING_SERVERS,
-                            ConnectionStage.AETHER_FALLBACK,
-                            ConnectionStage.SERVERLESS_FALLBACK,
-                            ConnectionStage.SNI_SPOOF_FALLBACK -> {
+                            ConnectionStage.TESTING_SERVERS -> {
                                 stopVpnService()
                             }
                             ConnectionStage.DISCONNECTED -> {

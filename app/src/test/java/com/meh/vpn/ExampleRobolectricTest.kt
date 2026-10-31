@@ -2,8 +2,6 @@ package com.meh.vpn
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
-import com.meh.vpn.data.AetherGatewayEngine
-import com.meh.vpn.data.PatternihaBypassEngine
 import com.meh.vpn.data.V2RayParser
 import com.meh.vpn.model.V2RayProtocol
 import com.meh.vpn.vpn.V2RayOutboundClient
@@ -44,56 +42,11 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `aether and patterniha serverless and sni spoofing configs build and parse cleanly`() {
-        val aetherCfg = AetherGatewayEngine.buildAetherConfig(
-            address = "162.159.198.1",
-            port = 443,
-            sni = "engage.cloudflareclient.com",
-            countryCode = "DE",
-            pingMs = 48
-        )
-        val parsedAether = V2RayParser.parseSingleUri(aetherCfg.rawUri, aetherCfg.sourceRepo)
-        assertNotNull(parsedAether)
-        assertEquals(V2RayProtocol.AETHER, parsedAether!!.protocol)
-        assertTrue(parsedAether.toV2RayCoreJson().replace("\\/", "/").contains("CluvexStudio/Aether"))
-
-        val serverlessCfg = PatternihaBypassEngine.buildServerlessConfig(
-            address = "104.16.132.229",
-            port = 443,
-            sni = "cp.cloudflare.com",
-            countryCode = "NL",
-            pingMs = 52
-        )
-        val parsedServerless = V2RayParser.parseSingleUri(serverlessCfg.rawUri, serverlessCfg.sourceRepo)
-        assertNotNull(parsedServerless)
-        assertEquals(V2RayProtocol.SERVERLESS, parsedServerless!!.protocol)
-        assertEquals("🇳🇱", parsedServerless.flagEmoji)
-        assertTrue(parsedServerless.toV2RayCoreJson().replace("\\/", "/").contains("patterniha/Serverless-for-Iran"))
-
-        val sniSpoofCfg = PatternihaBypassEngine.buildSniSpoofConfig(
-            address = "172.64.155.209",
-            port = 443,
-            fakeSni = "speedtest.net",
-            countryCode = "FI",
-            pingMs = 59
-        )
-        val parsedSniSpoof = V2RayParser.parseSingleUri(sniSpoofCfg.rawUri, sniSpoofCfg.sourceRepo)
-        assertNotNull(parsedSniSpoof)
-        assertEquals(V2RayProtocol.SNI_SPOOF, parsedSniSpoof!!.protocol)
-        assertEquals("🇫🇮", parsedSniSpoof.flagEmoji)
-        assertTrue(parsedSniSpoof.toV2RayCoreJson().replace("\\/", "/").contains("patterniha/SNI-Spoofing"))
-    }
-
-    @Test
     fun `dead node blacklisting and dns anti poisoning filter work accurately`() {
         V2RayOutboundClient.clearBlacklist()
-        val cfg = AetherGatewayEngine.buildAetherConfig(
-            address = "162.159.198.1",
-            port = 443,
-            sni = "engage.cloudflareclient.com",
-            countryCode = "DE",
-            pingMs = 45
-        )
+        val sampleUri =
+            "vless://8a4f2d10-9e73-4b88-a119-6c4d5e9f0011@1.1.1.1:443?encryption=none&security=tls&sni=cloudflare.com&type=ws&path=%2Fws#DE%20Frankfurt%20Edge"
+        val cfg = V2RayParser.parseSingleUri(sampleUri, "SoliSpirit/v2ray-configs")!!
         assertFalse(V2RayOutboundClient.isNodeBlacklisted(cfg))
         V2RayOutboundClient.markNodeDead(cfg)
         assertTrue(V2RayOutboundClient.isNodeBlacklisted(cfg))
@@ -108,13 +61,13 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `tls clientHello probe for twitter x_com and instant cancel work accurately`() {
-        val probe = V2RayOutboundClient.buildTlsClientHelloProbe("x.com")
+    fun `tls clientHello probe and instant cancel work accurately`() {
+        val probe = V2RayOutboundClient.buildTlsClientHelloProbe("www.youtube.com")
         assertTrue(probe.size > 60)
         assertEquals(0x16.toByte(), probe[0])
         assertEquals(0x03.toByte(), probe[1])
         assertEquals(0x01.toByte(), probe[5])
-        assertTrue(String(probe, Charsets.ISO_8859_1).contains("x.com"))
+        assertTrue(String(probe, Charsets.ISO_8859_1).contains("www.youtube.com"))
 
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val vm = com.meh.vpn.ui.VpnViewModel(app)

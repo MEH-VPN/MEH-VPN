@@ -6,14 +6,11 @@ import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.meh.vpn.R
-import com.meh.vpn.data.AetherGatewayEngine
 import com.meh.vpn.data.GitHubSubscriptionAggregator
 import com.meh.vpn.data.MehFirebaseRepository
-import com.meh.vpn.data.PatternihaBypassEngine
 import com.meh.vpn.data.V2RayParser
 import com.meh.vpn.model.ConnectionStage
 import com.meh.vpn.model.V2RayConfig
-import com.meh.vpn.model.V2RayProtocol
 import com.meh.vpn.vpn.V2RayOutboundClient
 import com.meh.vpn.vpn.VpnStateBus
 import com.google.firebase.FirebaseApp
@@ -79,16 +76,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     val resolvedStage = when {
                         runtime.stage == ConnectionStage.CONNECTED -> ConnectionStage.CONNECTED
                         runtime.stage == ConnectionStage.TESTING_SERVERS -> ConnectionStage.TESTING_SERVERS
-                        runtime.stage == ConnectionStage.AETHER_FALLBACK -> ConnectionStage.AETHER_FALLBACK
-                        runtime.stage == ConnectionStage.SERVERLESS_FALLBACK -> ConnectionStage.SERVERLESS_FALLBACK
-                        runtime.stage == ConnectionStage.SNI_SPOOF_FALLBACK -> ConnectionStage.SNI_SPOOF_FALLBACK
                         runtime.stage == ConnectionStage.CONNECTING -> ConnectionStage.CONNECTING
                         isScanRunning && (
                             current.stage == ConnectionStage.FETCHING_SUBSCRIPTIONS ||
-                                current.stage == ConnectionStage.TESTING_SERVERS ||
-                                current.stage == ConnectionStage.AETHER_FALLBACK ||
-                                current.stage == ConnectionStage.SERVERLESS_FALLBACK ||
-                                current.stage == ConnectionStage.SNI_SPOOF_FALLBACK
+                                current.stage == ConnectionStage.TESTING_SERVERS
                             ) -> current.stage
                         else -> ConnectionStage.DISCONNECTED
                     }
@@ -114,6 +105,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Fetches V2Ray configs from GitHub repositories, tests up to [MAX_TOTAL_TESTS] top candidates
+     * with real end-to-end TLS 443 verification, and connects immediately upon finding a healthy server.
+     */
     fun findBestServerAndConnect(onReadyToStartService: (V2RayConfig) -> Unit) {
         val sessionId = scanSessionId.incrementAndGet()
         scanJob?.cancel()
@@ -121,9 +116,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 logAnalyticsEvent("meh_connect_clicked")
 
-                // =========================================================================
-                // Phase 1 (0%..20%): دریافت سریع کانفیگ‌ها از گیت‌هاب و آینه‌های CDN
-                // =========================================================================
+                // Phase 1 (0%..20%): دریافت سریع کانفیگ‌ها از گیت‌هاب
                 _uiState.update {
                     it.copy(
                         stage = ConnectionStage.FETCHING_SUBSCRIPTIONS,
@@ -131,7 +124,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                         testedCount = 0,
                         maxTestCount = MAX_TOTAL_TESTS,
                         discoveredCount = 0,
-                        scanDetailText = "در حال دریافت کانفیگ از منابع گیت‌هاب..."
+                        scanDetailText = "دریافت منابع • مخازن گیت‌هاب"
                     )
                 }
 
@@ -144,9 +137,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                                 progressPercent = pct,
                                 discoveredCount = totalFound,
                                 scanDetailText = if (totalFound > 0) {
-                                    "دریافت $totalFound کانفیگ (منبع $completedSources از $totalSources)"
+                                    "منبع $completedSources از $totalSources • $totalFound کانفیگ"
                                 } else {
-                                    "بررسی منبع $completedSources از $totalSources..."
+                                    "بررسی منابع • $completedSources از $totalSources"
                                 }
                             )
                         }
@@ -156,26 +149,35 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 ensureActive()
                 if (scanSessionId.get() != sessionId) return@launch
 
-                // =========================================================================
-                // Phase 2 (20%..100%): انتخاب و تست حداکثر ۱۵ کانفیگ برتر (شامل V2Ray + روش‌های جایگزین)
-                // در صورت عدم اتصال پس از ۱۵ تست، به صورت خودکار قطع می‌شود.
-                // =========================================================================
+                // Phase 2 (20%..100%): تست واقعی کانفیگ‌های V2Ray (حداکثر ۱۵ تست)
                 _uiState.update {
                     it.copy(
                         stage = ConnectionStage.TESTING_SERVERS,
                         progressPercent = 22,
                         discoveredCount = configs.size,
                         scanDetailText = if (configs.isNotEmpty()) {
-                            "${configs.size} کانفیگ دریافت شد • اولویت‌بندی ۱۵ تست برتر..."
+                            "${configs.size} کانفیگ • انتخاب $MAX_TOTAL_TESTS تست برتر"
                         } else {
-                            "آماده‌سازی ۱۵ تست ضد فیلتر..."
+                            "بررسی کانفیگ ذخیره شده"
                         }
                     )
                 }
 
                 val candidateQueue = buildPrioritizedTestQueue(configs, MAX_TOTAL_TESTS)
-                val totalToTest = candidateQueue.size.coerceIn(1, MAX_TOTAL_TESTS)
+                if (candidateQueue.isEmpty()) {
+                    VpnStateBus.resetDisconnected()
+                    _uiState.update {
+                        it.copy(
+                            stage = ConnectionStage.DISCONNECTED,
+                            selectedServer = null,
+                            progressPercent = 0,
+                            scanDetailText = "عدم دریافت کانفیگ • بررسی اینترنت"
+                        )
+                    }
+                    return@launch
+                }
 
+                val totalToTest = candidateQueue.size.coerceIn(1, MAX_TOTAL_TESTS)
                 var verifiedBest: V2RayConfig? = null
                 var testedSoFar = 0
 
@@ -186,28 +188,16 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     val leadCandidate = batch.first()
                     val nextTestedCount = (testedSoFar + batch.size).coerceAtMost(totalToTest)
                     val pct = (22 + (nextTestedCount * 76) / totalToTest).coerceIn(24, 98)
-                    val stageForCandidate = when (leadCandidate.protocol) {
-                        V2RayProtocol.AETHER -> ConnectionStage.AETHER_FALLBACK
-                        V2RayProtocol.SERVERLESS -> ConnectionStage.SERVERLESS_FALLBACK
-                        V2RayProtocol.SNI_SPOOF -> ConnectionStage.SNI_SPOOF_FALLBACK
-                        else -> ConnectionStage.TESTING_SERVERS
-                    }
                     val countryOnly = leadCandidate.countryNameFa.substringBefore("•").trim()
-                    val methodName = when (leadCandidate.protocol) {
-                        V2RayProtocol.AETHER -> "Aether"
-                        V2RayProtocol.SERVERLESS -> "Serverless"
-                        V2RayProtocol.SNI_SPOOF -> "SNI-Spoof"
-                        else -> leadCandidate.protocol.name
-                    }
 
                     _uiState.update {
                         it.copy(
-                            stage = stageForCandidate,
+                            stage = ConnectionStage.TESTING_SERVERS,
                             progressPercent = pct,
                             testedCount = nextTestedCount,
                             maxTestCount = totalToTest,
                             discoveredCount = configs.size,
-                            scanDetailText = "تست $nextTestedCount از $totalToTest • بررسی ${leadCandidate.flagEmoji} $countryOnly ($methodName)"
+                            scanDetailText = "تست $nextTestedCount از $totalToTest • ${leadCandidate.flagEmoji} $countryOnly (${leadCandidate.protocol.name})"
                         )
                     }
 
@@ -242,7 +232,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                                 progressPercent = 100,
                                 testedCount = testedSoFar,
                                 maxTestCount = totalToTest,
-                                scanDetailText = "پیدا شد: ${bestInBatch.flagEmoji} $bestCountry (${bestInBatch.pingMs}ms)"
+                                scanDetailText = "پیدا شد (${bestInBatch.pingMs}ms) • ${bestInBatch.flagEmoji} $bestCountry"
                             )
                         }
                         break
@@ -250,21 +240,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 if (verifiedBest == null) {
-                    // طبق درخواست کاربر: بعد از ۱۰ الی ۲۰ تست (۱۵ تست) اگر متصل نشد، خودکار قطع شود
                     logAnalyticsEvent("meh_scan_failed_auto_disconnect") {
                         putLong("tested_count", totalToTest.toLong())
                         putLong("discovered_count", configs.size.toLong())
                     }
                     VpnStateBus.resetDisconnected()
                     _uiState.update {
-                        VpnUiState(
+                        it.copy(
                             stage = ConnectionStage.DISCONNECTED,
                             selectedServer = null,
                             progressPercent = 0,
                             testedCount = totalToTest,
                             maxTestCount = totalToTest,
                             discoveredCount = configs.size,
-                            scanDetailText = "عدم اتصال پس از $totalToTest تست (قطع خودکار)"
+                            scanDetailText = "عدم اتصال • توقف پس از $totalToTest تست"
                         )
                     }
                     return@launch
@@ -294,7 +283,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // Final Stage: در حال اتصال -> متصل
                 _uiState.update {
                     it.copy(
                         stage = ConnectionStage.CONNECTING,
@@ -309,96 +297,41 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Builds a bounded queue of at most [maxTests] (15) candidates in strict priority order:
-     * 1. Cached last-working European server (if available and not blacklisted)
-     * 2. Top TCP-reachable GitHub V2Ray configs (VLESS / Trojan)
-     * 3. CluvexStudio/Aether gateways
-     * 4. patterniha/Serverless-for-Iran candidates
-     * 5. patterniha/SNI-Spoofing candidates
-     */
     private suspend fun buildPrioritizedTestQueue(
         githubConfigs: List<V2RayConfig>,
         maxTests: Int
     ): List<V2RayConfig> = withContext(Dispatchers.IO) {
         val queue = mutableListOf<V2RayConfig>()
 
-        // 1. Last working cached server (excluding TR relays) for fast initial reconnection
+        fun addUnique(cfg: V2RayConfig) {
+            if (queue.size < maxTests &&
+                !V2RayOutboundClient.isNodeBlacklisted(cfg) &&
+                queue.none { it.address == cfg.address && it.port == cfg.port && it.protocol == cfg.protocol }
+            ) {
+                queue.add(cfg)
+            }
+        }
+
+        // 1. Last working cached server (skipping TR nodes so MCI never gets stuck on a cached Turkey node)
         val cachedUri = prefs.getString(KEY_LAST_BEST_URI, null)
         val cachedSource = prefs.getString(KEY_LAST_BEST_SOURCE, "SoliSpirit/v2ray-configs") ?: "GitHub"
         if (!cachedUri.isNullOrBlank()) {
             val parsedCached = V2RayParser.parseSingleUri(cachedUri, cachedSource)
-            if (parsedCached != null &&
-                !parsedCached.countryCode.equals("TR", ignoreCase = true) &&
-                !V2RayOutboundClient.isNodeBlacklisted(parsedCached)
-            ) {
-                queue.add(parsedCached)
+            if (parsedCached != null && !parsedCached.countryCode.equals("TR", ignoreCase = true)) {
+                addUnique(parsedCached)
             }
         }
 
-        // 2. Top TCP-reachable GitHub V2Ray servers (up to 9 slots)
+        // 2. Top TCP-reachable GitHub V2Ray servers (prioritizing DE / NL / FI / GB / FR)
         if (githubConfigs.isNotEmpty()) {
             val tcpRanked = aggregator.rankTopTcpCandidates(
                 configs = githubConfigs,
-                maxCandidates = 10,
+                maxCandidates = maxTests,
                 timeoutMs = 1100
             )
             for (cfg in tcpRanked) {
-                if (queue.size < 10 && queue.none { it.address == cfg.address && it.port == cfg.port }) {
-                    queue.add(cfg)
-                }
-            }
-        }
-
-        // 3. Method 2: CluvexStudio/Aether candidates (2 slots)
-        for (gw in AetherGatewayEngine.defaultAetherGateways.take(4)) {
-            if (queue.size >= maxTests - 3) break
-            val cfg = AetherGatewayEngine.buildAetherConfig(
-                address = gw.address,
-                port = gw.port,
-                sni = gw.sni,
-                countryCode = gw.defaultCountryCode,
-                pingMs = 60
-            )
-            if (!V2RayOutboundClient.isNodeBlacklisted(cfg) &&
-                queue.none { it.address == cfg.address && it.port == cfg.port && it.protocol == cfg.protocol }
-            ) {
-                queue.add(cfg)
-            }
-        }
-
-        // 4. Method 3: patterniha/Serverless-for-Iran candidates (2 slots)
-        for (sc in PatternihaBypassEngine.defaultServerlessCandidates.take(4)) {
-            if (queue.size >= maxTests - 1) break
-            val cfg = PatternihaBypassEngine.buildServerlessConfig(
-                address = sc.address,
-                port = sc.port,
-                sni = sc.sni,
-                countryCode = sc.countryCode,
-                pingMs = 55
-            )
-            if (!V2RayOutboundClient.isNodeBlacklisted(cfg) &&
-                queue.none { it.address == cfg.address && it.port == cfg.port && it.protocol == cfg.protocol }
-            ) {
-                queue.add(cfg)
-            }
-        }
-
-        // 5. Method 4: patterniha/SNI-Spoofing candidates (remaining slots up to maxTests = 15)
-        val spoofDomain = PatternihaBypassEngine.defaultSpoofDomains.first()
-        for (sc in PatternihaBypassEngine.defaultServerlessCandidates) {
-            if (queue.size >= maxTests) break
-            val cfg = PatternihaBypassEngine.buildSniSpoofConfig(
-                address = sc.address,
-                port = sc.port,
-                fakeSni = spoofDomain,
-                countryCode = sc.countryCode,
-                pingMs = 58
-            )
-            if (!V2RayOutboundClient.isNodeBlacklisted(cfg) &&
-                queue.none { it.address == cfg.address && it.port == cfg.port && it.protocol == cfg.protocol }
-            ) {
-                queue.add(cfg)
+                if (queue.size >= maxTests) break
+                addUnique(cfg)
             }
         }
 
@@ -416,27 +349,30 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         scanSessionId.incrementAndGet()
         scanJob?.cancel()
         scanJob = null
-        aggregator.cancelAllRequests()
         logAnalyticsEvent("meh_vpn_disconnected")
         VpnStateBus.resetDisconnected()
-        _uiState.value = VpnUiState(
-            stage = ConnectionStage.DISCONNECTED,
-            selectedServer = null,
-            progressPercent = 0,
-            testedCount = 0,
-            maxTestCount = MAX_TOTAL_TESTS,
-            discoveredCount = 0,
-            scanDetailText = ""
-        )
+        _uiState.update {
+            it.copy(
+                stage = ConnectionStage.DISCONNECTED,
+                selectedServer = null,
+                progressPercent = 0,
+                testedCount = 0,
+                scanDetailText = ""
+            )
+        }
     }
 
-    private fun logAnalyticsEvent(name: String, block: (Bundle.() -> Unit)? = null) {
+    private fun logAnalyticsEvent(
+        eventName: String,
+        paramsBuilder: (Bundle.() -> Unit)? = null
+    ) {
         runCatching {
             val appContext = getApplication<Application>()
             ensureFirebaseInitialized()
-            val bundle = Bundle()
-            block?.invoke(bundle)
-            FirebaseAnalytics.getInstance(appContext).logEvent(name, bundle)
+            val bundle = Bundle().apply {
+                paramsBuilder?.invoke(this)
+            }
+            FirebaseAnalytics.getInstance(appContext).logEvent(eventName, bundle)
         }
     }
 

@@ -7,20 +7,16 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.meh.vpn.MainActivity
 import com.meh.vpn.R
-import com.meh.vpn.data.AetherGatewayEngine
 import com.meh.vpn.data.GitHubSubscriptionAggregator
-import com.meh.vpn.data.PatternihaBypassEngine
 import com.meh.vpn.data.V2RayParser
 import com.meh.vpn.model.ConnectionStage
 import com.meh.vpn.model.V2RayConfig
-import com.meh.vpn.model.V2RayProtocol
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -64,7 +60,7 @@ class MehVpnService : VpnService() {
                     startTunnel(parsed)
                 } else {
                     serviceScope.launch {
-                        val fallbackConfig = resolveCascadeFallbackOrNull(null)
+                        val fallbackConfig = findNextHealthyConfigOrNull(null)
                         if (fallbackConfig != null) {
                             startTunnel(fallbackConfig)
                         } else {
@@ -78,11 +74,7 @@ class MehVpnService : VpnService() {
     }
 
     /**
-     * Resolves a new working configuration across all 4 stages when the current config drops or fails:
-     * 1. GitHub V2Ray Configs (VLESS/Trojan) excluding blacklisted/dead nodes
-     * 2. CluvexStudio/Aether
-     * 3. patterniha/Serverless-for-Iran
-     * 4. patterniha/SNI-Spoofing
+     * Resolves a new working V2Ray configuration from GitHub when the current config drops or fails.
      * Returns null if all tested nodes fail verification so the VPN can auto-disconnect cleanly.
      */
     private suspend fun findNextHealthyConfigOrNull(failedConfig: V2RayConfig?): V2RayConfig? {
@@ -90,7 +82,6 @@ class MehVpnService : VpnService() {
             V2RayOutboundClient.markNodeDead(failedConfig)
         }
 
-        // Method 1: Fresh GitHub V2Ray Configs (excluding the dead server)
         VpnStateBus.updateStage(ConnectionStage.TESTING_SERVERS, failedConfig)
         val githubConfigs = runCatching { aggregator.fetchAllGitHubConfigs() }.getOrDefault(emptyList())
         if (githubConfigs.isNotEmpty()) {
@@ -99,28 +90,7 @@ class MehVpnService : VpnService() {
                 return bestV2Ray
             }
         }
-
-        return resolveCascadeFallbackOrNull(failedConfig)
-    }
-
-    private suspend fun resolveCascadeFallbackOrNull(failedConfig: V2RayConfig?): V2RayConfig? {
-        if (failedConfig != null) {
-            V2RayOutboundClient.markNodeDead(failedConfig)
-        }
-
-        // Method 2: CluvexStudio/Aether
-        VpnStateBus.updateStage(ConnectionStage.AETHER_FALLBACK, failedConfig)
-        val aether = AetherGatewayEngine.discoverAndValidateGatewayOrNull()
-        if (aether != null) return aether
-
-        // Method 3: patterniha/Serverless-for-Iran
-        VpnStateBus.updateStage(ConnectionStage.SERVERLESS_FALLBACK, failedConfig)
-        val serverless = PatternihaBypassEngine.discoverAndValidateServerlessOrNull()
-        if (serverless != null) return serverless
-
-        // Method 4: patterniha/SNI-Spoofing
-        VpnStateBus.updateStage(ConnectionStage.SNI_SPOOF_FALLBACK, failedConfig)
-        return PatternihaBypassEngine.discoverAndValidateSniSpoofingOrNull()
+        return null
     }
 
     private fun startTunnel(initialConfig: V2RayConfig) {
@@ -150,10 +120,10 @@ class MehVpnService : VpnService() {
             persistActiveConfig(activeConfig)
             startVpnForegroundNotification(activeConfig)
 
-            // 1. Start local V2Ray / Aether / Serverless / SNI-Spoof HTTP/HTTPS CONNECT & SOCKS5 Proxy Server
+            // 1. Start local V2Ray HTTP/HTTPS CONNECT & SOCKS5 Proxy Server
             localProxyServer?.destroy()
             val proxy = V2RayLocalProxyServer(this@MehVpnService, activeConfig)
-            val boundProxyPort = proxy.start()
+            proxy.start()
             localProxyServer = proxy
 
             // 2. Establish full-device Android VPN TUN interface (0.0.0.0/0) + Tun2V2RayRouter
@@ -163,17 +133,14 @@ class MehVpnService : VpnService() {
 
                 val builder = Builder()
                     .setSession("MEH (مه) • ${activeConfig.countryNameFa}")
-                    // 1360 MTU prevents cellular GTP packet fragmentation on Irancell/MCI when loading Twitter/X
+                    // 1360 MTU prevents cellular GTP packet fragmentation on Irancell/MCI
                     .setMtu(1360)
                     .addAddress("10.0.0.2", 24)
-                    .addDnsServer("1.1.1.1")
-                    .addDnsServer("8.8.8.8")
-                    // Route all IPv4 traffic through the VPN TUN interface
+                    // Use internal virtual VPN gateway IP (10.0.0.1) as DNS server so Android netd
+                    // never triggers Opportunistic DNS-over-TLS (port 853) and sends all DNS over UDP 53 to TUN
+                    .addDnsServer("10.0.0.1")
+                    // Route all IPv4 traffic through the VPN TUN interface (just like Telegram)
                     .addRoute("0.0.0.0", 0)
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", boundProxyPort))
-                }
 
                 // Prevent our own app's outbound sockets from looping back into TUN
                 runCatching { builder.addDisallowedApplication(packageName) }
@@ -198,7 +165,7 @@ class MehVpnService : VpnService() {
     /**
      * Continuously monitors the active VPN tunnel every 15 seconds (or immediately when
      * 3 consecutive outbound stream failures occur) and seamlessly hot-swaps to a new live
-     * config if open internet access drops.
+     * V2Ray config if open internet access drops.
      */
     private fun startWatchdogLoop(tunEstablished: Boolean) {
         watchdogJob?.cancel()
@@ -208,7 +175,6 @@ class MehVpnService : VpnService() {
 
         watchdogJob = serviceScope.launch {
             while (isActive) {
-                // Wait either 15 seconds OR until an immediate tunnel degradation signal arrives
                 withTimeoutOrNull(15_000L) {
                     healTriggerChannel.receive()
                 }
@@ -225,10 +191,6 @@ class MehVpnService : VpnService() {
         }
     }
 
-    /**
-     * Double-checks real internet connectivity through [config] so a single transient packet loss
-     * does not trigger an unnecessary server switch, while genuine config drops are caught fast.
-     */
     private fun verifyConfigStillAlive(config: V2RayConfig): Boolean {
         for (attempt in 0..1) {
             val ping = V2RayOutboundClient.verifyRealInternetConnectivity(
@@ -243,10 +205,6 @@ class MehVpnService : VpnService() {
         return false
     }
 
-    /**
-     * Hot-swaps the dead configuration with a newly verified live server without dropping the TUN interface,
-     * or disconnects cleanly if all fallback tests fail.
-     */
     private suspend fun performHotSwapAutoHeal(deadConfig: V2RayConfig, tunEstablished: Boolean) {
         if (!isHealing.compareAndSet(false, true)) return
         try {
@@ -258,7 +216,6 @@ class MehVpnService : VpnService() {
             currentActiveConfig = newConfig
             persistActiveConfig(newConfig)
 
-            // Hot-swap config in-place on both the local proxy and TUN router
             localProxyServer?.updateConfig(newConfig)
             tunRouter?.updateConfig(newConfig)
 

@@ -134,12 +134,6 @@ object V2RayParser {
         val clean = uriString.trim()
         return try {
             when {
-                clean.startsWith("aether://", ignoreCase = true) ->
-                    parseCustomBypassUri(clean, V2RayProtocol.AETHER, sourceRepo.ifEmpty { "CluvexStudio/Aether" })
-                clean.startsWith("serverless://", ignoreCase = true) ->
-                    parseCustomBypassUri(clean, V2RayProtocol.SERVERLESS, sourceRepo.ifEmpty { "patterniha/Serverless-for-Iran" })
-                clean.startsWith("snispoof://", ignoreCase = true) ->
-                    parseCustomBypassUri(clean, V2RayProtocol.SNI_SPOOF, sourceRepo.ifEmpty { "patterniha/SNI-Spoofing" })
                 clean.startsWith("vless://", ignoreCase = true) ->
                     parseVlessOrTrojan(clean, V2RayProtocol.VLESS, sourceRepo)
                 clean.startsWith("trojan://", ignoreCase = true) ->
@@ -153,63 +147,6 @@ object V2RayParser {
         } catch (_: Exception) {
             null
         }
-    }
-
-    private fun parseCustomBypassUri(
-        rawUri: String,
-        protocol: V2RayProtocol,
-        defaultRepo: String
-    ): V2RayConfig? {
-        val withoutScheme = rawUri.substringAfter("://")
-        val fragment = urlDecodeSafe(withoutScheme.substringAfterLast("#", ""))
-        val mainPart = withoutScheme.substringBefore("#")
-        val queryPart = mainPart.substringAfter("?", "")
-        val authorityPart = mainPart.substringBefore("?")
-
-        val modeOrId = authorityPart.substringBefore("@", protocol.name.lowercase())
-            .ifEmpty { protocol.name.lowercase() }
-        val hostPortPart = if (authorityPart.contains("@")) authorityPart.substringAfter("@") else authorityPart
-        val (host, port) = splitHostPort(hostPortPart) ?: return null
-        val params = parseQueryParams(queryPart)
-
-        val defaultSni = when (protocol) {
-            V2RayProtocol.AETHER -> "engage.cloudflareclient.com"
-            V2RayProtocol.SERVERLESS -> "cp.cloudflare.com"
-            V2RayProtocol.SNI_SPOOF -> "speedtest.net"
-            else -> host
-        }
-        val sni = params["sni"] ?: defaultSni
-        val cc = params["cc"] ?: ""
-        val geo = if (cc.isNotEmpty()) geoForCountryCode(cc) else detectGeoLocation(fragment, host, sni)
-
-        val defaultNet = when (protocol) {
-            V2RayProtocol.AETHER -> "masque-h2"
-            V2RayProtocol.SERVERLESS -> "fragment-1-3"
-            V2RayProtocol.SNI_SPOOF -> "sni-spoof"
-            else -> "tcp"
-        }
-
-        return V2RayConfig(
-            id = "${protocol.name}_${host}_${port}",
-            rawUri = rawUri,
-            protocol = protocol,
-            remark = geo.countryNameFa,
-            address = host,
-            port = port,
-            uuidOrPassword = modeOrId,
-            network = params["net"] ?: defaultNet,
-            tls = "tls",
-            sni = sni,
-            path = params["path"] ?: "/",
-            hostHeader = params["host"] ?: sni,
-            encryption = params["fragment"] ?: modeOrId,
-            countryCode = geo.countryCode,
-            countryNameFa = geo.countryNameFa,
-            flagEmoji = geo.flagEmoji,
-            latitude = geo.latitude,
-            longitude = geo.longitude,
-            sourceRepo = defaultRepo
-        )
     }
 
     private fun parseVlessOrTrojan(
@@ -373,10 +310,7 @@ object V2RayParser {
     }
 
     private fun containsSchemeUris(text: String): Boolean {
-        return text.contains("aether://", ignoreCase = true) ||
-            text.contains("serverless://", ignoreCase = true) ||
-            text.contains("snispoof://", ignoreCase = true) ||
-            text.contains("vless://", ignoreCase = true) ||
+        return text.contains("vless://", ignoreCase = true) ||
             text.contains("vmess://", ignoreCase = true) ||
             text.contains("trojan://", ignoreCase = true) ||
             text.contains("ss://", ignoreCase = true)
