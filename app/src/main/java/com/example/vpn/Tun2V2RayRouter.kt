@@ -37,6 +37,10 @@ class Tun2V2RayRouter(
     private val dnsIpToDomainCache = ConcurrentHashMap<String, String>()
     private val ipIdCounter = AtomicInteger(1000)
 
+    private var pooledDnsStream: V2RayTunnelStream? = null
+    private var pooledDnsConfig: V2RayConfig? = null
+    private val dnsTunnelLock = Any()
+
     fun start(tunFd: FileDescriptor) {
         stop()
         val tunIn = FileInputStream(tunFd)
@@ -110,51 +114,90 @@ class Tun2V2RayRouter(
 
         routerScope.launch {
             runCatching {
-                V2RayOutboundClient.openTunnelStream(
-                    config = activeConfig,
-                    targetHost = "1.1.1.1",
-                    targetPort = 53,
-                    vpnService = vpnService,
-                    connectTimeoutMs = 3500
-                ).use { tunnel ->
+                val dnsResp = executeDnsQuery(dnsQuery) ?: return@launch
+
+                if (!queriedDomain.isNullOrEmpty()) {
+                    extractDnsARecords(dnsResp, queriedDomain)
+                }
+
+                val udpRespPacket = buildIpv4UdpPacket(
+                    srcIp = packet.copyOfRange(16, 20),
+                    dstIp = packet.copyOfRange(12, 16),
+                    srcPort = dstPort,
+                    dstPort = readUInt16(packet, ihl),
+                    payload = dnsResp
+                )
+                writeTunPacket(udpRespPacket)
+            }
+        }
+    }
+
+    private fun executeDnsQuery(dnsQuery: ByteArray): ByteArray? {
+        synchronized(dnsTunnelLock) {
+            for (attempt in 0..1) {
+                try {
+                    val stream = getOrCreateDnsTunnelLocked()
                     val framedReq = ByteArray(dnsQuery.size + 2)
                     framedReq[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
                     framedReq[1] = (dnsQuery.size and 0xFF).toByte()
                     System.arraycopy(dnsQuery, 0, framedReq, 2, dnsQuery.size)
 
-                    tunnel.output.write(framedReq)
-                    tunnel.output.flush()
+                    stream.output.write(framedReq)
+                    stream.output.flush()
 
-                    val hi = tunnel.input.read()
-                    val lo = tunnel.input.read()
-                    if (hi == -1 || lo == -1) return@launch
+                    val hi = stream.input.read()
+                    val lo = stream.input.read()
+                    if (hi == -1 || lo == -1) {
+                        closeDnsTunnelLocked()
+                        continue
+                    }
                     val respLen = (hi shl 8) or lo
-                    if (respLen !in 12..4096) return@launch
+                    if (respLen !in 12..4096) {
+                        closeDnsTunnelLocked()
+                        continue
+                    }
 
                     val dnsResp = ByteArray(respLen)
                     var total = 0
                     while (total < respLen) {
-                        val r = tunnel.input.read(dnsResp, total, respLen - total)
+                        val r = stream.input.read(dnsResp, total, respLen - total)
                         if (r == -1) break
                         total += r
                     }
-                    if (total < respLen) return@launch
-
-                    if (!queriedDomain.isNullOrEmpty()) {
-                        extractDnsARecords(dnsResp, queriedDomain)
+                    if (total == respLen) {
+                        return dnsResp
                     }
-
-                    val udpRespPacket = buildIpv4UdpPacket(
-                        srcIp = packet.copyOfRange(16, 20),
-                        dstIp = packet.copyOfRange(12, 16),
-                        srcPort = dstPort,
-                        dstPort = readUInt16(packet, ihl),
-                        payload = dnsResp
-                    )
-                    writeTunPacket(udpRespPacket)
+                    closeDnsTunnelLocked()
+                } catch (_: Exception) {
+                    closeDnsTunnelLocked()
                 }
             }
+            return null
         }
+    }
+
+    private fun getOrCreateDnsTunnelLocked(): V2RayTunnelStream {
+        val current = pooledDnsStream
+        if (current != null && pooledDnsConfig == activeConfig) {
+            return current
+        }
+        closeDnsTunnelLocked()
+        val newStream = V2RayOutboundClient.openTunnelStream(
+            config = activeConfig,
+            targetHost = "1.1.1.1",
+            targetPort = 53,
+            vpnService = vpnService,
+            connectTimeoutMs = 3500
+        )
+        pooledDnsStream = newStream
+        pooledDnsConfig = activeConfig
+        return newStream
+    }
+
+    private fun closeDnsTunnelLocked() {
+        runCatching { pooledDnsStream?.close() }
+        pooledDnsStream = null
+        pooledDnsConfig = null
     }
 
     private fun parseDnsQueryDomain(dnsBytes: ByteArray): String? {
@@ -803,6 +846,9 @@ class Tun2V2RayRouter(
         tcpSessions.values.forEach { it.closeQuietly() }
         tcpSessions.clear()
         tunOutStream = null
+        synchronized(dnsTunnelLock) {
+            closeDnsTunnelLocked()
+        }
     }
 
     fun destroy() {
