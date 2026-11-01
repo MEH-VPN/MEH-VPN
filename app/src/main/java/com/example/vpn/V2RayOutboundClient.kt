@@ -1,6 +1,5 @@
 package com.example.vpn
 
-import android.util.Base64
 import com.example.model.V2RayConfig
 import com.example.model.V2RayProtocol
 import java.io.BufferedInputStream
@@ -12,11 +11,16 @@ import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
@@ -27,7 +31,7 @@ import kotlin.system.measureNanoTime
 /**
  * Real V2Ray Outbound Protocol Client supporting:
  * - Protocols: VLESS (v0) and Trojan
- * - Transports: Raw TCP and RFC 6455 WebSocket (ws) / HTTPUpgrade
+ * - Transports: Raw TCP and RFC 6455 WebSocket (ws)
  * - Security: None and TLS (with custom SNI and permissive certificate trust for self-signed V2Ray nodes)
  */
 object V2RayOutboundClient {
@@ -74,7 +78,6 @@ object V2RayOutboundClient {
       return false
     }
     if (config.address.contains(":")) {
-      // Skip raw IPv6 literals for maximum ISP compatibility
       return false
     }
     val net = config.network.lowercase()
@@ -102,28 +105,44 @@ object V2RayOutboundClient {
     return true
   }
 
-  private val resolvedEndpointCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+  private val resolvedEndpointCache = ConcurrentHashMap<String, String>()
 
+  /**
+   * Resolves a V2Ray server hostname to a clean public IPv4 address, rejecting private/sinkhole IPs
+   * (such as 10.10.34.x ISP DNS poisoning).
+   */
   fun resolveEndpointIpv4(host: String): String? {
     val trimmed = host.trim()
     if (trimmed.isEmpty()) return null
-    parseIpv4Bytes(trimmed)?.let { return trimmed }
-    resolvedEndpointCache[trimmed.lowercase()]?.let { return it }
-    return try {
-      val ipv4 =
-        java.net.InetAddress.getAllByName(trimmed)
-          .firstOrNull { it is java.net.Inet4Address }
-          ?.hostAddress
-      if (!ipv4.isNullOrBlank()) {
-        resolvedEndpointCache[trimmed.lowercase()] = ipv4
-      }
-      ipv4
-    } catch (_: Exception) {
-      null
+    parseIpv4Bytes(trimmed)?.let { bytes ->
+      return if (isPublicRoutableIpv4(bytes)) trimmed else null
     }
+    resolvedEndpointCache[trimmed.lowercase()]?.let { return it }
+
+    try {
+      val candidates = InetAddress.getAllByName(trimmed)
+      for (addr in candidates) {
+        if (addr is Inet4Address) {
+          val bytes = addr.address
+          if (bytes != null && bytes.size == 4 && isPublicRoutableIpv4(bytes)) {
+            val ip = addr.hostAddress ?: continue
+            resolvedEndpointCache[trimmed.lowercase()] = ip
+            return ip
+          }
+        }
+      }
+    } catch (_: Exception) {}
+
+    // Fallback: Resolve via encrypted DNS-over-HTTPS (1.1.1.1 / 8.8.8.8) if system DNS failed or was poisoned
+    resolveViaDirectDoh(trimmed)?.let { cleanIp ->
+      resolvedEndpointCache[trimmed.lowercase()] = cleanIp
+      return cleanIp
+    }
+
+    return null
   }
 
-  private fun parseIpv4Bytes(host: String): ByteArray? {
+  fun parseIpv4Bytes(host: String): ByteArray? {
     val parts = host.split(".")
     if (parts.size != 4) return null
     val bytes = ByteArray(4)
@@ -135,14 +154,56 @@ object V2RayOutboundClient {
     return bytes
   }
 
+  fun isPublicRoutableIpv4(bytes: ByteArray): Boolean {
+    if (bytes.size != 4) return false
+    val b0 = bytes[0].toInt() and 0xFF
+    val b1 = bytes[1].toInt() and 0xFF
+    if (b0 == 0 || b0 == 10 || b0 == 127) return false
+    if (b0 == 172 && b1 in 16..31) return false
+    if (b0 == 192 && b1 == 168) return false
+    if (b0 == 100 && b1 in 64..127) return false
+    if (b0 >= 224) return false
+    return true
+  }
+
+  private fun resolveViaDirectDoh(domain: String): String? {
+    val query = buildDnsAQuery(domain)
+    for (dohIp in listOf(byteArrayOf(1, 1, 1, 1), byteArrayOf(8, 8, 8, 8))) {
+      try {
+        val raw = Socket()
+        raw.tcpNoDelay = true
+        raw.soTimeout = 2500
+        raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
+        val hostStr = "${dohIp[0].toInt() and 0xFF}.${dohIp[1].toInt() and 0xFF}.${dohIp[2].toInt() and 0xFF}.${dohIp[3].toInt() and 0xFF}"
+        val ssl = permissiveSslContext.socketFactory.createSocket(raw, hostStr, 443, true) as SSLSocket
+        ssl.soTimeout = 2500
+        ssl.startHandshake()
+        ssl.use { sock ->
+          val req =
+            "POST /dns-query HTTP/1.1\r\n" +
+              "Host: $hostStr\r\n" +
+              "Content-Type: application/dns-message\r\n" +
+              "Accept: application/dns-message\r\n" +
+              "Content-Length: ${query.size}\r\n" +
+              "Connection: close\r\n\r\n"
+          sock.outputStream.write(req.toByteArray(Charsets.US_ASCII))
+          sock.outputStream.write(query)
+          sock.outputStream.flush()
+          val respBytes = readHttpBody(sock.inputStream, 2048) ?: return@use
+          extractFirstPublicARecord(respBytes)?.let { return it }
+        }
+      } catch (_: Exception) {}
+    }
+    return null
+  }
+
   /**
-   * Tests a V2Ray node by opening a real V2Ray protocol tunnel to `connectivitycheck.gstatic.com:80`
-   * and sending `GET /generate_204 HTTP/1.1` through the proxy tunnel.
-   * Requires both `HTTP/1.1 204` and Google's `Cross-Origin-Resource-Policy` header to reject fake fallbacks.
+   * Stage 1 Fast Probe: Opens a V2Ray tunnel to `connectivitycheck.gstatic.com:80`
+   * and verifies `HTTP/1.1 204`.
    */
   fun measureRealProxyDelay(
     config: V2RayConfig,
-    timeoutMs: Int = 2600,
+    timeoutMs: Int = 2400,
     protector: ((Socket) -> Boolean)? = null,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
@@ -176,14 +237,12 @@ object V2RayOutboundClient {
               if (n <= 0) break
               responseBuf.write(chunk, 0, n)
               val textSoFar = responseBuf.toString("US-ASCII")
-              if (textSoFar.contains("\r\n\r\n") || textSoFar.contains("Cross-Origin-Resource-Policy", ignoreCase = true)) {
+              if (textSoFar.contains("\r\n\r\n")) {
                 break
               }
             }
             val responseText = responseBuf.toString("US-ASCII")
-            if (!responseText.startsWith("HTTP/1.1 204") ||
-              !responseText.contains("Cross-Origin-Resource-Policy", ignoreCase = true)
-            ) {
+            if (!responseText.startsWith("HTTP/1.1 204")) {
               throw IOException("Invalid gstatic 204 probe response: ${responseText.take(48)}")
             }
           }
@@ -196,21 +255,92 @@ object V2RayOutboundClient {
   }
 
   /**
+   * Stage 2 Strict Verification: Opens a SECOND independent V2Ray tunnel to `www.google.com:443`,
+   * performs a real end-to-end TLS handshake with `www.google.com` INSIDE the V2Ray tunnel,
+   * and verifies `GET /generate_204 -> HTTP/1.1 204`.
+   * This eliminates single-connection honeypots, port-443 blockers, and fake HTTP 204 stubs.
+   */
+  fun verifyHttpsAndDnsCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2800,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    if (!isSupportedByEngine(config)) return null
+    val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
+    if (resolvedIp.isEmpty()) return null
+    val resolvedConfig = config.copy(resolvedIp = resolvedIp)
+
+    return try {
+      val elapsedNanos =
+        measureNanoTime {
+          openTunnel(
+            config = resolvedConfig,
+            targetHost = "www.google.com",
+            targetPort = 443,
+            timeoutMs = timeoutMs,
+            protector = protector,
+          ).use { tunnel ->
+            val tunnelBridgeSocket = TunnelStreamSocketAdapter(tunnel)
+            val sslOverTunnel =
+              permissiveSslContext.socketFactory.createSocket(
+                tunnelBridgeSocket,
+                "www.google.com",
+                443,
+                false,
+              ) as SSLSocket
+            sslOverTunnel.soTimeout = timeoutMs
+            try {
+              if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+                val params = sslOverTunnel.sslParameters
+                params.serverNames = listOf(SNIHostName("www.google.com"))
+                sslOverTunnel.sslParameters = params
+              }
+            } catch (_: Exception) {}
+
+            sslOverTunnel.startHandshake()
+            val req =
+              "GET /generate_204 HTTP/1.1\r\n" +
+                "Host: www.google.com\r\n" +
+                "User-Agent: Mozilla/5.0\r\n" +
+                "Connection: close\r\n\r\n"
+            sslOverTunnel.outputStream.write(req.toByteArray(Charsets.US_ASCII))
+            sslOverTunnel.outputStream.flush()
+
+            val buf = ByteArray(128)
+            val n = sslOverTunnel.inputStream.read(buf)
+            if (n <= 0) throw IOException("Empty HTTPS 443 response over tunnel")
+            val statusLine = String(buf, 0, n, Charsets.US_ASCII)
+            if (!statusLine.startsWith("HTTP/1.1 204") && !statusLine.startsWith("HTTP/2 204")) {
+              throw IOException("Unexpected HTTPS 443 status: ${statusLine.take(32)}")
+            }
+          }
+        }
+      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  /**
    * Establishes an outbound V2Ray tunnel to [targetHost]:[targetPort] through [config].
    */
   fun openTunnel(
     config: V2RayConfig,
     targetHost: String,
     targetPort: Int,
-    timeoutMs: Int = 8000,
+    timeoutMs: Int = 7000,
     protector: ((Socket) -> Boolean)? = null,
   ): TunnelConnection {
     val rawSocket = Socket()
     try {
-      // Bind first so Android's SocketImpl allocates a valid OS file descriptor (fd) before protect(rawSocket)
-      rawSocket.bind(InetSocketAddress(0))
+      // Touching reuseAddress forces Android's SocketImpl to allocate its underlying OS file descriptor
+      // immediately WITHOUT calling bind(), so VpnService.protect(rawSocket) succeeds prior to connect().
+      try {
+        rawSocket.reuseAddress
+      } catch (_: Exception) {}
       protector?.invoke(rawSocket)
       rawSocket.tcpNoDelay = true
+      rawSocket.keepAlive = true
       rawSocket.soTimeout = timeoutMs
 
       val connectHost =
@@ -220,7 +350,7 @@ object V2RayOutboundClient {
       val ipv4Bytes = parseIpv4Bytes(connectHost)
       val remoteEndpoint =
         if (ipv4Bytes != null) {
-          InetSocketAddress(java.net.InetAddress.getByAddress(ipv4Bytes), config.port)
+          InetSocketAddress(InetAddress.getByAddress(ipv4Bytes), config.port)
         } else {
           InetSocketAddress(connectHost, config.port)
         }
@@ -240,6 +370,14 @@ object V2RayOutboundClient {
         performWebSocketUpgrade(config, transportIn, transportOut)
         transportIn = WebSocketFrameInputStream(transportIn)
         transportOut = WebSocketFrameOutputStream(transportOut)
+      }
+
+      // Increase read timeout for active tunnel streaming so HTTP/2 and long-lived connections stay alive
+      if (timeoutMs >= 5000) {
+        try {
+          transportSocket.soTimeout = 120_000
+          rawSocket.soTimeout = 120_000
+        } catch (_: Exception) {}
       }
 
       return when (config.protocol) {
@@ -366,6 +504,7 @@ object V2RayOutboundClient {
 
     writeVlessAddress(header, targetHost)
     val headerBytes = header.toByteArray()
+    val headerSentLatch = CountDownLatch(1)
 
     val vlessOut =
       object : FilterOutputStream(output) {
@@ -380,17 +519,21 @@ object V2RayOutboundClient {
         override fun write(b: ByteArray, off: Int, len: Int) {
           if (!headerSent) {
             headerSent = true
-            val combined = ByteArray(headerBytes.size + len)
-            System.arraycopy(headerBytes, 0, combined, 0, headerBytes.size)
-            System.arraycopy(b, off, combined, headerBytes.size, len)
-            out.write(combined)
+            try {
+              val combined = ByteArray(headerBytes.size + len)
+              System.arraycopy(headerBytes, 0, combined, 0, headerBytes.size)
+              System.arraycopy(b, off, combined, headerBytes.size, len)
+              out.write(combined)
+              out.flush()
+            } finally {
+              headerSentLatch.countDown()
+            }
           } else {
             out.write(b, off, len)
           }
         }
       }
 
-    // Consume VLESS 2-byte response header [version == 0x00, addon_len, ...addons] on first read
     val vlessIn =
       object : FilterInputStream(input) {
         private var responseHeaderRead = false
@@ -398,6 +541,7 @@ object V2RayOutboundClient {
         @Synchronized
         private fun ensureHeader() {
           if (!responseHeaderRead) {
+            headerSentLatch.await(3000, TimeUnit.MILLISECONDS)
             responseHeaderRead = true
             val ver = `in`.read()
             if (ver == -1) throw EOFException("VLESS EOF before response header")
@@ -406,13 +550,9 @@ object V2RayOutboundClient {
             if (addonLen == -1) throw EOFException("VLESS EOF reading addon length")
             var remaining = addonLen
             while (remaining > 0) {
-              val skipped = `in`.skip(remaining.toLong()).toInt()
-              if (skipped <= 0) {
-                if (`in`.read() == -1) throw EOFException("VLESS EOF skipping addons")
-                remaining--
-              } else {
-                remaining -= skipped
-              }
+              val b = `in`.read()
+              if (b == -1) throw EOFException("VLESS EOF skipping addons")
+              remaining--
             }
           }
         }
@@ -467,6 +607,7 @@ object V2RayOutboundClient {
             System.arraycopy(headerBytes, 0, combined, 0, headerBytes.size)
             System.arraycopy(b, off, combined, headerBytes.size, len)
             out.write(combined)
+            out.flush()
           } else {
             out.write(b, off, len)
           }
@@ -551,8 +692,120 @@ object V2RayOutboundClient {
     return out.toString()
   }
 
+  private fun buildDnsAQuery(domain: String): ByteArray {
+    val out = ByteArrayOutputStream(64)
+    out.write(byteArrayOf(0x13, 0x37, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+    for (label in domain.trimEnd('.').split(".")) {
+      val bytes = label.toByteArray(Charsets.US_ASCII)
+      out.write(bytes.size)
+      out.write(bytes)
+    }
+    out.write(0x00)
+    out.write(byteArrayOf(0x00, 0x01, 0x00, 0x01)) // QTYPE=A, QCLASS=IN
+    return out.toByteArray()
+  }
+
+  internal fun readHttpBody(input: InputStream, maxBytes: Int): ByteArray? {
+    val headerBuf = ByteArrayOutputStream(256)
+    var state = 0
+    while (headerBuf.size() < 4096) {
+      val b = input.read()
+      if (b == -1) return null
+      headerBuf.write(b)
+      state =
+        when {
+          state == 0 && b == '\r'.code -> 1
+          state == 1 && b == '\n'.code -> 2
+          state == 2 && b == '\r'.code -> 3
+          state == 3 && b == '\n'.code -> 4
+          else -> if (b == '\r'.code) 1 else 0
+        }
+      if (state == 4) break
+    }
+    val headers = headerBuf.toString("US-ASCII")
+    if (!headers.startsWith("HTTP/1.1 200") && !headers.startsWith("HTTP/1.0 200")) return null
+    val contentLen =
+      headers
+        .lineSequence()
+        .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+        ?.substringAfter(":")
+        ?.trim()
+        ?.toIntOrNull()
+        ?: -1
+
+    if (contentLen in 12..maxBytes) {
+      val body = ByteArray(contentLen)
+      DataInputStream(input).readFully(body)
+      return body
+    }
+    val rest = ByteArrayOutputStream(256)
+    val buf = ByteArray(256)
+    while (rest.size() < maxBytes) {
+      val n = input.read(buf)
+      if (n <= 0) break
+      rest.write(buf, 0, n)
+    }
+    return if (rest.size() >= 12) rest.toByteArray() else null
+  }
+
+  private fun extractFirstPublicARecord(dnsPacket: ByteArray): String? {
+    if (dnsPacket.size < 12) return null
+    val qdCount = ((dnsPacket[4].toInt() and 0xFF) shl 8) or (dnsPacket[5].toInt() and 0xFF)
+    val anCount = ((dnsPacket[6].toInt() and 0xFF) shl 8) or (dnsPacket[7].toInt() and 0xFF)
+    if (anCount <= 0) return null
+    var offset = 12
+    repeat(qdCount) {
+      offset = skipDnsName(dnsPacket, offset)
+      if (offset < 0 || offset + 4 > dnsPacket.size) return null
+      offset += 4
+    }
+    repeat(anCount) {
+      offset = skipDnsName(dnsPacket, offset)
+      if (offset < 0 || offset + 10 > dnsPacket.size) return null
+      val type = ((dnsPacket[offset].toInt() and 0xFF) shl 8) or (dnsPacket[offset + 1].toInt() and 0xFF)
+      val rdLen = ((dnsPacket[offset + 8].toInt() and 0xFF) shl 8) or (dnsPacket[offset + 9].toInt() and 0xFF)
+      offset += 10
+      if (offset + rdLen > dnsPacket.size) return null
+      if (type == 1 && rdLen == 4) {
+        val ipBytes = dnsPacket.copyOfRange(offset, offset + 4)
+        if (isPublicRoutableIpv4(ipBytes)) {
+          return "${ipBytes[0].toInt() and 0xFF}.${ipBytes[1].toInt() and 0xFF}.${ipBytes[2].toInt() and 0xFF}.${ipBytes[3].toInt() and 0xFF}"
+        }
+      }
+      offset += rdLen
+    }
+    return null
+  }
+
+  internal fun skipDnsName(pkt: ByteArray, startOffset: Int): Int {
+    var pos = startOffset
+    while (pos < pkt.size) {
+      val len = pkt[pos].toInt() and 0xFF
+      if (len == 0) return pos + 1
+      if ((len and 0xC0) == 0xC0) return pos + 2
+      pos += 1 + len
+    }
+    return -1
+  }
+
+  /**
+   * Adapts a [TunnelConnection] into a [Socket] so Java's [SSLSocketFactory] can perform TLS handshakes over the tunnel.
+   */
+  private class TunnelStreamSocketAdapter(
+    private val tunnel: TunnelConnection,
+  ) : Socket() {
+    override fun getInputStream(): InputStream = tunnel.inputStream
+    override fun getOutputStream(): OutputStream = tunnel.outputStream
+    override fun isConnected(): Boolean = true
+    override fun isClosed(): Boolean = tunnel.underlyingSocket.isClosed
+    override fun close() {
+      tunnel.close()
+    }
+  }
+
   /**
    * RFC 6455 WebSocket Binary Frame OutputStream (client-to-server frames must be masked).
+   * Chunks writes into <= 4096 byte frames so Xray/Cloudflare WebSocket buffers never overflow.
    */
   private class WebSocketFrameOutputStream(out: OutputStream) : FilterOutputStream(out) {
     private val rng = SecureRandom()
@@ -565,6 +818,17 @@ object V2RayOutboundClient {
     @Synchronized
     override fun write(b: ByteArray, off: Int, len: Int) {
       if (len <= 0) return
+      var cursor = off
+      var remaining = len
+      while (remaining > 0) {
+        val chunkLen = minOf(remaining, 4096)
+        writeSingleFrame(b, cursor, chunkLen)
+        cursor += chunkLen
+        remaining -= chunkLen
+      }
+    }
+
+    private fun writeSingleFrame(b: ByteArray, off: Int, len: Int) {
       val maskKey = ByteArray(4).also { rng.nextBytes(it) }
       val frame = ByteArrayOutputStream(len + 14)
       frame.write(0x82) // FIN + Binary frame (0x02)
@@ -619,6 +883,14 @@ object V2RayOutboundClient {
       System.arraycopy(currentPayload, currentOffset, b, off, toCopy)
       currentOffset += toCopy
       return toCopy
+    }
+
+    @Synchronized
+    override fun skip(n: Long): Long {
+      if (n <= 0) return 0
+      val buf = ByteArray(minOf(n, 4096L).toInt())
+      val r = read(buf, 0, buf.size)
+      return if (r <= 0) 0L else r.toLong()
     }
 
     private fun readNextFrame(): Boolean {

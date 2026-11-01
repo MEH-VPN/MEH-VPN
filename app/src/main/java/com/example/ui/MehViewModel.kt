@@ -9,6 +9,7 @@ import com.example.data.SoliSpiritRepository
 import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
 import com.example.vpn.MehVpnService
+import java.util.ArrayList
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -56,7 +57,7 @@ class MehViewModel(
   val uiState: StateFlow<MehUiState> = _uiState.asStateFlow()
 
   private var workflowJob: Job? = null
-  private var pendingConfigForPermission: V2RayConfig? = null
+  private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
 
   init {
     viewModelScope.launch {
@@ -150,9 +151,13 @@ class MehViewModel(
           }
           delay(200L)
 
-          val fastestConfig = repository.testAndSelectFastest(configs) { _ -> }
+          val verifiedCandidates =
+            repository.testAndSelectFastestCandidates(
+              configs = configs,
+              maxCount = 6,
+            ) { _ -> }
 
-          if (fastestConfig == null) {
+          if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(
               stage = "speed_test",
               errorMessage = "No responsive V2Ray server found among ${configs.size} configs",
@@ -179,10 +184,10 @@ class MehViewModel(
             }
 
           if (prepareIntent != null) {
-            pendingConfigForPermission = fastestConfig
+            pendingCandidatesForPermission = verifiedCandidates
             onRequestVpnPermission(prepareIntent)
           } else {
-            launchVpnService(context, fastestConfig)
+            launchVpnService(context, verifiedCandidates)
           }
         } catch (ce: CancellationException) {
           throw ce
@@ -203,11 +208,11 @@ class MehViewModel(
   }
 
   fun onVpnPermissionResult(context: Context, granted: Boolean) {
-    val config = pendingConfigForPermission
-    pendingConfigForPermission = null
+    val candidates = pendingCandidatesForPermission
+    pendingCandidatesForPermission = emptyList()
 
-    if (granted && config != null) {
-      launchVpnService(context, config)
+    if (granted && candidates.isNotEmpty()) {
+      launchVpnService(context, candidates)
     } else {
       MehTelemetry.logError(
         stage = "vpn_permission",
@@ -222,12 +227,21 @@ class MehViewModel(
     }
   }
 
-  private fun launchVpnService(context: Context, config: V2RayConfig) {
+  private fun launchVpnService(context: Context, candidates: List<V2RayConfig>) {
+    val config = candidates.first()
     val intent =
       Intent(context, MehVpnService::class.java).apply {
         action = MehVpnService.ACTION_CONNECT
         putExtra(MehVpnService.EXTRA_RAW_URI, config.rawUri)
         putExtra(MehVpnService.EXTRA_RESOLVED_IP, config.resolvedIp)
+        putStringArrayListExtra(
+          MehVpnService.EXTRA_CANDIDATE_URIS,
+          ArrayList(candidates.map { it.rawUri }),
+        )
+        putStringArrayListExtra(
+          MehVpnService.EXTRA_CANDIDATE_IPS,
+          ArrayList(candidates.map { it.resolvedIp }),
+        )
         putExtra(MehVpnService.EXTRA_SERVER_NAME, config.cleanTitle)
         putExtra(MehVpnService.EXTRA_SERVER_ADDRESS, config.address)
         putExtra(MehVpnService.EXTRA_SERVER_PORT, config.port)
@@ -265,7 +279,7 @@ class MehViewModel(
   private fun disconnectOrCancel(context: Context) {
     workflowJob?.cancel()
     workflowJob = null
-    pendingConfigForPermission = null
+    pendingCandidatesForPermission = emptyList()
 
     try {
       val stopIntent =

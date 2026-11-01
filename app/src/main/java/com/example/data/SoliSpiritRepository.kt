@@ -28,8 +28,8 @@ class SoliSpiritRepository(
   private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
   private val httpClient: OkHttpClient =
     OkHttpClient.Builder()
-      .connectTimeout(8, TimeUnit.SECONDS)
-      .readTimeout(10, TimeUnit.SECONDS)
+      .connectTimeout(7, TimeUnit.SECONDS)
+      .readTimeout(9, TimeUnit.SECONDS)
       .followRedirects(true)
       .build(),
 ) {
@@ -37,42 +37,58 @@ class SoliSpiritRepository(
   companion object {
     /**
      * Official raw subscription endpoints from https://github.com/SoliSpirit/v2ray-configs
-     * Ordered with Trojan and VLESS first for highest verified working rate.
+     * with GitHub Raw + jsDelivr + Fastly + GCore CDN mirrors so configs are always reachable.
      */
     val SOLISPIRIT_SOURCES =
       listOf(
         SubscriptionSource(
-          name = "SoliSpirit/Trojan-Raw",
-          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
-        ),
-        SubscriptionSource(
           name = "SoliSpirit/Trojan-CDN",
           url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
-        ),
-        SubscriptionSource(
-          name = "SoliSpirit/VLESS-Raw",
-          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
         ),
         SubscriptionSource(
           name = "SoliSpirit/VLESS-CDN",
           url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
         ),
         SubscriptionSource(
+          name = "SoliSpirit/Trojan-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+        ),
+        SubscriptionSource(
           name = "SoliSpirit/VLESS-Fastly",
           url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
         ),
         SubscriptionSource(
-          name = "SoliSpirit/Sub1",
+          name = "SoliSpirit/Trojan-GCore",
+          url = "https://gcore.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS-GCore",
+          url = "https://gcore.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/Trojan-Raw",
+          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS-Raw",
+          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/Sub1-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Subscriptions/Sub1.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/Sub1-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Subscriptions/Sub1.txt",
         ),
       )
 
-    private const val WAVE_SIZE = 75
-    private const val CONCURRENT_TEST_LIMIT = 30
+    private const val WAVE_SIZE = 80
+    private const val CONCURRENT_TEST_LIMIT = 32
   }
 
   /**
-   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub (and jsDelivr mirrors)
+   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub (and CDN mirrors in parallel)
    * and filters to clean protocols supported by the built-in V2Ray tunneling engine.
    */
   suspend fun fetchConfigsFromSoliSpirit(
@@ -83,37 +99,27 @@ class SoliSpiritRepository(
 
       onLogUpdate("دریافت لیست سرور ها")
 
-      for (source in SOLISPIRIT_SOURCES) {
+      val batches = SOLISPIRIT_SOURCES.chunked(4)
+      for (batch in batches) {
         coroutineContext.ensureActive()
-        try {
-          val request =
-            Request.Builder()
-              .url(source.url)
-              .header("User-Agent", "MEH-V2Ray-Android/1.0 (+https://github.com/SoliSpirit/v2ray-configs)")
-              .header("Accept", "text/plain, */*")
-              .build()
-
-          httpClient.newCall(request).execute().use { response ->
-            if (response.isSuccessful) {
-              val bodyText =
-                response.body
-                  ?.charStream()
-                  ?.buffered()
-                  ?.useLines { lines -> lines.take(700).joinToString("\n") }
-                  .orEmpty()
-              val parsed = V2RayConfigParser.parseSubscriptionContent(bodyText)
-              for (cfg in parsed) {
-                if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
-                  collected[cfg.endpointKey] = cfg
+        val batchLists =
+          coroutineScope {
+            batch
+              .map { source ->
+                async {
+                  fetchSingleSource(source)
                 }
               }
+              .awaitAll()
+          }
+        for (list in batchLists) {
+          for (cfg in list) {
+            if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
+              collected[cfg.endpointKey] = cfg
             }
           }
-        } catch (_: IOException) {
-          // Continue trying remaining SoliSpirit subscription files and mirrors
         }
-
-        if (collected.size >= 300) {
+        if (collected.size >= 250) {
           break
         }
       }
@@ -121,28 +127,60 @@ class SoliSpiritRepository(
       collected.values.toList()
     }
 
+  private fun fetchSingleSource(source: SubscriptionSource): List<V2RayConfig> {
+    return try {
+      val request =
+        Request.Builder()
+          .url(source.url)
+          .header("User-Agent", "MEH-V2Ray-Android/1.0 (+https://github.com/SoliSpirit/v2ray-configs)")
+          .header("Accept", "text/plain, */*")
+          .build()
+
+      httpClient.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) return emptyList()
+        val bodyText =
+          response.body
+            ?.charStream()
+            ?.buffered()
+            ?.useLines { lines -> lines.take(600).joinToString("\n") }
+            .orEmpty()
+        V2RayConfigParser.parseSubscriptionContent(bodyText)
+      }
+    } catch (_: IOException) {
+      emptyList()
+    } catch (_: Exception) {
+      emptyList()
+    }
+  }
+
   /**
-   * Benchmarks candidate V2Ray nodes concurrently by opening a REAL V2Ray protocol tunnel
-   * and sending an HTTP 204 connectivity probe (`http://connectivitycheck.gstatic.com/generate_204`)
-   * through each server, returning the fastest node that actually proxies internet traffic.
+   * Two-stage benchmark:
+   * 1. Screens candidate V2Ray nodes concurrently with a fast HTTP 204 probe (`measureNodeSpeed`).
+   * 2. Verifies the fastest candidates with a 2nd independent connection over TLS/HTTPS port 443
+   *    (`V2RayOutboundClient.verifyHttpsAndDnsCapability`) to filter out rate-limited or broken nodes
+   *    that pass a single port-80 probe but drop real app HTTPS traffic.
    */
-  suspend fun testAndSelectFastest(
+  suspend fun testAndSelectFastestCandidates(
     configs: List<V2RayConfig>,
+    maxCount: Int = 6,
     onLogUpdate: (String) -> Unit,
-  ): V2RayConfig? =
+  ): List<V2RayConfig> =
     withContext(ioDispatcher) {
       val supported = configs.filter { V2RayOutboundClient.isSupportedByEngine(it) }.shuffled()
-      if (supported.isEmpty()) return@withContext null
+      if (supported.isEmpty()) return@withContext emptyList()
 
       val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
       val completedCount = AtomicInteger(0)
 
       onLogUpdate("تست سرور ها")
 
+      val verifiedPool = mutableListOf<V2RayConfig>()
+      val stage1Fallbacks = mutableListOf<V2RayConfig>()
+
       val waves = supported.chunked(WAVE_SIZE).take(3)
       for (wave in waves) {
         coroutineContext.ensureActive()
-        val verifiedWorkingNodes =
+        val stage1Passed =
           coroutineScope {
             wave
               .map { config ->
@@ -157,23 +195,64 @@ class SoliSpiritRepository(
               }
               .awaitAll()
               .filterNotNull()
+              .sortedWith(
+                compareBy<V2RayConfig> { it.latencyMs }
+                  .thenByDescending { it.speedScore }
+              )
           }
 
-        val bestInWave =
-          verifiedWorkingNodes
-            .sortedWith(
-              compareBy<V2RayConfig> { it.latencyMs }
-                .thenByDescending { it.speedScore }
-            )
-            .firstOrNull()
+        if (stage1Passed.isEmpty()) continue
+        stage1Fallbacks.addAll(stage1Passed)
 
-        if (bestInWave != null) {
-          return@withContext bestInWave
+        // Stage 2: Verify real HTTPS (port 443 TLS + second concurrent/sequential connection) on top candidates
+        val topToVerify = stage1Passed.take(14)
+        val stage2Verified =
+          coroutineScope {
+            topToVerify
+              .map { candidate ->
+                async {
+                  coroutineContext.ensureActive()
+                  val httpsLatency =
+                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                      config = candidate,
+                      timeoutMs = 3200,
+                    )
+                  if (httpsLatency != null) {
+                    val combinedLatency = (candidate.latencyMs + httpsLatency) / 2L
+                    candidate.copy(
+                      latencyMs = combinedLatency.coerceAtLeast(1L),
+                      speedScore = 10_000.0 / combinedLatency.coerceAtLeast(1L).toDouble(),
+                    )
+                  } else {
+                    null
+                  }
+                }
+              }
+              .awaitAll()
+              .filterNotNull()
+              .sortedBy { it.latencyMs }
+          }
+
+        verifiedPool.addAll(stage2Verified)
+        if (verifiedPool.isNotEmpty()) {
+          return@withContext verifiedPool
+            .distinctBy { it.endpointKey }
+            .sortedBy { it.latencyMs }
+            .take(maxCount)
         }
       }
 
-      null
+      stage1Fallbacks
+        .distinctBy { it.endpointKey }
+        .sortedBy { it.latencyMs }
+        .take(maxCount)
     }
+
+  suspend fun testAndSelectFastest(
+    configs: List<V2RayConfig>,
+    onLogUpdate: (String) -> Unit,
+  ): V2RayConfig? =
+    testAndSelectFastestCandidates(configs, maxCount = 1, onLogUpdate = onLogUpdate).firstOrNull()
 
   /**
    * Verifies real end-to-end V2Ray proxy connectivity (`GET /generate_204`) and measures round-trip speed.

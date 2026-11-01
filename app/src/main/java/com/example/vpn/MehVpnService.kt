@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -17,6 +21,8 @@ import com.example.telemetry.MehTelemetry
 import engine.Engine
 import engine.Key
 import java.io.File
+import java.net.DatagramSocket
+import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,6 +55,75 @@ class MehVpnService : VpnService() {
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
 
+  @Volatile private var underlyingPhysicalNetwork: Network? = null
+  private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+  override fun onCreate() {
+    super.onCreate()
+    registerPhysicalNetworkTracker()
+  }
+
+  private fun registerPhysicalNetworkTracker() {
+    try {
+      val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+      val requestBuilder =
+        NetworkRequest.Builder()
+          .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+          .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+      val callback =
+        object : ConnectivityManager.NetworkCallback() {
+          override fun onAvailable(network: Network) {
+            underlyingPhysicalNetwork = network
+          }
+
+          override fun onLost(network: Network) {
+            if (underlyingPhysicalNetwork == network) {
+              underlyingPhysicalNetwork = null
+            }
+          }
+        }
+      cm.registerNetworkCallback(requestBuilder.build(), callback)
+      networkCallback = callback
+    } catch (_: Exception) {}
+  }
+
+  private fun unregisterPhysicalNetworkTracker() {
+    try {
+      val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+      val cb = networkCallback
+      if (cm != null && cb != null) {
+        cm.unregisterNetworkCallback(cb)
+      }
+    } catch (_: Exception) {}
+    networkCallback = null
+  }
+
+  private fun protectOutboundSocket(socket: Socket): Boolean {
+    val protectedOk =
+      try {
+        protect(socket)
+      } catch (_: Exception) {
+        false
+      }
+    try {
+      underlyingPhysicalNetwork?.bindSocket(socket)
+    } catch (_: Exception) {}
+    return protectedOk
+  }
+
+  private fun protectOutboundDatagramSocket(datagramSocket: DatagramSocket): Boolean {
+    val protectedOk =
+      try {
+        protect(datagramSocket)
+      } catch (_: Exception) {
+        false
+      }
+    try {
+      underlyingPhysicalNetwork?.bindSocket(datagramSocket)
+    } catch (_: Exception) {}
+    return protectedOk
+  }
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
       ACTION_DISCONNECT -> {
@@ -58,15 +133,29 @@ class MehVpnService : VpnService() {
       ACTION_CONNECT -> {
         val rawUri = intent.getStringExtra(EXTRA_RAW_URI).orEmpty()
         val resolvedIp = intent.getStringExtra(EXTRA_RESOLVED_IP).orEmpty()
-        val parsedConfig = V2RayConfigParser.parseSingleUri(rawUri)
+        val candidateUris = intent.getStringArrayListExtra(EXTRA_CANDIDATE_URIS).orEmpty()
+        val candidateIps = intent.getStringArrayListExtra(EXTRA_CANDIDATE_IPS).orEmpty()
+
+        val parsedPrimary = V2RayConfigParser.parseSingleUri(rawUri)
         val serverName =
-          intent.getStringExtra(EXTRA_SERVER_NAME) ?: parsedConfig?.cleanTitle ?: "V2Ray Server"
+          intent.getStringExtra(EXTRA_SERVER_NAME) ?: parsedPrimary?.cleanTitle ?: "V2Ray Server"
         val initialPing = intent.getLongExtra(EXTRA_INITIAL_PING, 80L)
         val coreJson = intent.getStringExtra(EXTRA_CORE_JSON) ?: "{}"
 
-        if (parsedConfig == null) {
+        if (parsedPrimary == null) {
           stopTunnel("کانفیگ سرور نامعتبر است")
           return START_NOT_STICKY
+        }
+
+        val candidateConfigs = mutableListOf<V2RayConfig>()
+        candidateConfigs.add(parsedPrimary.copy(resolvedIp = resolvedIp, latencyMs = initialPing))
+        for (i in candidateUris.indices) {
+          val uri = candidateUris[i]
+          val ip = candidateIps.getOrNull(i).orEmpty()
+          val cfg = V2RayConfigParser.parseSingleUri(uri)
+          if (cfg != null && candidateConfigs.none { it.endpointKey == cfg.endpointKey }) {
+            candidateConfigs.add(cfg.copy(resolvedIp = ip))
+          }
         }
 
         // Must call startForeground synchronously on main thread before launching IO work
@@ -78,7 +167,7 @@ class MehVpnService : VpnService() {
         connectJob =
           serviceScope.launch {
             startTunnelAsync(
-              config = parsedConfig.copy(resolvedIp = resolvedIp, latencyMs = initialPing),
+              configs = candidateConfigs,
               serverName = serverName,
               initialPing = initialPing,
               coreJson = coreJson,
@@ -91,7 +180,7 @@ class MehVpnService : VpnService() {
   }
 
   private fun startTunnelAsync(
-    config: V2RayConfig,
+    configs: List<V2RayConfig>,
     serverName: String,
     initialPing: Long,
     coreJson: String,
@@ -107,18 +196,22 @@ class MehVpnService : VpnService() {
       } catch (_: Exception) {}
       vpnInterface = null
 
-      val effectiveResolvedIp =
-        config.resolvedIp.ifBlank {
-          V2RayOutboundClient.resolveEndpointIpv4(config.address).orEmpty()
+      val effectiveConfigs =
+        configs.map { cfg ->
+          val ip =
+            cfg.resolvedIp.ifBlank {
+              V2RayOutboundClient.resolveEndpointIpv4(cfg.address).orEmpty()
+            }
+          cfg.copy(resolvedIp = ip)
         }
-      val effectiveConfig = config.copy(resolvedIp = effectiveResolvedIp)
+      val primaryConfig = effectiveConfigs.first()
 
-      // 1. Start local V2Ray SOCKS5 (TCP + UDP ASSOCIATE) & HTTP CONNECT proxy server on IO thread
+      // 1. Start local V2Ray SOCKS5 (TCP + UDP ASSOCIATE) & HTTP CONNECT proxy server with failover pool
       val proxyServer =
         LocalV2RayProxyServer(
-          config = effectiveConfig,
-          protector = { socket -> protect(socket) },
-          udpProtector = { datagramSocket -> protect(datagramSocket) },
+          configs = effectiveConfigs,
+          protector = { socket -> protectOutboundSocket(socket) },
+          udpProtector = { datagramSocket -> protectOutboundDatagramSocket(datagramSocket) },
         )
       val proxyPort = proxyServer.start()
       localProxyServer = proxyServer
@@ -145,19 +238,12 @@ class MehVpnService : VpnService() {
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
 
-      // 3. Start native Go tun2socks engine with a duplicated FD so Go and Java don't double-close the same FD
-      val tunFdForEngine =
-        try {
-          ParcelFileDescriptor.dup(establishedPfd.fileDescriptor).detachFd()
-        } catch (_: Exception) {
-          establishedPfd.fd
-        }
-
+      // 3. Start native Go tun2socks engine with the established TUN file descriptor
       try {
         val key =
           Key().apply {
             mtu = 1500L
-            device = "fd://$tunFdForEngine"
+            device = "fd://${establishedPfd.fd}"
             proxy = "socks5://127.0.0.1:$proxyPort"
             logLevel = "error"
           }
@@ -176,15 +262,15 @@ class MehVpnService : VpnService() {
         VpnTunnelSession(
           isRunning = true,
           serverName = serverName,
-          serverAddress = effectiveConfig.address,
-          serverPort = effectiveConfig.port,
-          protocolLabel = effectiveConfig.protocol.label,
+          serverAddress = primaryConfig.address,
+          serverPort = primaryConfig.port,
+          protocolLabel = primaryConfig.protocol.label,
           currentPingMs = initialPing,
           localProxyPort = proxyPort,
           errorMessage = null,
         )
 
-      startProtectedKeepAliveProbe(effectiveConfig, serverName, proxyPort, initialPing)
+      startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -205,7 +291,7 @@ class MehVpnService : VpnService() {
   }
 
   private fun startProtectedKeepAliveProbe(
-    config: V2RayConfig,
+    proxyServer: LocalV2RayProxyServer,
     serverName: String,
     proxyPort: Int,
     initialPing: Long,
@@ -216,20 +302,21 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         while (isActive) {
           delay(15_000L)
+          val activeCfg = proxyServer.activeConfig
           val measuredPing =
             V2RayOutboundClient.measureRealProxyDelay(
-              config = config,
+              config = activeCfg,
               timeoutMs = 3500,
-              protector = { socket -> protect(socket) },
+              protector = { socket -> protectOutboundSocket(socket) },
             ) ?: lastPing
           lastPing = measuredPing
           _tunnelSession.value =
             VpnTunnelSession(
               isRunning = true,
-              serverName = serverName,
-              serverAddress = config.address,
-              serverPort = config.port,
-              protocolLabel = config.protocol.label,
+              serverName = activeCfg.cleanTitle.ifBlank { serverName },
+              serverAddress = activeCfg.address,
+              serverPort = activeCfg.port,
+              protocolLabel = activeCfg.protocol.label,
               currentPingMs = lastPing,
               localProxyPort = proxyPort,
               errorMessage = null,
@@ -280,6 +367,7 @@ class MehVpnService : VpnService() {
       vpnInterface?.close()
     } catch (_: Exception) {}
     vpnInterface = null
+    unregisterPhysicalNetworkTracker()
     _tunnelSession.value = VpnTunnelSession(isRunning = false)
     serviceScope.cancel()
     super.onDestroy()
@@ -348,6 +436,8 @@ class MehVpnService : VpnService() {
 
     const val EXTRA_RAW_URI = "extra_raw_uri"
     const val EXTRA_RESOLVED_IP = "extra_resolved_ip"
+    const val EXTRA_CANDIDATE_URIS = "extra_candidate_uris"
+    const val EXTRA_CANDIDATE_IPS = "extra_candidate_ips"
     const val EXTRA_SERVER_NAME = "extra_server_name"
     const val EXTRA_SERVER_ADDRESS = "extra_server_address"
     const val EXTRA_SERVER_PORT = "extra_server_port"
