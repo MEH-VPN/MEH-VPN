@@ -227,6 +227,7 @@ class MehViewModel(
       Intent(context, MehVpnService::class.java).apply {
         action = MehVpnService.ACTION_CONNECT
         putExtra(MehVpnService.EXTRA_RAW_URI, config.rawUri)
+        putExtra(MehVpnService.EXTRA_RESOLVED_IP, config.resolvedIp)
         putExtra(MehVpnService.EXTRA_SERVER_NAME, config.cleanTitle)
         putExtra(MehVpnService.EXTRA_SERVER_ADDRESS, config.address)
         putExtra(MehVpnService.EXTRA_SERVER_PORT, config.port)

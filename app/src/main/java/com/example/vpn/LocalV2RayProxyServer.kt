@@ -112,7 +112,7 @@ class LocalV2RayProxyServer(
         if (firstByte == -1) return
 
         if (firstByte == 0x05) {
-          handleSocks5Client(clientIn, clientOut)
+          handleSocks5Client(client, clientIn, clientOut)
         } else {
           handleHttpProxyClient(firstByte.toByte(), clientIn, clientOut)
         }
@@ -120,7 +120,11 @@ class LocalV2RayProxyServer(
     } catch (_: Exception) {}
   }
 
-  private fun handleSocks5Client(clientIn: InputStream, clientOut: OutputStream) {
+  private fun handleSocks5Client(
+    clientSocket: Socket,
+    clientIn: InputStream,
+    clientOut: OutputStream,
+  ) {
     val nMethods = clientIn.read()
     if (nMethods < 0) return
     val methods = ByteArray(nMethods)
@@ -176,7 +180,8 @@ class LocalV2RayProxyServer(
         }
       }
       0x03 -> {
-        // UDP ASSOCIATE: return 127.0.0.1:udpListenPort and hold TCP control channel open
+        // UDP ASSOCIATE: return 127.0.0.1:udpListenPort and hold TCP control channel open indefinitely
+        clientSocket.soTimeout = 0
         val pHigh = ((udpListenPort ushr 8) and 0xFF).toByte()
         val pLow = (udpListenPort and 0xFF).toByte()
         clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, pHigh, pLow))
@@ -258,14 +263,14 @@ class LocalV2RayProxyServer(
   }
 
   private fun resolveDnsOverV2Ray(dnsQuery: ByteArray): ByteArray? {
-    // 1. Primary: Resolve DNS over TCP through the encrypted V2Ray tunnel (1.1.1.1:53 or 8.8.8.8:53)
-    for (dnsServer in listOf("1.1.1.1", "8.8.8.8")) {
+    // 1. Primary: Resolve DNS over TCP through the encrypted V2Ray tunnel (8.8.8.8:53 or 1.1.1.1:53)
+    for (dnsServer in listOf("8.8.8.8", "1.1.1.1")) {
       try {
         V2RayOutboundClient.openTunnel(
           config = config,
           targetHost = dnsServer,
           targetPort = 53,
-          timeoutMs = 3000,
+          timeoutMs = 1800,
           protector = protector,
         ).use { tunnel ->
           val framed = ByteArray(dnsQuery.size + 2)
@@ -289,14 +294,20 @@ class LocalV2RayProxyServer(
 
     // 2. Fallback: Protected UDP DNS
     return forwardProtectedUdp("8.8.8.8", 53, dnsQuery)
+      ?: forwardProtectedUdp("1.1.1.1", 53, dnsQuery)
   }
 
   private fun forwardProtectedUdp(host: String, port: Int, payload: ByteArray): ByteArray? {
     return try {
       DatagramSocket().use { sock ->
         udpProtector(sock)
-        sock.soTimeout = 2500
-        val addr = InetAddress.getByName(host)
+        sock.soTimeout = 1800
+        val addr =
+          when (host) {
+            "8.8.8.8" -> InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8))
+            "1.1.1.1" -> InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1))
+            else -> InetAddress.getByName(host)
+          }
         sock.send(DatagramPacket(payload, payload.size, addr, port))
         val recvBuf = ByteArray(2048)
         val recvPkt = DatagramPacket(recvBuf, recvBuf.size)

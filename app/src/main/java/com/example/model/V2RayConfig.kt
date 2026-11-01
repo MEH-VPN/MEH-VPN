@@ -27,6 +27,7 @@ data class V2RayConfig(
   val headerType: String = "none",
   val pbk: String = "",
   val rawUri: String,
+  val resolvedIp: String = "",
   val latencyMs: Long = -1L,
   val speedScore: Double = 0.0,
 ) {

@@ -42,20 +42,28 @@ class SoliSpiritRepository(
     val SOLISPIRIT_SOURCES =
       listOf(
         SubscriptionSource(
-          name = "SoliSpirit/Trojan",
+          name = "SoliSpirit/Trojan-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
         ),
         SubscriptionSource(
-          name = "SoliSpirit/VLESS",
+          name = "SoliSpirit/Trojan-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Sub1",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Subscriptions/Sub1.txt",
-        ),
-        SubscriptionSource(
-          name = "SoliSpirit/All",
-          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt",
         ),
       )
 
@@ -64,8 +72,8 @@ class SoliSpiritRepository(
   }
 
   /**
-   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub and filters to clean protocols
-   * supported by the built-in V2Ray tunneling engine.
+   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub (and jsDelivr mirrors)
+   * and filters to clean protocols supported by the built-in V2Ray tunneling engine.
    */
   suspend fun fetchConfigsFromSoliSpirit(
     onLogUpdate: (String) -> Unit,
@@ -87,7 +95,12 @@ class SoliSpiritRepository(
 
           httpClient.newCall(request).execute().use { response ->
             if (response.isSuccessful) {
-              val bodyText = response.body?.string().orEmpty()
+              val bodyText =
+                response.body
+                  ?.charStream()
+                  ?.buffered()
+                  ?.useLines { lines -> lines.take(700).joinToString("\n") }
+                  .orEmpty()
               val parsed = V2RayConfigParser.parseSubscriptionContent(bodyText)
               for (cfg in parsed) {
                 if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
@@ -97,10 +110,10 @@ class SoliSpiritRepository(
             }
           }
         } catch (_: IOException) {
-          // Continue trying remaining SoliSpirit subscription files
+          // Continue trying remaining SoliSpirit subscription files and mirrors
         }
 
-        if (collected.size >= 400) {
+        if (collected.size >= 300) {
           break
         }
       }
@@ -110,7 +123,7 @@ class SoliSpiritRepository(
 
   /**
    * Benchmarks candidate V2Ray nodes concurrently by opening a REAL V2Ray protocol tunnel
-   * and sending an HTTP 204 connectivity probe (`http://cp.cloudflare.com/generate_204`)
+   * and sending an HTTP 204 connectivity probe (`http://connectivitycheck.gstatic.com/generate_204`)
    * through each server, returning the fastest node that actually proxies internet traffic.
    */
   suspend fun testAndSelectFastest(
@@ -166,9 +179,11 @@ class SoliSpiritRepository(
    * Verifies real end-to-end V2Ray proxy connectivity (`GET /generate_204`) and measures round-trip speed.
    */
   fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
-    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(config, timeoutMs = 2600) ?: return null
+    val resolvedIp = V2RayOutboundClient.resolveEndpointIpv4(config.address) ?: return null
+    val withIp = config.copy(resolvedIp = resolvedIp)
+    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(withIp, timeoutMs = 2600) ?: return null
     val score = 10_000.0 / realDelayMs.toDouble()
-    return config.copy(
+    return withIp.copy(
       latencyMs = realDelayMs,
       speedScore = score,
     )

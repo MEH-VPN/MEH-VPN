@@ -102,10 +102,43 @@ object V2RayOutboundClient {
     return true
   }
 
+  private val resolvedEndpointCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+  fun resolveEndpointIpv4(host: String): String? {
+    val trimmed = host.trim()
+    if (trimmed.isEmpty()) return null
+    parseIpv4Bytes(trimmed)?.let { return trimmed }
+    resolvedEndpointCache[trimmed.lowercase()]?.let { return it }
+    return try {
+      val ipv4 =
+        java.net.InetAddress.getAllByName(trimmed)
+          .firstOrNull { it is java.net.Inet4Address }
+          ?.hostAddress
+      if (!ipv4.isNullOrBlank()) {
+        resolvedEndpointCache[trimmed.lowercase()] = ipv4
+      }
+      ipv4
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun parseIpv4Bytes(host: String): ByteArray? {
+    val parts = host.split(".")
+    if (parts.size != 4) return null
+    val bytes = ByteArray(4)
+    for (i in 0..3) {
+      val n = parts[i].toIntOrNull() ?: return null
+      if (n !in 0..255) return null
+      bytes[i] = n.toByte()
+    }
+    return bytes
+  }
+
   /**
-   * Tests a V2Ray node by opening a real V2Ray protocol tunnel to `cp.cloudflare.com:80`
+   * Tests a V2Ray node by opening a real V2Ray protocol tunnel to `connectivitycheck.gstatic.com:80`
    * and sending `GET /generate_204 HTTP/1.1` through the proxy tunnel.
-   * Returns the measured round-trip delay in milliseconds if and only if valid HTTP 204/200 response returns.
+   * Requires both `HTTP/1.1 204` and Google's `Cross-Origin-Resource-Policy` header to reject fake fallbacks.
    */
   fun measureRealProxyDelay(
     config: V2RayConfig,
@@ -113,40 +146,45 @@ object V2RayOutboundClient {
     protector: ((Socket) -> Boolean)? = null,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
+    val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
+    if (resolvedIp.isEmpty()) return null
+    val resolvedConfig = config.copy(resolvedIp = resolvedIp)
+
     return try {
       var latencyMs = -1L
       val elapsedNanos =
         measureNanoTime {
           openTunnel(
-            config = config,
-            targetHost = "cp.cloudflare.com",
+            config = resolvedConfig,
+            targetHost = "connectivitycheck.gstatic.com",
             targetPort = 80,
             timeoutMs = timeoutMs,
             protector = protector,
           ).use { conn ->
             val probeRequest =
               "GET /generate_204 HTTP/1.1\r\n" +
-                "Host: cp.cloudflare.com\r\n" +
-                "User-Agent: curl/8.0\r\n" +
+                "Host: connectivitycheck.gstatic.com\r\n" +
+                "User-Agent: Mozilla/5.0\r\n" +
                 "Connection: close\r\n\r\n"
             conn.outputStream.write(probeRequest.toByteArray(Charsets.US_ASCII))
             conn.outputStream.flush()
 
-            val responseBuf = ByteArrayOutputStream(128)
-            val chunk = ByteArray(128)
-            while (responseBuf.size() < 96) {
+            val responseBuf = ByteArrayOutputStream(256)
+            val chunk = ByteArray(256)
+            while (responseBuf.size() < 220) {
               val n = conn.inputStream.read(chunk)
               if (n <= 0) break
               responseBuf.write(chunk, 0, n)
               val textSoFar = responseBuf.toString("US-ASCII")
-              if (textSoFar.contains("\r\n")) break
+              if (textSoFar.contains("\r\n\r\n") || textSoFar.contains("Cross-Origin-Resource-Policy", ignoreCase = true)) {
+                break
+              }
             }
-            val statusLine = responseBuf.toString("US-ASCII")
-            if (!statusLine.startsWith("HTTP/1.1 204") &&
-              !statusLine.startsWith("HTTP/1.0 204") &&
-              !statusLine.startsWith("HTTP/1.1 200")
+            val responseText = responseBuf.toString("US-ASCII")
+            if (!responseText.startsWith("HTTP/1.1 204") ||
+              !responseText.contains("Cross-Origin-Resource-Policy", ignoreCase = true)
             ) {
-              throw IOException("Invalid HTTP 204 probe response: ${statusLine.take(32)}")
+              throw IOException("Invalid gstatic 204 probe response: ${responseText.take(48)}")
             }
           }
         }
@@ -169,10 +207,24 @@ object V2RayOutboundClient {
   ): TunnelConnection {
     val rawSocket = Socket()
     try {
+      // Bind first so Android's SocketImpl allocates a valid OS file descriptor (fd) before protect(rawSocket)
+      rawSocket.bind(InetSocketAddress(0))
       protector?.invoke(rawSocket)
       rawSocket.tcpNoDelay = true
       rawSocket.soTimeout = timeoutMs
-      rawSocket.connect(InetSocketAddress(config.address, config.port), timeoutMs)
+
+      val connectHost =
+        config.resolvedIp.ifBlank {
+          resolveEndpointIpv4(config.address) ?: config.address
+        }
+      val ipv4Bytes = parseIpv4Bytes(connectHost)
+      val remoteEndpoint =
+        if (ipv4Bytes != null) {
+          InetSocketAddress(java.net.InetAddress.getByAddress(ipv4Bytes), config.port)
+        } else {
+          InetSocketAddress(connectHost, config.port)
+        }
+      rawSocket.connect(remoteEndpoint, timeoutMs)
 
       val transportSocket: Socket =
         if (config.security.equals("tls", ignoreCase = true)) {
@@ -256,7 +308,7 @@ object V2RayOutboundClient {
     val wsPath = if (rawPath.startsWith("/")) rawPath else "/$rawPath"
 
     val keyBytes = ByteArray(16).also { secureRandom.nextBytes(it) }
-    val wsKey = Base64.encodeToString(keyBytes, Base64.NO_WRAP)
+    val wsKey = encodeBase64NoWrap(keyBytes)
 
     val requestHeaders =
       "GET $wsPath HTTP/1.1\r\n" +
@@ -477,6 +529,26 @@ object V2RayOutboundClient {
       sb.append(String.format("%02x", b))
     }
     return sb.toString()
+  }
+
+  private const val BASE64_ALPHABET =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+  private fun encodeBase64NoWrap(data: ByteArray): String {
+    val out = StringBuilder(((data.size + 2) / 3) * 4)
+    var i = 0
+    while (i < data.size) {
+      val b0 = data[i].toInt() and 0xFF
+      val b1 = if (i + 1 < data.size) data[i + 1].toInt() and 0xFF else 0
+      val b2 = if (i + 2 < data.size) data[i + 2].toInt() and 0xFF else 0
+      val triple = (b0 shl 16) or (b1 shl 8) or b2
+      out.append(BASE64_ALPHABET[(triple ushr 18) and 0x3F])
+      out.append(BASE64_ALPHABET[(triple ushr 12) and 0x3F])
+      out.append(if (i + 1 < data.size) BASE64_ALPHABET[(triple ushr 6) and 0x3F] else '=')
+      out.append(if (i + 2 < data.size) BASE64_ALPHABET[triple and 0x3F] else '=')
+      i += 3
+    }
+    return out.toString()
   }
 
   /**

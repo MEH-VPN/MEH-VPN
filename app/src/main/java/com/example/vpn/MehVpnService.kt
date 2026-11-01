@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
-import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -47,6 +46,7 @@ class MehVpnService : VpnService() {
   private var vpnInterface: ParcelFileDescriptor? = null
   private var localProxyServer: LocalV2RayProxyServer? = null
   private var tun2SocksStarted: Boolean = false
+  private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -57,6 +57,7 @@ class MehVpnService : VpnService() {
       }
       ACTION_CONNECT -> {
         val rawUri = intent.getStringExtra(EXTRA_RAW_URI).orEmpty()
+        val resolvedIp = intent.getStringExtra(EXTRA_RESOLVED_IP).orEmpty()
         val parsedConfig = V2RayConfigParser.parseSingleUri(rawUri)
         val serverName =
           intent.getStringExtra(EXTRA_SERVER_NAME) ?: parsedConfig?.cleanTitle ?: "V2Ray Server"
@@ -68,40 +69,54 @@ class MehVpnService : VpnService() {
           return START_NOT_STICKY
         }
 
-        startTunnel(
-          config = parsedConfig.copy(latencyMs = initialPing),
-          serverName = serverName,
-          initialPing = initialPing,
-          coreJson = coreJson,
-        )
+        // Must call startForeground synchronously on main thread before launching IO work
+        createNotificationChannel()
+        val notification = buildForegroundNotification(serverName, initialPing)
+        startForeground(NOTIFICATION_ID, notification)
+
+        connectJob?.cancel()
+        connectJob =
+          serviceScope.launch {
+            startTunnelAsync(
+              config = parsedConfig.copy(resolvedIp = resolvedIp, latencyMs = initialPing),
+              serverName = serverName,
+              initialPing = initialPing,
+              coreJson = coreJson,
+            )
+          }
         return START_STICKY
       }
       else -> return START_NOT_STICKY
     }
   }
 
-  private fun startTunnel(
+  private fun startTunnelAsync(
     config: V2RayConfig,
     serverName: String,
     initialPing: Long,
     coreJson: String,
   ) {
     try {
-      createNotificationChannel()
-      val notification = buildForegroundNotification(serverName, initialPing)
-      startForeground(NOTIFICATION_ID, notification)
-
       File(filesDir, "active_v2ray_config.json").writeText(coreJson)
 
       // Stop any previous tunnel session cleanly
       stopNativeTun2Socks()
       localProxyServer?.stop()
-      vpnInterface?.close()
+      try {
+        vpnInterface?.close()
+      } catch (_: Exception) {}
+      vpnInterface = null
 
-      // 1. Start local V2Ray SOCKS5 (TCP + UDP ASSOCIATE) & HTTP CONNECT proxy server
+      val effectiveResolvedIp =
+        config.resolvedIp.ifBlank {
+          V2RayOutboundClient.resolveEndpointIpv4(config.address).orEmpty()
+        }
+      val effectiveConfig = config.copy(resolvedIp = effectiveResolvedIp)
+
+      // 1. Start local V2Ray SOCKS5 (TCP + UDP ASSOCIATE) & HTTP CONNECT proxy server on IO thread
       val proxyServer =
         LocalV2RayProxyServer(
-          config = config,
+          config = effectiveConfig,
           protector = { socket -> protect(socket) },
           udpProtector = { datagramSocket -> protect(datagramSocket) },
         )
@@ -115,8 +130,8 @@ class MehVpnService : VpnService() {
           .setMtu(1500)
           .addAddress("10.10.14.2", 24)
           .addRoute("0.0.0.0", 0)
-          .addDnsServer("1.1.1.1")
           .addDnsServer("8.8.8.8")
+          .addDnsServer("1.1.1.1")
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -124,19 +139,25 @@ class MehVpnService : VpnService() {
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         builder.setMetered(false)
-        builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", proxyPort))
       }
 
       val establishedPfd =
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
 
-      // 3. Start native Go tun2socks engine routing all TUN traffic to our local SOCKS5 V2Ray server
+      // 3. Start native Go tun2socks engine with a duplicated FD so Go and Java don't double-close the same FD
+      val tunFdForEngine =
+        try {
+          ParcelFileDescriptor.dup(establishedPfd.fileDescriptor).detachFd()
+        } catch (_: Exception) {
+          establishedPfd.fd
+        }
+
       try {
         val key =
           Key().apply {
             mtu = 1500L
-            device = "fd://${establishedPfd.fd}"
+            device = "fd://$tunFdForEngine"
             proxy = "socks5://127.0.0.1:$proxyPort"
             logLevel = "error"
           }
@@ -155,15 +176,15 @@ class MehVpnService : VpnService() {
         VpnTunnelSession(
           isRunning = true,
           serverName = serverName,
-          serverAddress = config.address,
-          serverPort = config.port,
-          protocolLabel = config.protocol.label,
+          serverAddress = effectiveConfig.address,
+          serverPort = effectiveConfig.port,
+          protocolLabel = effectiveConfig.protocol.label,
           currentPingMs = initialPing,
           localProxyPort = proxyPort,
           errorMessage = null,
         )
 
-      startProtectedKeepAliveProbe(config, serverName, proxyPort, initialPing)
+      startProtectedKeepAliveProbe(effectiveConfig, serverName, proxyPort, initialPing)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -176,10 +197,10 @@ class MehVpnService : VpnService() {
 
   private fun stopNativeTun2Socks() {
     if (tun2SocksStarted) {
+      tun2SocksStarted = false
       try {
         Engine.stop()
       } catch (_: Throwable) {}
-      tun2SocksStarted = false
     }
   }
 
@@ -218,6 +239,8 @@ class MehVpnService : VpnService() {
   }
 
   private fun stopTunnel(errorMsg: String? = null) {
+    connectJob?.cancel()
+    connectJob = null
     keepAliveJob?.cancel()
     keepAliveJob = null
     stopNativeTun2Socks()
@@ -249,6 +272,7 @@ class MehVpnService : VpnService() {
   }
 
   override fun onDestroy() {
+    connectJob?.cancel()
     keepAliveJob?.cancel()
     stopNativeTun2Socks()
     localProxyServer?.stop()
@@ -323,6 +347,7 @@ class MehVpnService : VpnService() {
     const val ACTION_DISCONNECT = "com.example.vpn.ACTION_DISCONNECT"
 
     const val EXTRA_RAW_URI = "extra_raw_uri"
+    const val EXTRA_RESOLVED_IP = "extra_resolved_ip"
     const val EXTRA_SERVER_NAME = "extra_server_name"
     const val EXTRA_SERVER_ADDRESS = "extra_server_address"
     const val EXTRA_SERVER_PORT = "extra_server_port"
