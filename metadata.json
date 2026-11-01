@@ -1,6 +1,6 @@
 {
-  "name": "MEH",
-  "description": "فیلترشکن سبک و پرسرعت مه (MEH) بر پایه V2Ray با اتصال تک‌کلیدی و دریافت خودکار بهترین سرور از گیت‌هاب.",
+  "name": "Meh",
+  "description": "Minimalist one-tap V2Ray VPN client that fetches live configs from SoliSpirit/v2ray-configs, benchmarks server speed, and auto-connects to the fastest node.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

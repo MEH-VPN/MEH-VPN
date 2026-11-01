@@ -2,9 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <uses-sdk
+        tools:overrideLibrary="androidx.core,androidx.core.ktx,com.google.android.gms.ads_identifier,com.google.android.gms.base,com.google.android.gms.common,com.google.android.gms.measurement.api,com.google.android.gms.measurement.sdk,com.google.android.gms.measurement.sdk.api,com.google.android.gms.measurement_base,com.google.android.gms.stats,com.google.android.gms.tasks,com.google.firebase,com.google.firebase.analytics.connector,com.google.firebase.components,com.google.firebase.firebase_analytics,com.google.firebase.installations,com.google.firebase.installations.interop,com.google.firebase.measurement,com.google.firebase.measurement_impl" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
@@ -16,8 +18,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.MyApplication"
-        tools:targetApi="31">
+        android:theme="@style/Theme.MyApplication">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -35,12 +36,12 @@
             android:exported="false"
             android:foregroundServiceType="specialUse"
             android:permission="android.permission.BIND_VPN_SERVICE">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn" />
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="meh_v2ray_vpn_tunnel" />
         </service>
     </application>
 

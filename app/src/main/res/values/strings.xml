@@ -1,9 +1,12 @@
 <resources>
-    <string name="app_name">MEH</string>
-    <string name="app_name_fa">مه</string>
-    <string name="status_off">خاموش</string>
-    <string name="status_fetching">دریافت کانفیگ...</string>
-    <string name="status_testing">تست کانفیگ...</string>
-    <string name="status_connecting">در حال اتصال...</string>
-    <string name="status_connected">متصل</string>
+    <string name="app_name">Meh</string>
+    <string name="brand_title">MEH</string>
+    <string name="vpn_button_connect_desc">روشن کردن وی‌پی‌ان</string>
+    <string name="vpn_button_disconnect_desc">خاموش کردن وی‌پی‌ان</string>
+    <string name="log_fetching">دریافت لیست سرور ها</string>
+    <string name="log_testing">تست سرور ها</string>
+    <string name="log_connected">متصل</string>
+    <string name="vpn_notification_channel">وضعیت اتصال MEH VPN</string>
+    <string name="vpn_notification_title">MEH VPN</string>
+    <string name="vpn_notification_disconnect">قطع اتصال</string>
 </resources>
