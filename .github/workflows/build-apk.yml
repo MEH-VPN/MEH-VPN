@@ -1,0 +1,88 @@
+name: Build Android APK
+
+# Tag-only trigger: this workflow runs ONLY when a version tag like
+# v1.2.0 is pushed. Plain pushes to main (and pull requests) do NOT
+# run it at all — no build, no artifact, no release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# contents: write is needed for the tag-triggered release step below
+# (softprops/action-gh-release creates/updates the release).
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build debug APK
+    # Pinned to 24.04: ubuntu-latest is migrating to Ubuntu 26 and its
+    # preinstalled sdkmanager broke the setup-android step in run #1.
+    # 24.04 already ships the Android SDK, so no setup-android step
+    # is needed at all.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      # No android-actions/setup-android step: on ubuntu-24.04 the
+      # Android SDK is preinstalled at $ANDROID_HOME, and v3 of that
+      # action fails here trying to install the obsolete "tools"
+      # package (sdkmanager exit code 1, run #1).
+
+      # The repo has gradle/wrapper/gradle-wrapper.properties but no
+      # gradlew script, so use the matching Gradle version directly
+      # instead of ./gradlew.
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "9.3.1"
+
+      # app/build.gradle.kts points the debug signing config at
+      # ${rootDir}/debug.keystore (android / androiddebugkey), and that
+      # file is gitignored, so create it if it is not in the repo.
+      - name: Generate debug keystore if missing
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkey -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MEH-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Automatic release, tag-triggered only: pushing a tag like
+      # v1.3.0 builds the APK above and then publishes/updates a
+      # release for that tag with the APK attached, e.g.
+      # https://github.com/MEH-VPN/MEH-VPN/releases/download/v1.3.0/app-debug.apk
+      # Release notes are auto-generated from the commits since the
+      # previous tag (generate_release_notes), not a fixed sentence.
+      - name: Publish release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MEH ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: app/build/outputs/apk/debug/*.apk
