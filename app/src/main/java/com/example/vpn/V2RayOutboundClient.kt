@@ -12,7 +12,6 @@ import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
@@ -68,19 +67,33 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Returns true if this config uses a protocol/transport combination supported by the built-in V2Ray engine.
+   * Returns true if this config uses a clean protocol/transport combination supported by the V2Ray engine.
    */
   fun isSupportedByEngine(config: V2RayConfig): Boolean {
     if (config.protocol != V2RayProtocol.VLESS && config.protocol != V2RayProtocol.TROJAN) {
       return false
     }
+    if (config.address.contains(":")) {
+      // Skip raw IPv6 literals for maximum ISP compatibility
+      return false
+    }
     val net = config.network.lowercase()
-    if (net != "tcp" && net != "ws" && net != "httpupgrade") {
+    if (net != "tcp" && net != "ws") {
       return false
     }
     val sec = config.security.lowercase()
-    // Exclude "reality" since X25519 uTLS fingerprint forging requires native Go/BoringSSL
     if (sec != "none" && sec != "tls" && sec != "") {
+      return false
+    }
+    if (config.pbk.isNotEmpty()) {
+      return false
+    }
+    val enc = config.encryption.lowercase()
+    if (enc != "none" && enc != "") {
+      return false
+    }
+    val hdr = config.headerType.lowercase()
+    if (hdr != "none" && hdr != "" && hdr != "---") {
       return false
     }
     if (config.protocol == V2RayProtocol.VLESS && parseUuidBytes(config.authId) == null) {
@@ -92,11 +105,11 @@ object V2RayOutboundClient {
   /**
    * Tests a V2Ray node by opening a real V2Ray protocol tunnel to `cp.cloudflare.com:80`
    * and sending `GET /generate_204 HTTP/1.1` through the proxy tunnel.
-   * Returns the measured round-trip delay in milliseconds if and only if valid HTTP response returns.
+   * Returns the measured round-trip delay in milliseconds if and only if valid HTTP 204/200 response returns.
    */
   fun measureRealProxyDelay(
     config: V2RayConfig,
-    timeoutMs: Int = 2200,
+    timeoutMs: Int = 2600,
     protector: ((Socket) -> Boolean)? = null,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
@@ -119,17 +132,21 @@ object V2RayOutboundClient {
             conn.outputStream.write(probeRequest.toByteArray(Charsets.US_ASCII))
             conn.outputStream.flush()
 
-            val buffer = ByteArray(128)
-            val read = conn.inputStream.read(buffer)
-            if (read <= 0) throw IOException("Empty response from proxy")
-            val statusLine = String(buffer, 0, read, Charsets.US_ASCII)
+            val responseBuf = ByteArrayOutputStream(128)
+            val chunk = ByteArray(128)
+            while (responseBuf.size() < 96) {
+              val n = conn.inputStream.read(chunk)
+              if (n <= 0) break
+              responseBuf.write(chunk, 0, n)
+              val textSoFar = responseBuf.toString("US-ASCII")
+              if (textSoFar.contains("\r\n")) break
+            }
+            val statusLine = responseBuf.toString("US-ASCII")
             if (!statusLine.startsWith("HTTP/1.1 204") &&
               !statusLine.startsWith("HTTP/1.0 204") &&
-              !statusLine.startsWith("HTTP/1.1 200") &&
-              !statusLine.startsWith("HTTP/1.1 301") &&
-              !statusLine.startsWith("HTTP/1.1 302")
+              !statusLine.startsWith("HTTP/1.1 200")
             ) {
-              throw IOException("Unexpected HTTP probe response: ${statusLine.take(30)}")
+              throw IOException("Invalid HTTP 204 probe response: ${statusLine.take(32)}")
             }
           }
         }
@@ -147,7 +164,7 @@ object V2RayOutboundClient {
     config: V2RayConfig,
     targetHost: String,
     targetPort: Int,
-    timeoutMs: Int = 6000,
+    timeoutMs: Int = 8000,
     protector: ((Socket) -> Boolean)? = null,
   ): TunnelConnection {
     val rawSocket = Socket()
@@ -167,15 +184,10 @@ object V2RayOutboundClient {
       var transportIn: InputStream = BufferedInputStream(transportSocket.getInputStream(), 16384)
       var transportOut: OutputStream = transportSocket.getOutputStream()
 
-      if (config.network.equals("ws", ignoreCase = true) ||
-        config.network.equals("httpupgrade", ignoreCase = true)
-      ) {
-        val isWs = config.network.equals("ws", ignoreCase = true)
+      if (config.network.equals("ws", ignoreCase = true)) {
         performWebSocketUpgrade(config, transportIn, transportOut)
-        if (isWs) {
-          transportIn = WebSocketFrameInputStream(transportIn)
-          transportOut = WebSocketFrameOutputStream(transportOut)
-        }
+        transportIn = WebSocketFrameInputStream(transportIn)
+        transportOut = WebSocketFrameOutputStream(transportOut)
       }
 
       return when (config.protocol) {
@@ -203,6 +215,7 @@ object V2RayOutboundClient {
         .ifBlank { config.hostHeader }
         .ifBlank { config.address }
         .trim()
+        .trimEnd('.')
 
     val sslSocket =
       permissiveSslContext.socketFactory.createSocket(
@@ -238,7 +251,8 @@ object V2RayOutboundClient {
         .ifBlank { config.sni }
         .ifBlank { config.address }
         .trim()
-    val rawPath = config.path.ifBlank { "/" }
+        .trimEnd('.')
+    val rawPath = config.path.substringBefore("?ed=").ifBlank { "/" }
     val wsPath = if (rawPath.startsWith("/")) rawPath else "/$rawPath"
 
     val keyBytes = ByteArray(16).also { secureRandom.nextBytes(it) }
@@ -256,7 +270,6 @@ object V2RayOutboundClient {
     output.write(requestHeaders.toByteArray(Charsets.US_ASCII))
     output.flush()
 
-    // Read HTTP response headers until \r\n\r\n
     val headerBuf = ByteArrayOutputStream(512)
     var state = 0
     while (headerBuf.size() < 8192) {
@@ -275,7 +288,7 @@ object V2RayOutboundClient {
     }
     val responseText = headerBuf.toString("US-ASCII")
     val firstLine = responseText.lineSequence().firstOrNull().orEmpty()
-    if (!firstLine.contains("101")) {
+    if (!firstLine.contains(" 101 ")) {
       throw IOException("WebSocket upgrade rejected: $firstLine")
     }
   }
@@ -302,7 +315,6 @@ object V2RayOutboundClient {
     writeVlessAddress(header, targetHost)
     val headerBytes = header.toByteArray()
 
-    // Send VLESS header along with first payload write (or immediately)
     val vlessOut =
       object : FilterOutputStream(output) {
         private var headerSent = false
@@ -326,7 +338,7 @@ object V2RayOutboundClient {
         }
       }
 
-    // Consume VLESS 2-byte response header [version, addon_len, ...addons] on first read
+    // Consume VLESS 2-byte response header [version == 0x00, addon_len, ...addons] on first read
     val vlessIn =
       object : FilterInputStream(input) {
         private var responseHeaderRead = false
@@ -337,6 +349,7 @@ object V2RayOutboundClient {
             responseHeaderRead = true
             val ver = `in`.read()
             if (ver == -1) throw EOFException("VLESS EOF before response header")
+            if (ver != 0) throw IOException("Invalid VLESS response version byte: $ver")
             val addonLen = `in`.read()
             if (addonLen == -1) throw EOFException("VLESS EOF reading addon length")
             var remaining = addonLen
@@ -572,12 +585,9 @@ object V2RayOutboundClient {
         }
 
         when (opcode) {
-          0x08 -> return false // Connection close frame
-          0x09 -> {
-            // Ping frame -> ignore or continue
-            continue
-          }
-          0x0A -> continue // Pong frame
+          0x08 -> return false
+          0x09 -> continue
+          0x0A -> continue
           0x00, 0x01, 0x02 -> {
             if (payload.isNotEmpty()) {
               currentPayload = payload

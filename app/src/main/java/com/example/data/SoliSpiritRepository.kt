@@ -3,6 +3,10 @@ package com.example.data
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
 import com.example.vpn.V2RayOutboundClient
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -14,10 +18,6 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.IOException
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.coroutineContext
 
 data class SubscriptionSource(
   val name: String,
@@ -37,16 +37,17 @@ class SoliSpiritRepository(
   companion object {
     /**
      * Official raw subscription endpoints from https://github.com/SoliSpirit/v2ray-configs
+     * Ordered with Trojan and VLESS first for highest verified working rate.
      */
     val SOLISPIRIT_SOURCES =
       listOf(
         SubscriptionSource(
-          name = "SoliSpirit/VLESS",
-          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
-        ),
-        SubscriptionSource(
           name = "SoliSpirit/Trojan",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VLESS",
+          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Sub1",
@@ -58,12 +59,12 @@ class SoliSpiritRepository(
         ),
       )
 
-    private const val WAVE_SIZE = 60
-    private const val CONCURRENT_TEST_LIMIT = 24
+    private const val WAVE_SIZE = 75
+    private const val CONCURRENT_TEST_LIMIT = 30
   }
 
   /**
-   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub and filters to protocols
+   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub and filters to clean protocols
    * supported by the built-in V2Ray tunneling engine.
    */
   suspend fun fetchConfigsFromSoliSpirit(
@@ -99,7 +100,7 @@ class SoliSpiritRepository(
           // Continue trying remaining SoliSpirit subscription files
         }
 
-        if (collected.size >= 200) {
+        if (collected.size >= 400) {
           break
         }
       }
@@ -125,7 +126,7 @@ class SoliSpiritRepository(
 
       onLogUpdate("تست سرور ها")
 
-      val waves = supported.chunked(WAVE_SIZE).take(2)
+      val waves = supported.chunked(WAVE_SIZE).take(3)
       for (wave in waves) {
         coroutineContext.ensureActive()
         val verifiedWorkingNodes =
@@ -165,7 +166,7 @@ class SoliSpiritRepository(
    * Verifies real end-to-end V2Ray proxy connectivity (`GET /generate_204`) and measures round-trip speed.
    */
   fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
-    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(config, timeoutMs = 2800) ?: return null
+    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(config, timeoutMs = 2600) ?: return null
     val score = 10_000.0 / realDelayMs.toDouble()
     return config.copy(
       latencyMs = realDelayMs,

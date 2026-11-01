@@ -23,6 +23,9 @@ data class V2RayConfig(
   val sni: String = "",
   val hostHeader: String = "",
   val path: String = "",
+  val encryption: String = "none",
+  val headerType: String = "none",
+  val pbk: String = "",
   val rawUri: String,
   val latencyMs: Long = -1L,
   val speedScore: Double = 0.0,
@@ -129,7 +132,8 @@ object V2RayConfigParser {
   }
 
   fun parseSingleUri(uriString: String): V2RayConfig? {
-    val line = uriString.trim()
+    // Normalize HTML-escaped ampersands common in scraped subscription feeds
+    val line = uriString.trim().replace("&amp;", "&")
     return try {
       when {
         line.startsWith("vless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.VLESS)
@@ -161,13 +165,17 @@ object V2RayConfigParser {
     val queryParams = parseQueryParams(queryPart)
 
     val cleanRemarks = sanitizeRemarks(decodeUrlSafe(rawFragment), protocol, host, port)
-    val network = queryParams["type"]?.lowercase() ?: "tcp"
+    val network = queryParams["type"]?.lowercase()?.trim() ?: "tcp"
     val security =
-      queryParams["security"]?.lowercase()
+      queryParams["security"]?.lowercase()?.trim()
         ?: if (protocol == V2RayProtocol.TROJAN) "tls" else "none"
-    val sni = queryParams["sni"] ?: queryParams["host"] ?: ""
-    val hostHeader = queryParams["host"] ?: ""
-    val path = queryParams["path"] ?: ""
+    val sni = (queryParams["sni"] ?: queryParams["host"] ?: "").trim().trimEnd('.')
+    val hostHeader = (queryParams["host"] ?: "").trim().trimEnd('.')
+    val rawPath = queryParams["path"] ?: "/"
+    val cleanPath = rawPath.substringBefore("?ed=").ifEmpty { "/" }
+    val encryption = (queryParams["encryption"] ?: "none").lowercase().trim()
+    val headerType = (queryParams["headerType"] ?: "none").lowercase().trim()
+    val pbk = (queryParams["pbk"] ?: "").trim()
 
     return V2RayConfig(
       id = "${protocol.name}_${host}_$port",
@@ -180,7 +188,10 @@ object V2RayConfigParser {
       security = security,
       sni = sni,
       hostHeader = hostHeader,
-      path = path,
+      path = cleanPath,
+      encryption = encryption,
+      headerType = headerType,
+      pbk = pbk,
       rawUri = uriString,
     )
   }
@@ -203,7 +214,8 @@ object V2RayConfigParser {
     val tls = json.optString("tls", "none").lowercase().ifEmpty { "none" }
     val sni = json.optString("sni", json.optString("host", ""))
     val hostHeader = json.optString("host", "")
-    val path = json.optString("path", "")
+    val path = json.optString("path", "").substringBefore("?ed=")
+    val headerType = json.optString("type", "none").lowercase()
 
     return V2RayConfig(
       id = "VMESS_${address}_$port",
@@ -217,6 +229,7 @@ object V2RayConfigParser {
       sni = sni,
       hostHeader = hostHeader,
       path = path,
+      headerType = headerType,
       rawUri = uriString,
     )
   }
