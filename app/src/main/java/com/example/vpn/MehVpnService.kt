@@ -4,18 +4,18 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.Context
 import android.content.Intent
+import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.model.V2RayConfig
+import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,7 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.system.measureNanoTime
 
 data class VpnTunnelSession(
   val isRunning: Boolean = false,
@@ -36,6 +35,7 @@ data class VpnTunnelSession(
   val serverPort: Int = 0,
   val protocolLabel: String = "",
   val currentPingMs: Long = 0L,
+  val localProxyPort: Int = 0,
   val errorMessage: String? = null,
 )
 
@@ -43,6 +43,8 @@ class MehVpnService : VpnService() {
 
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private var vpnInterface: ParcelFileDescriptor? = null
+  private var localProxyServer: LocalV2RayProxyServer? = null
+  private var tunDnsForwarder: TunDnsForwarder? = null
   private var keepAliveJob: Job? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -52,23 +54,20 @@ class MehVpnService : VpnService() {
         return START_NOT_STICKY
       }
       ACTION_CONNECT -> {
-        val serverName = intent.getStringExtra(EXTRA_SERVER_NAME) ?: "V2Ray Server"
-        val serverAddress = intent.getStringExtra(EXTRA_SERVER_ADDRESS) ?: ""
-        val serverPort = intent.getIntExtra(EXTRA_SERVER_PORT, 443)
-        val protocolLabel = intent.getStringExtra(EXTRA_PROTOCOL_LABEL) ?: "VLESS"
-        val initialPing = intent.getLongExtra(EXTRA_INITIAL_PING, 50L)
+        val rawUri = intent.getStringExtra(EXTRA_RAW_URI).orEmpty()
+        val parsedConfig = V2RayConfigParser.parseSingleUri(rawUri)
+        val serverName = intent.getStringExtra(EXTRA_SERVER_NAME) ?: parsedConfig?.cleanTitle ?: "V2Ray Server"
+        val initialPing = intent.getLongExtra(EXTRA_INITIAL_PING, 80L)
         val coreJson = intent.getStringExtra(EXTRA_CORE_JSON) ?: "{}"
 
-        if (serverAddress.isBlank()) {
-          stopTunnel("آدرس سرور نامعتبر است")
+        if (parsedConfig == null) {
+          stopTunnel("کانفیگ سرور نامعتبر است")
           return START_NOT_STICKY
         }
 
         startTunnel(
+          config = parsedConfig.copy(latencyMs = initialPing),
           serverName = serverName,
-          serverAddress = serverAddress,
-          serverPort = serverPort,
-          protocolLabel = protocolLabel,
           initialPing = initialPing,
           coreJson = coreJson,
         )
@@ -79,10 +78,8 @@ class MehVpnService : VpnService() {
   }
 
   private fun startTunnel(
+    config: V2RayConfig,
     serverName: String,
-    serverAddress: String,
-    serverPort: Int,
-    protocolLabel: String,
     initialPing: Long,
     coreJson: String,
   ) {
@@ -91,37 +88,67 @@ class MehVpnService : VpnService() {
       val notification = buildForegroundNotification(serverName, initialPing)
       startForeground(NOTIFICATION_ID, notification)
 
-      // Persist the active V2Ray JSON config in internal filesDir
       File(filesDir, "active_v2ray_config.json").writeText(coreJson)
 
+      // 1. Start local V2Ray HTTP/HTTPS CONNECT & SOCKS5 proxy server with VPN socket protection
+      localProxyServer?.stop()
+      val proxyServer =
+        LocalV2RayProxyServer(
+          config = config,
+          protector = { socket -> protect(socket) },
+        )
+      val proxyPort = proxyServer.start()
+      localProxyServer = proxyServer
+
+      // 2. Establish Android VPN Interface with system HTTP Proxy & virtual DNS forwarder
+      tunDnsForwarder?.stop()
       vpnInterface?.close()
+
       val builder =
         Builder()
           .setSession("MEH • $serverName")
           .setMtu(1500)
-          .addAddress("10.10.14.2", 24)
-          .addDnsServer("1.1.1.1")
-          .addDnsServer("8.8.8.8")
+          .addAddress("10.10.14.2", 30)
+          .addRoute("10.10.14.1", 32)
+          .addDnsServer("10.10.14.1")
+
+      // Exclude our own app so its V2Ray outbound sockets never route back into the VPN
+      try {
+        builder.addDisallowedApplication(packageName)
+      } catch (_: Exception) {}
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         builder.setMetered(false)
+        builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", proxyPort))
       }
 
-      // Exclude our own package from routing loops if needed, and establish the TUN interface
-      vpnInterface = builder.establish()
+      val establishedPfd = builder.establish() ?: throw IllegalStateException("TUN establish returned null")
+      vpnInterface = establishedPfd
+
+      // 3. Start real TUN DNS forwarder for 10.10.14.1:53
+      val dnsForwarder =
+        TunDnsForwarder(
+          tunPfd = establishedPfd,
+          config = config,
+          protector = { socket -> protect(socket) },
+          udpProtector = { datagramSocket -> protect(datagramSocket) },
+        )
+      dnsForwarder.start()
+      tunDnsForwarder = dnsForwarder
 
       _tunnelSession.value =
         VpnTunnelSession(
           isRunning = true,
           serverName = serverName,
-          serverAddress = serverAddress,
-          serverPort = serverPort,
-          protocolLabel = protocolLabel,
+          serverAddress = config.address,
+          serverPort = config.port,
+          protocolLabel = config.protocol.label,
           currentPingMs = initialPing,
+          localProxyPort = proxyPort,
           errorMessage = null,
         )
 
-      startProtectedKeepAliveProbe(serverName, serverAddress, serverPort, protocolLabel, initialPing)
+      startProtectedKeepAliveProbe(config, serverName, proxyPort, initialPing)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -132,15 +159,10 @@ class MehVpnService : VpnService() {
     }
   }
 
-  /**
-   * Periodically probes the connected V2Ray server over a VPN-protected socket (`protect(socket)`)
-   * to keep the live ping log accurate while the tunnel is active.
-   */
   private fun startProtectedKeepAliveProbe(
+    config: V2RayConfig,
     serverName: String,
-    serverAddress: String,
-    serverPort: Int,
-    protocolLabel: String,
+    proxyPort: Int,
     initialPing: Long,
   ) {
     keepAliveJob?.cancel()
@@ -148,31 +170,23 @@ class MehVpnService : VpnService() {
       serviceScope.launch {
         var lastPing = initialPing
         while (isActive) {
-          delay(6000L)
+          delay(12_000L)
           val measuredPing =
-            try {
-              val nanos =
-                measureNanoTime {
-                  Socket().use { socket ->
-                    protect(socket)
-                    socket.tcpNoDelay = true
-                    socket.soTimeout = 2000
-                    socket.connect(InetSocketAddress(serverAddress, serverPort), 2000)
-                  }
-                }
-              (nanos / 1_000_000L).coerceAtLeast(1L)
-            } catch (_: Exception) {
-              lastPing
-            }
+            V2RayOutboundClient.measureRealProxyDelay(
+              config = config,
+              timeoutMs = 3000,
+              protector = { socket -> protect(socket) },
+            ) ?: lastPing
           lastPing = measuredPing
           _tunnelSession.value =
             VpnTunnelSession(
               isRunning = true,
               serverName = serverName,
-              serverAddress = serverAddress,
-              serverPort = serverPort,
-              protocolLabel = protocolLabel,
+              serverAddress = config.address,
+              serverPort = config.port,
+              protocolLabel = config.protocol.label,
               currentPingMs = lastPing,
+              localProxyPort = proxyPort,
               errorMessage = null,
             )
         }
@@ -182,6 +196,10 @@ class MehVpnService : VpnService() {
   private fun stopTunnel(errorMsg: String? = null) {
     keepAliveJob?.cancel()
     keepAliveJob = null
+    tunDnsForwarder?.stop()
+    tunDnsForwarder = null
+    localProxyServer?.stop()
+    localProxyServer = null
     try {
       vpnInterface?.close()
     } catch (_: Exception) {}
@@ -209,6 +227,8 @@ class MehVpnService : VpnService() {
 
   override fun onDestroy() {
     keepAliveJob?.cancel()
+    tunDnsForwarder?.stop()
+    localProxyServer?.stop()
     try {
       vpnInterface?.close()
     } catch (_: Exception) {}
@@ -262,7 +282,7 @@ class MehVpnService : VpnService() {
       )
 
     return NotificationCompat.Builder(this, CHANNEL_ID)
-      .setSmallIcon(R.drawable.ic_launcher_foreground)
+      .setSmallIcon(android.R.drawable.ic_lock_lock)
       .setContentTitle(getString(R.string.vpn_notification_title))
       .setContentText("متصل به $serverName • پینگ ${pingMs}ms")
       .setContentIntent(openPendingIntent)
@@ -279,6 +299,7 @@ class MehVpnService : VpnService() {
     const val ACTION_CONNECT = "com.example.vpn.ACTION_CONNECT"
     const val ACTION_DISCONNECT = "com.example.vpn.ACTION_DISCONNECT"
 
+    const val EXTRA_RAW_URI = "extra_raw_uri"
     const val EXTRA_SERVER_NAME = "extra_server_name"
     const val EXTRA_SERVER_ADDRESS = "extra_server_address"
     const val EXTRA_SERVER_PORT = "extra_server_port"
