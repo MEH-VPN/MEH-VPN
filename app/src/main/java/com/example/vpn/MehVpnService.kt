@@ -107,7 +107,7 @@ class MehVpnService : VpnService() {
       val builder =
         Builder()
           .setSession("MEH • $serverName")
-          .setMtu(1500)
+          .setMtu(1280) // RFC 2460 standard minimum MTU to prevent GTP-U packet fragmentation on mobile carriers
           .addAddress("10.10.14.2", 30)
           .addRoute("10.10.14.1", 32)
           .addDnsServer("10.10.14.1")
@@ -115,6 +115,12 @@ class MehVpnService : VpnService() {
       // Exclude our own app so its V2Ray outbound sockets never route back into the VPN
       try {
         builder.addDisallowedApplication(packageName)
+      } catch (_: Exception) {}
+
+      // Trap IPv6 into TUN to prevent cellular leak & Happy Eyeballs timeouts on Irancell/MCI dual-stack
+      try {
+        builder.addAddress("fd00:1:fd00:1::2", 64)
+        builder.addRoute("::", 0)
       } catch (_: Exception) {}
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

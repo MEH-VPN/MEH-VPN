@@ -88,7 +88,12 @@ class TunDnsForwarder(
       if (dnsPayloadLen <= 12) return
 
       val dnsQuery = packet.copyOfRange(dnsPayloadOffset, packet.size)
-      val dnsResponse = resolveDnsViaV2RayOrProtected(dnsQuery) ?: return
+      val dnsResponse =
+        if (isAaaaQuery(dnsQuery)) {
+          buildSyntheticNoDataResponse(dnsQuery)
+        } else {
+          resolveDnsViaV2RayOrProtected(dnsQuery) ?: return
+        }
 
       val responsePacket = buildIpv4UdpReply(packet, ihl, dnsResponse)
       synchronized(writeLock) {
@@ -99,11 +104,34 @@ class TunDnsForwarder(
   }
 
   private fun resolveDnsViaV2RayOrProtected(dnsQuery: ByteArray): ByteArray? {
-    // 1. Try DNS-over-TCP (RFC 1035 Section 4.2.2) through the V2Ray outbound tunnel to 1.1.1.1:53
-    try {
+    // 1. Primary: DNS-over-TCP through V2Ray outbound tunnel to 1.1.1.1:53
+    queryDnsOverTcpThroughV2Ray(dnsQuery, "1.1.1.1")?.let { return it }
+
+    // 2. Secondary fallback: DNS-over-TCP through V2Ray outbound tunnel to 8.8.8.8:53
+    queryDnsOverTcpThroughV2Ray(dnsQuery, "8.8.8.8")?.let { return it }
+
+    // 3. Last-resort fallback: Protected UDP socket to 8.8.8.8:53
+    return try {
+      DatagramSocket().use { udpSocket ->
+        udpProtector(udpSocket)
+        udpSocket.soTimeout = 2000
+        val target = InetAddress.getByName("8.8.8.8")
+        udpSocket.send(DatagramPacket(dnsQuery, dnsQuery.size, target, 53))
+        val buf = ByteArray(1500)
+        val recv = DatagramPacket(buf, buf.size)
+        udpSocket.receive(recv)
+        buf.copyOfRange(0, recv.length)
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun queryDnsOverTcpThroughV2Ray(dnsQuery: ByteArray, dnsHost: String): ByteArray? {
+    return try {
       V2RayOutboundClient.openTunnel(
         config = config,
-        targetHost = "1.1.1.1",
+        targetHost = dnsHost,
         targetPort = 53,
         timeoutMs = 2500,
         protector = protector,
@@ -121,26 +149,62 @@ class TunDnsForwarder(
         if (respLen in 12..4096) {
           val resp = ByteArray(respLen)
           dataIn.readFully(resp)
-          return resp
+          resp
+        } else {
+          null
         }
-      }
-    } catch (_: Exception) {}
-
-    // 2. Fallback: Protected UDP socket to 8.8.8.8:53
-    return try {
-      DatagramSocket().use { udpSocket ->
-        udpProtector(udpSocket)
-        udpSocket.soTimeout = 2000
-        val target = InetAddress.getByName("8.8.8.8")
-        udpSocket.send(DatagramPacket(dnsQuery, dnsQuery.size, target, 53))
-        val buf = ByteArray(1500)
-        val recv = DatagramPacket(buf, buf.size)
-        udpSocket.receive(recv)
-        buf.copyOfRange(0, recv.length)
       }
     } catch (_: Exception) {
       null
     }
+  }
+
+  private fun isAaaaQuery(dnsQuery: ByteArray): Boolean {
+    if (dnsQuery.size < 16) return false
+    val qdCount = ((dnsQuery[4].toInt() and 0xFF) shl 8) or (dnsQuery[5].toInt() and 0xFF)
+    if (qdCount < 1) return false
+    var offset = 12
+    while (offset < dnsQuery.size) {
+      val len = dnsQuery[offset].toInt() and 0xFF
+      if (len == 0) {
+        offset++ // Skip 0x00 terminating root label
+        break
+      }
+      offset += 1 + len
+    }
+    if (offset + 4 <= dnsQuery.size) {
+      val qType = ((dnsQuery[offset].toInt() and 0xFF) shl 8) or (dnsQuery[offset + 1].toInt() and 0xFF)
+      return qType == 28 // 28 = AAAA (IPv6)
+    }
+    return false
+  }
+
+  private fun buildSyntheticNoDataResponse(dnsQuery: ByteArray): ByteArray {
+    var questionEnd = 12
+    while (questionEnd < dnsQuery.size) {
+      val len = dnsQuery[questionEnd].toInt() and 0xFF
+      if (len == 0) {
+        questionEnd += 5 // 1 byte (0x00) + 2 bytes QTYPE + 2 bytes QCLASS
+        break
+      }
+      questionEnd += 1 + len
+    }
+    val safeEnd = questionEnd.coerceAtMost(dnsQuery.size)
+    val resp = ByteArray(safeEnd)
+    System.arraycopy(dnsQuery, 0, resp, 0, safeEnd)
+    // Flags: Response (0x80), Recursion Desired (0x01), Recursion Available (0x80) -> 0x8180, RCODE = 0 (NOERROR)
+    resp[2] = 0x81.toByte()
+    resp[3] = 0x80.toByte()
+    // ANCOUNT = 0 (No answers)
+    resp[6] = 0x00.toByte()
+    resp[7] = 0x00.toByte()
+    // NSCOUNT = 0
+    resp[8] = 0x00.toByte()
+    resp[9] = 0x00.toByte()
+    // ARCOUNT = 0
+    resp[10] = 0x00.toByte()
+    resp[11] = 0x00.toByte()
+    return resp
   }
 
   private fun buildIpv4UdpReply(
