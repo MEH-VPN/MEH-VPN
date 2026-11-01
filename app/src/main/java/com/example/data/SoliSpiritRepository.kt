@@ -204,8 +204,8 @@ class SoliSpiritRepository(
         if (stage1Passed.isEmpty()) continue
         stage1Fallbacks.addAll(stage1Passed)
 
-        // Stage 2: Verify real HTTPS (port 443 TLS + second concurrent/sequential connection) on top candidates
-        val topToVerify = stage1Passed.take(14)
+        // Stage 2: Verify real HTTPS (Google) AND raw IP connection to Telegram DC2 (149.154.167.50:443)
+        val topToVerify = stage1Passed.take(16)
         val stage2Verified =
           coroutineScope {
             topToVerify
@@ -215,17 +215,26 @@ class SoliSpiritRepository(
                   val httpsLatency =
                     V2RayOutboundClient.verifyHttpsAndDnsCapability(
                       config = candidate,
-                      timeoutMs = 3200,
+                      timeoutMs = 3000,
+                    ) ?: return@async null
+
+                  val tgLatency =
+                    V2RayOutboundClient.verifyTelegramCapability(
+                      config = candidate,
+                      timeoutMs = 2400,
                     )
-                  if (httpsLatency != null) {
-                    val combinedLatency = (candidate.latencyMs + httpsLatency) / 2L
-                    candidate.copy(
-                      latencyMs = combinedLatency.coerceAtLeast(1L),
-                      speedScore = 10_000.0 / combinedLatency.coerceAtLeast(1L).toDouble(),
-                    )
-                  } else {
-                    null
-                  }
+
+                  val effectiveLatency =
+                    if (tgLatency != null) {
+                      (candidate.latencyMs + httpsLatency + tgLatency) / 3L
+                    } else {
+                      (candidate.latencyMs + httpsLatency) / 2L
+                    }
+
+                  candidate.copy(
+                    latencyMs = effectiveLatency.coerceAtLeast(1L),
+                    speedScore = 10_000.0 / effectiveLatency.coerceAtLeast(1L).toDouble(),
+                  )
                 }
               }
               .awaitAll()

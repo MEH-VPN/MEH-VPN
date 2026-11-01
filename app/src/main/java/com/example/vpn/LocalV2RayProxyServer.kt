@@ -225,6 +225,9 @@ class LocalV2RayProxyServer(
 
     when (cmd) {
       0x01 -> {
+        // Clear read timeout for active streaming so long-lived idle apps (Telegram, push notifications)
+        // are never killed after 2 minutes
+        clientSocket.soTimeout = 0
         // TCP CONNECT with automatic failover
         val tunnel =
           try {
@@ -243,7 +246,14 @@ class LocalV2RayProxyServer(
         tunnel.use { activeTunnel ->
           clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
           clientOut.flush()
-          relayStreams(clientIn, clientOut, activeTunnel.inputStream, activeTunnel.outputStream)
+          relayStreams(
+            clientIn = clientIn,
+            clientOut = clientOut,
+            remoteIn = activeTunnel.inputStream,
+            remoteOut = activeTunnel.outputStream,
+            clientSocket = clientSocket,
+            tunnelConnection = activeTunnel,
+          )
         }
       }
       0x03 -> {
@@ -322,6 +332,11 @@ class LocalV2RayProxyServer(
 
   private fun resolveDnsOverV2Ray(dnsQuery: ByteArray): ByteArray? {
     if (dnsQuery.size < 12) return null
+    if (isAaaaQuery(dnsQuery)) {
+      // Immediate NOERROR with 0 answers: forces Android 9 (and apps like Telegram/Chrome)
+      // to immediately route traffic via IPv4 without Happy Eyeballs delays or IPv6 timeouts
+      return buildEmptyDnsNoerrorResponse(dnsQuery)
+    }
     val cacheKey = extractDnsCacheKey(dnsQuery)
     if (cacheKey != null) {
       val cached = dnsCache[cacheKey]
@@ -618,11 +633,44 @@ class LocalV2RayProxyServer(
     }
   }
 
+  private fun isAaaaQuery(dnsQuery: ByteArray): Boolean {
+    if (dnsQuery.size < 17) return false
+    var offset = 12
+    while (offset < dnsQuery.size) {
+      val len = dnsQuery[offset].toInt() and 0xFF
+      offset++
+      if (len == 0) break
+      if (len >= 0xC0 || offset + len > dnsQuery.size) return false
+      offset += len
+    }
+    if (offset + 4 > dnsQuery.size) return false
+    val qtype = ((dnsQuery[offset].toInt() and 0xFF) shl 8) or (dnsQuery[offset + 1].toInt() and 0xFF)
+    return qtype == 28 // AAAA
+  }
+
+  private fun buildEmptyDnsNoerrorResponse(dnsQuery: ByteArray): ByteArray {
+    val resp = ByteArray(dnsQuery.size)
+    System.arraycopy(dnsQuery, 0, resp, 0, dnsQuery.size)
+    // Flags: QR=1 (response), Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0 (No error) -> 0x8180
+    resp[2] = 0x81.toByte()
+    resp[3] = 0x80.toByte()
+    // ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0
+    resp[6] = 0x00
+    resp[7] = 0x00
+    resp[8] = 0x00
+    resp[9] = 0x00
+    resp[10] = 0x00
+    resp[11] = 0x00
+    return resp
+  }
+
   private fun relayStreams(
     clientIn: InputStream,
     clientOut: OutputStream,
     remoteIn: InputStream,
     remoteOut: OutputStream,
+    clientSocket: Socket? = null,
+    tunnelConnection: V2RayOutboundClient.TunnelConnection? = null,
   ) {
     val upstreamJob =
       scope.launch {
@@ -634,7 +682,12 @@ class LocalV2RayProxyServer(
             remoteOut.write(buf, 0, n)
             remoteOut.flush()
           }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        } finally {
+          try {
+            tunnelConnection?.close()
+          } catch (_: Exception) {}
+        }
       }
 
     try {
@@ -648,6 +701,9 @@ class LocalV2RayProxyServer(
     } catch (_: Exception) {
     } finally {
       upstreamJob.cancel()
+      try {
+        clientSocket?.close()
+      } catch (_: Exception) {}
     }
   }
 

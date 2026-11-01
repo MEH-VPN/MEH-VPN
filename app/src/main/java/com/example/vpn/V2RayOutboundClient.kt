@@ -12,6 +12,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -152,6 +153,17 @@ object V2RayOutboundClient {
       bytes[i] = n.toByte()
     }
     return bytes
+  }
+
+  fun parseIpv6Bytes(host: String): ByteArray? {
+    val clean = host.removePrefix("[").removeSuffix("]").trim()
+    if (!clean.contains(":")) return null
+    return try {
+      val addr = InetAddress.getByName(clean)
+      if (addr is Inet6Address) addr.address else null
+    } catch (_: Exception) {
+      null
+    }
   }
 
   fun isPublicRoutableIpv4(bytes: ByteArray): Boolean {
@@ -322,6 +334,41 @@ object V2RayOutboundClient {
   }
 
   /**
+   * Verifies direct connection capability to Telegram Data Centers (e.g. 149.154.167.50:443).
+   * This guarantees that nodes in the pool do not block or drop raw Telegram IP connections.
+   */
+  fun verifyTelegramCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2400,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    if (!isSupportedByEngine(config)) return null
+    val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
+    if (resolvedIp.isEmpty()) return null
+    val resolvedConfig = config.copy(resolvedIp = resolvedIp)
+
+    return try {
+      val elapsedNanos =
+        measureNanoTime {
+          openTunnel(
+            config = resolvedConfig,
+            targetHost = "149.154.167.50",
+            targetPort = 443,
+            timeoutMs = timeoutMs,
+            protector = protector,
+          ).use { conn ->
+            // Telegram MTProto intermediate handshake preamble
+            conn.outputStream.write(byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte()))
+            conn.outputStream.flush()
+          }
+        }
+      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  /**
    * Establishes an outbound V2Ray tunnel to [targetHost]:[targetPort] through [config].
    */
   fun openTunnel(
@@ -368,17 +415,20 @@ object V2RayOutboundClient {
 
       if (config.network.equals("ws", ignoreCase = true)) {
         performWebSocketUpgrade(config, transportIn, transportOut)
-        transportIn = WebSocketFrameInputStream(transportIn)
-        transportOut = WebSocketFrameOutputStream(transportOut)
+        val wsOut = WebSocketFrameOutputStream(transportOut)
+        val wsIn = WebSocketFrameInputStream(transportIn) { pongPayload ->
+          wsOut.sendPong(pongPayload)
+        }
+        transportIn = wsIn
+        transportOut = wsOut
       }
 
-      // Increase read timeout for active tunnel streaming so HTTP/2 and long-lived connections stay alive
-      if (timeoutMs >= 5000) {
-        try {
-          transportSocket.soTimeout = 120_000
-          rawSocket.soTimeout = 120_000
-        } catch (_: Exception) {}
-      }
+      // For long-lived active streams (Telegram, push notifications, web), clear read timeout
+      // so idle connections are NOT terminated after 2 minutes
+      try {
+        transportSocket.soTimeout = 0
+        rawSocket.soTimeout = 0
+      } catch (_: Exception) {}
 
       return when (config.protocol) {
         V2RayProtocol.VLESS ->
@@ -618,33 +668,41 @@ object V2RayOutboundClient {
   }
 
   private fun writeVlessAddress(out: ByteArrayOutputStream, host: String) {
-    val ipv4Parts = host.split(".")
-    if (ipv4Parts.size == 4 && ipv4Parts.all { it.toIntOrNull() in 0..255 }) {
+    val ipv4Bytes = parseIpv4Bytes(host)
+    if (ipv4Bytes != null) {
       out.write(0x01) // IPv4
-      for (part in ipv4Parts) {
-        out.write(part.toInt())
-      }
-    } else {
-      val domainBytes = host.toByteArray(Charsets.UTF_8)
-      out.write(0x02) // Domain
-      out.write(domainBytes.size)
-      out.write(domainBytes)
+      out.write(ipv4Bytes)
+      return
     }
+    val ipv6Bytes = parseIpv6Bytes(host)
+    if (ipv6Bytes != null && ipv6Bytes.size == 16) {
+      out.write(0x03) // IPv6 (16 bytes) in VLESS
+      out.write(ipv6Bytes)
+      return
+    }
+    val domainBytes = host.toByteArray(Charsets.UTF_8)
+    out.write(0x02) // Domain
+    out.write(domainBytes.size)
+    out.write(domainBytes)
   }
 
   private fun writeSocks5Address(out: ByteArrayOutputStream, host: String) {
-    val ipv4Parts = host.split(".")
-    if (ipv4Parts.size == 4 && ipv4Parts.all { it.toIntOrNull() in 0..255 }) {
+    val ipv4Bytes = parseIpv4Bytes(host)
+    if (ipv4Bytes != null) {
       out.write(0x01) // IPv4
-      for (part in ipv4Parts) {
-        out.write(part.toInt())
-      }
-    } else {
-      val domainBytes = host.toByteArray(Charsets.UTF_8)
-      out.write(0x03) // Domain in SOCKS5/Trojan
-      out.write(domainBytes.size)
-      out.write(domainBytes)
+      out.write(ipv4Bytes)
+      return
     }
+    val ipv6Bytes = parseIpv6Bytes(host)
+    if (ipv6Bytes != null && ipv6Bytes.size == 16) {
+      out.write(0x04) // IPv6 (16 bytes) in SOCKS5/Trojan
+      out.write(ipv6Bytes)
+      return
+    }
+    val domainBytes = host.toByteArray(Charsets.UTF_8)
+    out.write(0x03) // Domain in SOCKS5/Trojan
+    out.write(domainBytes.size)
+    out.write(domainBytes)
   }
 
   private fun parseUuidBytes(uuidStr: String): ByteArray? {
@@ -811,6 +869,24 @@ object V2RayOutboundClient {
     private val rng = SecureRandom()
 
     @Synchronized
+    fun sendPong(payload: ByteArray) {
+      try {
+        val maskKey = ByteArray(4).also { rng.nextBytes(it) }
+        val frame = ByteArrayOutputStream(payload.size + 14)
+        frame.write(0x8A) // FIN + Pong opcode (0x0A)
+        frame.write(0x80 or (payload.size and 0x7F))
+        frame.write(maskKey)
+        val masked = ByteArray(payload.size)
+        for (i in payload.indices) {
+          masked[i] = (payload[i].toInt() xor maskKey[i and 3].toInt()).toByte()
+        }
+        frame.write(masked)
+        out.write(frame.toByteArray())
+        out.flush()
+      } catch (_: Exception) {}
+    }
+
+    @Synchronized
     override fun write(b: Int) {
       write(byteArrayOf(b.toByte()), 0, 1)
     }
@@ -860,7 +936,10 @@ object V2RayOutboundClient {
   /**
    * RFC 6455 WebSocket Frame InputStream.
    */
-  private class WebSocketFrameInputStream(input: InputStream) : FilterInputStream(input) {
+  private class WebSocketFrameInputStream(
+    input: InputStream,
+    private val pongSender: ((ByteArray) -> Unit)? = null,
+  ) : FilterInputStream(input) {
     private val dataIn = DataInputStream(input)
     private var currentPayload: ByteArray = ByteArray(0)
     private var currentOffset = 0
@@ -930,7 +1009,10 @@ object V2RayOutboundClient {
 
         when (opcode) {
           0x08 -> return false
-          0x09 -> continue
+          0x09 -> {
+            pongSender?.invoke(payload)
+            continue
+          }
           0x0A -> continue
           0x00, 0x01, 0x02 -> {
             if (payload.isNotEmpty()) {

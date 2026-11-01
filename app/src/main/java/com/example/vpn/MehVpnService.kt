@@ -227,6 +227,11 @@ class MehVpnService : VpnService() {
           .addDnsServer("1.1.1.1")
 
       try {
+        builder.addAddress("fd00:1:fd00:1::2", 64)
+        builder.addRoute("::", 0)
+      } catch (_: Exception) {}
+
+      try {
         builder.addDisallowedApplication(packageName)
       } catch (_: Exception) {}
 

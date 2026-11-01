@@ -138,4 +138,34 @@ class ExampleUnitTest {
       proxy.stop()
     }
   }
+
+  @Test
+  fun testTelegramConnect() = runBlocking {
+    val repo = SoliSpiritRepository()
+    val configs = repo.fetchConfigsFromSoliSpirit {}
+    println("TELEGRAM_TEST: fetched ${configs.size} configs")
+    val candidates = repo.testAndSelectFastestCandidates(configs, maxCount = 8) {}
+    println("TELEGRAM_TEST: candidates count = ${candidates.size}")
+    for ((idx, c) in candidates.withIndex()) {
+      println("TELEGRAM_TEST: Candidate #$idx: ${c.protocol} ${c.address}:${c.port} net=${c.network} sni=${c.sni} path=${c.path}")
+      // Test direct TCP connect to Telegram DC2 over V2Ray tunnel
+      val tgStatus = try {
+        V2RayOutboundClient.openTunnel(
+          config = c,
+          targetHost = "149.154.167.50",
+          targetPort = 443,
+          timeoutMs = 4000,
+        ).use { conn ->
+          // Send Telegram unpadded MTProto handshake preamble (0xef, 0xef, 0xef, 0xef) or test raw TCP connect
+          conn.outputStream.write(byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte()))
+          conn.outputStream.flush()
+          "OPENED_AND_WRITTEN_OK"
+        }
+      } catch (e: Exception) {
+        "FAILED: ${e.javaClass.simpleName}: ${e.message}"
+      }
+      println("TELEGRAM_TEST: -> Telegram DC2 result: $tgStatus")
+    }
+  }
 }
+
