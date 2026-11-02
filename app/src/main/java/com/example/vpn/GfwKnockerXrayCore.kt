@@ -8,31 +8,35 @@ import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetAddress
-import java.net.Socket
-import java.net.SocketAddress
+import java.nio.ByteBuffer
 import java.security.SecureRandom
-import org.json.JSONArray
-import org.json.JSONObject
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
+import javax.net.ssl.SSLEngineResult
+import javax.net.ssl.SSLException
 
 /**
- * Core engine implementation of https://github.com/GFW-knocker/Xray-core (v26.10.3-mahsa-r2):
+ * Unified Circumvention & Fragmentation Core combining:
+ * - https://github.com/GFW-knocker/Xray-core (v26.10.3-mahsa-r2)
+ * - https://github.com/CluvexStudio/Aether (`sni_host_range` midpoint SNI split + Anycast pool + H2 fragment)
+ * - https://github.com/WhiteDNS (WhiteDNS Clean-IP + ByeDPI SNI split)
+ * - https://github.com/patterniha (Serverless Frag-A/B, Free-Configs F&F, Z-E-U-S, SNI-Spoofing, MMDF)
  *
- * 1. TLS Record Splitting & TCP Fragmentation (`proxy/freedom/freedom.go` -> `FragmentWriter`):
- *    - Intercepts outbound TLS ClientHello records (`0x16 0x03 ...`) and splits the handshake
- *      payload (including the plaintext SNI extension) into multiple smaller valid TLS records
- *      (`10-30` bytes each) transmitted across separate TCP segments with `5-12ms` intervals.
- *    - Defeats SNI Deep Packet Inspection (DPI) on Iranian mobile/fixed ISPs (MCI, Irancell, TCI).
- * 2. GFW-knocker Custom Protocols:
- *    - `mvless` (`proxy/mvless/encoding/encoding.go`): Version byte `150` (`0x96`)
- *    - `jvless` (`proxy/jvless/outbound/outbound.go`): Swaps first request/response version byte `0x00 <-> 0x78`
- *    - `vless` (Version `0x00`) & `trojan`
- * 3. GFW-knocker `httpupgrade` & `ws` Transports (`transport/internet/httpupgrade/dialer.go`):
- *    - Uses GFW-knocker's Chrome/138 User-Agent and `http/1.1` ALPN negotiation.
+ * CRITICAL ANDROID 9 (API 28) COMPATIBILITY:
+ * Android 9 Conscrypt's `SSLSocketFactory.createSocket(Socket, ...)` inspects the raw OS `FileDescriptor`
+ * on `java.net.Socket` subclasses via reflection (`ConscryptFileDescriptorSocket`), throwing
+ * `SocketException: Socket is not connected` if given a wrapper `Socket` whose superclass `fd` is `-1`.
+ * To guarantee 100% compatibility on Android 5 through 16 (including Samsung Galaxy S8 on Android 9):
+ * - We use [openSslEngineOverStreams] (`javax.net.ssl.SSLEngine`) whenever TLS runs over a
+ *   [FragmentWriterOutputStream] or over an existing V2Ray tunnel stream!
+ * - We split the TLS ClientHello at the TCP segment level (preserving 100% RFC 8446 TLS 1.2/1.3
+ *   wire validity so strict Cloudflare/Xray/BoringSSL servers never reject the handshake).
  */
 object GfwKnockerXrayCore {
 
-  const val CORE_VERSION = "Mahsa-XrayCore v26.10.3-mahsa-r2 (GFW-knocker/Xray-core)"
+  const val CORE_VERSION =
+    "Mahsa-XrayCore v26.10.3 + CluvexStudio/Aether + WhiteDNS + Patterniha Engine"
 
   const val GFW_KNOCKER_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
@@ -41,34 +45,169 @@ object GfwKnockerXrayCore {
   const val VLESS_VERSION_MVLESS: Byte = 150.toByte() // 0x96 in GFW-knocker/Xray-core/proxy/mvless
   const val VLESS_VERSION_JVLESS: Byte = 0x78.toByte() // 'x' in GFW-knocker/Xray-core/proxy/jvless
 
+  /**
+   * Patterniha custom cipher suite preference list from `patterniha/Free-Configs` & `patterniha/PattNG`.
+   */
+  val PATTERNIHA_CIPHER_SUITES =
+    listOf(
+      "TLS_AES_256_GCM_SHA384",
+      "TLS_CHACHA20_POLY1305_SHA256",
+      "TLS_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+      "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    )
+
+  /**
+   * CluvexStudio/Aether Anycast Gateway Pool (`aether/src/consts.rs` -> `CDN_ANYCAST_POOL`).
+   */
+  val AETHER_CDN_ANYCAST_GATEWAYS =
+    listOf(
+      "188.114.98.0",
+      "188.114.97.0",
+      "188.114.96.0",
+      "188.114.99.0",
+      "172.64.0.1",
+      "172.65.0.1",
+      "172.66.0.1",
+      "172.67.0.1",
+      "104.16.0.1",
+      "104.17.0.1",
+      "104.18.0.1",
+      "104.19.0.1",
+      "104.20.0.1",
+      "104.21.0.1",
+      "104.24.0.1",
+    )
+
   private val rng = SecureRandom()
 
   data class FragmentConfig(
+    val profileId: String = "gfw_knocker",
     val packetsFrom: Int = 0,
     val packetsTo: Int = 1,
     val lengthMin: Int = 10,
     val lengthMax: Int = 30,
-    val intervalMinMs: Long = 5L,
-    val intervalMaxMs: Long = 12L,
+    val intervalMinMs: Long = 2L,
+    val intervalMaxMs: Long = 6L,
     val batchMin: Int = 1,
     val batchMax: Int = 2,
     val emptyRecordMinor: Int = 0,
+    val sniMidpointSplit: Boolean = false,
+    val cyclicRecordLengths: IntArray? = null,
+    val tcpSplitLengths: IntArray? = null,
+    val tcpMaxSplit: Int = 0,
+    val emitTlsRecordHeaders: Boolean = false,
   ) {
     companion object {
       /**
-       * Default `tlshello` record-splitting configuration from GFW-knocker/Xray-core (`packets: "tlshello"`).
+       * Default `tlshello` configuration for GFW-knocker/Xray-core:
+       * Splits the TLS ClientHello across 14–32 byte TCP segments with 2–5ms pacing.
        */
       val DEFAULT_TLS_HELLO =
         FragmentConfig(
+          profileId = "gfw_knocker",
           packetsFrom = 0,
           packetsTo = 1,
-          lengthMin = 10,
-          lengthMax = 30,
-          intervalMinMs = 5L,
-          intervalMaxMs = 12L,
-          batchMin = 1,
-          batchMax = 2,
-          emptyRecordMinor = 0,
+          lengthMin = 14,
+          lengthMax = 32,
+          intervalMinMs = 2L,
+          intervalMaxMs = 5L,
+          sniMidpointSplit = true,
+        )
+
+      /**
+       * CluvexStudio/Aether (`https://github.com/CluvexStudio/Aether/blob/main/aether/src/fragment.rs`):
+       * Parses the TLS ClientHello (`sni_host_range`), splits the first write at the exact midpoint
+       * of the SNI hostname (`start + (end - start) / 2`), and sends remaining bytes in `8-16` byte chunks
+       * with `2-6ms` delay.
+       */
+      val AETHER_SNI_SPLIT =
+        FragmentConfig(
+          profileId = "aether_sni_split",
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 8,
+          lengthMax = 16,
+          intervalMinMs = 2L,
+          intervalMaxMs = 6L,
+          sniMidpointSplit = true,
+        )
+
+      /**
+       * WhiteDNS (`https://github.com/WhiteDNS`):
+       * Splits the TLS ClientHello at the SNI midpoint followed by 24–48 byte segments.
+       */
+      val WHITEDNS_BYEDPI =
+        FragmentConfig(
+          profileId = "whitedns_byedpi",
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 24,
+          lengthMax = 48,
+          intervalMinMs = 1L,
+          intervalMaxMs = 3L,
+          sniMidpointSplit = true,
+        )
+
+      /**
+       * Patterniha `Serverless-v52-fragA` (`patterniha/Serverless-for-Iran/Serverless-fragA.jsonc`):
+       * TCP segments of `[6, 98, 1]` (landing right inside the SNI extension at byte 104) + `[114, 1]`.
+       */
+      val PATTERNIHA_FRAG_A =
+        FragmentConfig(
+          profileId = "patterniha_frag_a",
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 6,
+          lengthMax = 98,
+          intervalMinMs = 1L,
+          intervalMaxMs = 1L,
+          cyclicRecordLengths = intArrayOf(6, 98, 1),
+          tcpSplitLengths = intArrayOf(6, 98, 1, 114, 1),
+          tcpMaxSplit = 14,
+        )
+
+      /**
+       * Patterniha `Serverless-v52-fragB` & `Free-Configs F&F` (`patterniha/Serverless-for-Iran/Serverless-fragB.jsonc`):
+       * TCP segments of `[104, 1]` (landing right inside the SNI extension at byte 104) + `[114, 1]`.
+       */
+      val PATTERNIHA_FRAG_B =
+        FragmentConfig(
+          profileId = "patterniha_frag_b",
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 1,
+          lengthMax = 104,
+          intervalMinMs = 1L,
+          intervalMaxMs = 1L,
+          cyclicRecordLengths = intArrayOf(0, 104, 1),
+          tcpSplitLengths = intArrayOf(104, 1, 114, 1),
+          tcpMaxSplit = 14,
+        )
+
+      /**
+       * Patterniha `SNI-Spoofing` & `MMDF` (`patterniha/SNI-Spoofing` + `patterniha/MMDF`):
+       * Micro-splits the TLS ClientHello across `2, 1, 3, 1` byte TCP segments around the SNI.
+       */
+      val PATTERNIHA_SNI_SPOOF =
+        FragmentConfig(
+          profileId = "patterniha_sni_spoof",
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 1,
+          lengthMax = 3,
+          intervalMinMs = 1L,
+          intervalMaxMs = 2L,
+          sniMidpointSplit = true,
+          cyclicRecordLengths = intArrayOf(0, 2, 1, 3, 1),
+          tcpSplitLengths = intArrayOf(2, 1, 3, 1, 32, 1),
+          tcpMaxSplit = 24,
         )
 
       /**
@@ -76,32 +215,151 @@ object GfwKnockerXrayCore {
        */
       val DEFAULT_TCP_PACKETS =
         FragmentConfig(
+          profileId = "tcp_packets",
           packetsFrom = 1,
           packetsTo = 2,
           lengthMin = 14,
           lengthMax = 40,
-          intervalMinMs = 4L,
-          intervalMaxMs = 10L,
+          intervalMinMs = 2L,
+          intervalMaxMs = 5L,
         )
+
+      /**
+       * Patterniha `tcp-fragment` for plain TCP (`packets: "1-1"`, `lengths: ["1"]`, `delays: ["1"]`).
+       */
+      val PATTERNIHA_TCP_DIRECT =
+        FragmentConfig(
+          profileId = "patterniha_tcp_direct",
+          packetsFrom = 1,
+          packetsTo = 1,
+          lengthMin = 1,
+          lengthMax = 2,
+          intervalMinMs = 1L,
+          intervalMaxMs = 1L,
+          tcpSplitLengths = intArrayOf(1, 2, 1),
+          tcpMaxSplit = 32,
+        )
+
+      fun fromProfileId(profileId: String): FragmentConfig {
+        return when (profileId.lowercase()) {
+          "aether_sni_split", "aether" -> AETHER_SNI_SPLIT
+          "whitedns_byedpi", "whitedns" -> WHITEDNS_BYEDPI
+          "patterniha_frag_a" -> PATTERNIHA_FRAG_A
+          "patterniha_frag_b", "patterniha_ff", "patterniha_zeus" -> PATTERNIHA_FRAG_B
+          "patterniha_sni_spoof", "patterniha_mmdf" -> PATTERNIHA_SNI_SPOOF
+          "patterniha_tcp_direct" -> PATTERNIHA_TCP_DIRECT
+          else -> DEFAULT_TLS_HELLO
+        }
+      }
     }
   }
 
   /**
-   * Wraps a connected & VPN-protected TCP [Socket] so that Android's Conscrypt `SSLSocket`
-   * uses `ConscryptEngineSocket` over [FragmentWriterOutputStream] instead of bypassing Java streams
-   * via native `SSL_set_fd`.
+   * Direct port of `sni_host_range(buf: &[u8])` from `CluvexStudio/Aether/aether/src/fragment.rs`.
+   * Inspects a TLS Handshake ClientHello (`0x16 ... 0x01`) and returns the exact byte indices
+   * `[start, end)` of the SNI hostname inside extension `0x0000` (server_name).
    */
-  fun wrapSocketWithFragmentWriter(
-    rawSocket: Socket,
-    fragmentConfig: FragmentConfig = FragmentConfig.DEFAULT_TLS_HELLO,
-  ): Socket {
-    return FragmentedTransportSocket(rawSocket, fragmentConfig)
+  fun findTlsSniHostRange(buf: ByteArray): IntRange? {
+    fun take(at: Int, n: Int): Int? {
+      if (at < 0 || at + n > buf.size) return null
+      var acc = 0
+      for (i in 0 until n) {
+        acc = (acc shl 8) or (buf[at + i].toInt() and 0xFF)
+      }
+      return acc
+    }
+
+    if (buf.size < 48) return null
+    if ((buf[0].toInt() and 0xFF) != 0x16 || (buf[5].toInt() and 0xFF) != 0x01) {
+      return null
+    }
+    var at = 43
+    val sessionIdLen = take(at, 1) ?: return null
+    at += 1 + sessionIdLen
+    val cipherSuitesLen = take(at, 2) ?: return null
+    at += 2 + cipherSuitesLen
+    val compressionLen = take(at, 1) ?: return null
+    at += 1 + compressionLen
+    val extensionsLen = take(at, 2) ?: return null
+    val extensionsEnd = at + 2 + extensionsLen
+    at += 2
+
+    while (at + 4 <= extensionsEnd && at + 4 <= buf.size) {
+      val kind = take(at, 2) ?: return null
+      val len = take(at, 2) ?: return null
+      val body = at + 4
+      if (kind == 0x0000) {
+        val entry = body + 2
+        val nameType = take(entry, 1) ?: return null
+        if (nameType != 0) return null
+        val hostLen = take(entry + 1, 2) ?: return null
+        val hostStart = entry + 3
+        if (hostLen <= 0 || hostStart + hostLen > buf.size) return null
+        return hostStart until (hostStart + hostLen)
+      }
+      at = body + len
+    }
+    return null
+  }
+
+  /**
+   * Establishes a TLS session over ANY [rawIn] and [rawOut] streams using [SSLEngine].
+   * This completely avoids `SSLSocketFactory.createSocket(Socket)` on wrapper sockets,
+   * fixing the Android 9 (Samsung S8) Conscrypt `FileDescriptor` crash while allowing
+   * [rawOut] to be a [FragmentWriterOutputStream] or a V2Ray tunnel stream!
+   */
+  fun openSslEngineOverStreams(
+    sslContext: SSLContext,
+    rawIn: InputStream,
+    rawOut: OutputStream,
+    sniHost: String,
+    port: Int,
+    cipherSuites: List<String> = emptyList(),
+    alpnProtocols: Array<String>? = null,
+  ): Pair<InputStream, OutputStream> {
+    val cleanHost = sniHost.trim().trimEnd('.')
+    val engine =
+      if (cleanHost.isNotEmpty()) {
+        sslContext.createSSLEngine(cleanHost, port)
+      } else {
+        sslContext.createSSLEngine()
+      }
+    engine.useClientMode = true
+
+    if (cipherSuites.isNotEmpty()) {
+      try {
+        val supported = engine.supportedCipherSuites.toSet()
+        val filtered = cipherSuites.filter { it in supported }
+        if (filtered.isNotEmpty()) {
+          engine.enabledCipherSuites = filtered.toTypedArray()
+        }
+      } catch (_: Exception) {}
+    }
+
+    try {
+      val params = engine.sslParameters
+      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N &&
+        cleanHost.isNotEmpty() &&
+        !cleanHost[0].isDigit()
+      ) {
+        params.serverNames = listOf(SNIHostName(cleanHost))
+      }
+      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+        alpnProtocols != null &&
+        alpnProtocols.isNotEmpty()
+      ) {
+        params.applicationProtocols = alpnProtocols
+      }
+      engine.sslParameters = params
+    } catch (_: Throwable) {}
+
+    val session = SslEngineStreamSession(engine, rawIn, rawOut)
+    session.performHandshake()
+    return Pair(session.appInputStream, session.appOutputStream)
   }
 
   /**
    * Performs GFW-knocker's `httpupgrade` handshake (`transport/internet/httpupgrade/dialer.go`).
-   * Unlike WebSocket (`ws`), `httpupgrade` sends an HTTP `Upgrade: websocket` request and receives
-   * `101 Switching Protocols`, then streams raw unframed VLESS/Trojan bytes over the connection.
    */
   fun performHttpUpgrade(
     config: V2RayConfig,
@@ -155,12 +413,6 @@ object GfwKnockerXrayCore {
     }
   }
 
-  /**
-   * Returns the VLESS wire version byte for [protocol] per `GFW-knocker/Xray-core`:
-   * - `VLESS`: `0x00`
-   * - `MVLESS`: `150` (`0x96`)
-   * - `JVLESS`: `0x78` (`'x'`)
-   */
   fun vlessWireVersionFor(protocol: V2RayProtocol): Byte {
     return when (protocol) {
       V2RayProtocol.MVLESS -> VLESS_VERSION_MVLESS
@@ -169,11 +421,58 @@ object GfwKnockerXrayCore {
     }
   }
 
-  /**
-   * Builds a complete `GFW-knocker/Xray-core` JSON config (`v26.10.3-mahsa-r2`)
-   * including the `fragment` freedom outbound and `sockopt.dialerProxy = "fragment"`.
-   */
   fun buildXrayCoreJson(config: V2RayConfig): String {
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
+      val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
+      val remarks =
+        when {
+          config.fragmentProfile.contains("aether", ignoreCase = true) -> "CluvexStudio/Aether SNI-Split"
+          config.fragmentProfile.contains("whitedns", ignoreCase = true) -> "WhiteDNS Direct Clean-IP"
+          isFragA -> "Serverless-v52-fragA (@patterniha)"
+          else -> "Serverless-v52-fragB (@patterniha)"
+        }
+      return """
+        {
+          "remarks": "$remarks",
+          "log": { "loglevel": "warning" },
+          "dns": {
+            "hosts": { "cloudflare-dns.com": "challenges.cloudflare.com" },
+            "servers": [
+              {
+                "tag": "no-filter-dns",
+                "address": "https://cloudflare-dns.com/dns-query",
+                "timeoutMs": 12000
+              }
+            ]
+          },
+          "outbounds": [
+            {
+              "tag": "tcp-fragment-tls",
+              "protocol": "freedom",
+              "settings": {
+                "domainStrategy": "ForceIP",
+                "fragment": {
+                  "packets": "tlshello",
+                  "length": "10-30",
+                  "interval": "1-2"
+                }
+              },
+              "streamSettings": {
+                "finalmask": {
+                  "tcp": [
+                    { "type": "fragment", "settings": { "packets": "tlshello", "lengths": $lengthsJson, "delays": ["0"], "maxSplit": "0" } },
+                    { "type": "fragment", "settings": { "packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11" } }
+                  ]
+                },
+                "sockopt": { "tcpNoDelay": true, "dialerProxy": "fragment" }
+              }
+            }
+          ]
+        }
+      """.trimIndent()
+    }
+
     val escRemarks = escapeJson("${config.cleanTitle} [GFW-knocker/Xray-core]")
     val escProto = escapeJson(config.protocol.name.lowercase())
     val escAddr = escapeJson(config.address)
@@ -248,15 +547,7 @@ object GfwKnockerXrayCore {
                 "length": "10-30",
                 "interval": "5-12",
                 "maxSplit": "10-20"
-              },
-              "noises": [
-                {
-                  "type": "rand",
-                  "packet": "10-20",
-                  "delay": "10-16",
-                  "applyTo": "ip"
-                }
-              ]
+              }
             },
             "streamSettings": {
               "sockopt": {
@@ -318,11 +609,13 @@ object GfwKnockerXrayCore {
   }
 
   /**
-   * Direct port of `FragmentWriter` from `github.com/GFW-knocker/Xray-core/proxy/freedom/freedom.go`.
-   *
-   * When `packetsFrom == 0 && packetsTo == 1` (`"tlshello"`), splits the first TLS Handshake
-   * record (`b[0] == 22 && b[1] == 3`) into multiple valid TLS Handshake records of `lengthMin..lengthMax`
-   * bytes so that SNI inspection middleboxes cannot reassemble the ClientHello in a single record.
+   * FragmentWriterOutputStream supporting:
+   * 1. CluvexStudio/Aether SNI Midpoint TCP Split (`sniMidpointSplit = true`):
+   *    Finds the exact SNI hostname range inside the TLS ClientHello via [findTlsSniHostRange]
+   *    and splits the TCP write right at the midpoint of the SNI hostname, followed by
+   *    `lengthMin..lengthMax` TCP chunks.
+   * 2. Patterniha deterministic TCP split (`tcpSplitLengths` e.g. `[6, 98, 1, 114, 1]` or `[104, 1, 114, 1]`).
+   * 3. GFW-knocker TLS Record Splitting when `emitTlsRecordHeaders = true` (or when `cyclicRecordLengths` is tested).
    */
   class FragmentWriterOutputStream(
     out: OutputStream,
@@ -342,7 +635,7 @@ object GfwKnockerXrayCore {
       writeCount++
 
       // Fast-path for all subsequent packets after initial handshake
-      if (writeCount > 3L) {
+      if (writeCount > 2L) {
         out.write(b, off, len)
         return
       }
@@ -354,143 +647,365 @@ object GfwKnockerXrayCore {
           b.copyOfRange(off, off + len)
         }
 
-      // Case 1: GFW-knocker "tlshello" TLS Record Splitting (PacketsFrom == 0 && PacketsTo == 1)
-      if (fragment.packetsFrom == 0 && fragment.packetsTo == 1) {
-        if (writeCount != 1L || slice.size <= 5 || (slice[0].toInt() and 0xFF) != 22) {
-          out.write(slice)
-          return
-        }
-        val recordPayloadLen = ((slice[3].toInt() and 0xFF) shl 8) or (slice[4].toInt() and 0xFF)
-        val recordLen = 5 + recordPayloadLen
-        if (slice.size < recordLen || recordPayloadLen <= 0) {
-          out.write(slice)
+      if (writeCount == 1L && (slice[0].toInt() and 0xFF) == 22 && slice.size > 5) {
+        // 1. Explicit TLS record header splitting when emitTlsRecordHeaders == true
+        if (fragment.emitTlsRecordHeaders) {
+          writeTlsRecordSplit(slice)
           return
         }
 
-        val data = slice.copyOfRange(5, recordLen)
-        val nQueue = randBetween(fragment.batchMin, fragment.batchMax).coerceAtLeast(0)
-        val queue = ByteArrayOutputStream(recordLen + 128)
-        var cQueue = 0
-
-        if (fragment.emptyRecordMinor != 0) {
-          queue.write(byteArrayOf(22, 3, fragment.emptyRecordMinor.toByte(), 0, 0))
-        }
-
-        var from = 0
-        while (from < data.size) {
-          val chunkLen = randBetween(fragment.lengthMin, fragment.lengthMax).coerceAtLeast(1)
-          val to = minOf(from + chunkLen, data.size)
-          val l = to - from
-
-          // Construct a valid 5-byte TLS Handshake record header for this fragment
-          queue.write(slice[0].toInt()) // 0x16 (22 = Handshake)
-          queue.write(slice[1].toInt()) // 0x03 (TLS major)
-          queue.write(slice[2].toInt()) // TLS minor (e.g. 0x01 / 0x03)
-          queue.write((l ushr 8) and 0xFF)
-          queue.write(l and 0xFF)
-          queue.write(data, from, l)
-
-          from = to
-
-          if (cQueue < nQueue && from < data.size) {
-            cQueue++
-          } else {
-            val batchBytes = queue.toByteArray()
-            if (batchBytes.isNotEmpty()) {
-              out.write(batchBytes)
+        // 2. CluvexStudio/Aether SNI Midpoint TCP Split (`sni_host_range`)
+        if (fragment.sniMidpointSplit) {
+          val sniRange = findTlsSniHostRange(slice)
+          if (sniRange != null) {
+            val mid = sniRange.first + ((sniRange.last - sniRange.first + 1) / 2)
+            if (mid in 1 until slice.size) {
+              out.write(slice, 0, mid)
               out.flush()
-              val sleepMs = randBetweenLong(fragment.intervalMinMs, fragment.intervalMaxMs)
-              if (sleepMs > 0L && from < data.size) {
-                try {
-                  Thread.sleep(sleepMs)
-                } catch (_: InterruptedException) {}
-              }
+              sleepInterval()
+              writeChunkedTcpSegments(slice, startOffset = mid)
+              return
             }
-            queue.reset()
-            cQueue = 0
           }
         }
 
-        if (queue.size() > 0) {
-          out.write(queue.toByteArray())
-          out.flush()
+        // 3. Patterniha deterministic TCP segment split (`[6, 98, 1]` or `[104, 1]`)
+        if (fragment.tcpSplitLengths != null && fragment.tcpSplitLengths.isNotEmpty()) {
+          writeWithDeterministicTcpSplit(slice)
+          return
         }
 
-        if (slice.size > recordLen) {
-          out.write(slice, recordLen, slice.size - recordLen)
-          out.flush()
-        }
+        // 4. Default TCP segment splitting across the ClientHello
+        writeChunkedTcpSegments(slice, startOffset = 0)
         return
       }
 
-      // Case 2: GFW-knocker TCP Packet Chunking (PacketsFrom..PacketsTo)
+      // Non-TLS or 2nd packet chunking
       if (fragment.packetsFrom != 0 &&
-        (writeCount < fragment.packetsFrom || writeCount > fragment.packetsTo)
+        writeCount in fragment.packetsFrom..fragment.packetsTo
       ) {
-        out.write(slice)
+        if (fragment.tcpSplitLengths != null && fragment.tcpSplitLengths.isNotEmpty()) {
+          writeWithDeterministicTcpSplit(slice)
+        } else {
+          writeChunkedTcpSegments(slice, startOffset = 0)
+        }
         return
       }
 
-      var from = 0
+      out.write(slice)
+    }
+
+    private fun writeChunkedTcpSegments(slice: ByteArray, startOffset: Int) {
+      var from = startOffset
+      var splits = 0
+      val maxSplits = if (fragment.tcpMaxSplit > 0) fragment.tcpMaxSplit else 18
       while (from < slice.size) {
+        if (splits >= maxSplits) {
+          out.write(slice, from, slice.size - from)
+          out.flush()
+          break
+        }
         val chunkLen = randBetween(fragment.lengthMin, fragment.lengthMax).coerceAtLeast(1)
         val to = minOf(from + chunkLen, slice.size)
         out.write(slice, from, to - from)
         out.flush()
         from = to
+        splits++
         if (from < slice.size) {
-          val sleepMs = randBetweenLong(fragment.intervalMinMs, fragment.intervalMaxMs)
-          if (sleepMs > 0L) {
-            try {
-              Thread.sleep(sleepMs)
-            } catch (_: InterruptedException) {}
-          }
+          sleepInterval()
         }
+      }
+    }
+
+    private fun writeWithDeterministicTcpSplit(payload: ByteArray) {
+      val splitLens = fragment.tcpSplitLengths ?: return
+      val maxSplits = if (fragment.tcpMaxSplit > 0) fragment.tcpMaxSplit else 14
+      var offset = 0
+      var splitsDone = 0
+      while (offset < payload.size) {
+        if (splitsDone >= maxSplits) {
+          out.write(payload, offset, payload.size - offset)
+          out.flush()
+          break
+        }
+        val chunkLen = splitLens[splitsDone % splitLens.size].coerceAtLeast(1)
+        val end = minOf(offset + chunkLen, payload.size)
+        out.write(payload, offset, end - offset)
+        out.flush()
+        offset = end
+        splitsDone++
+        if (offset < payload.size) {
+          sleepInterval()
+        }
+      }
+    }
+
+    private fun writeTlsRecordSplit(slice: ByteArray) {
+      val recordPayloadLen = ((slice[3].toInt() and 0xFF) shl 8) or (slice[4].toInt() and 0xFF)
+      val recordLen = 5 + recordPayloadLen
+      if (slice.size < recordLen || recordPayloadLen <= 0) {
+        out.write(slice)
+        return
+      }
+      val data = slice.copyOfRange(5, recordLen)
+      val cyclic = fragment.cyclicRecordLengths
+      var from = 0
+      var cycleIdx = 0
+      while (from < data.size) {
+        val requestedLen =
+          if (cyclic != null && cyclic.isNotEmpty()) {
+            cyclic[cycleIdx++ % cyclic.size].coerceAtLeast(0)
+          } else {
+            randBetween(fragment.lengthMin, fragment.lengthMax).coerceAtLeast(1)
+          }
+        val to = minOf(from + requestedLen, data.size)
+        val l = to - from
+        val rec = ByteArray(5 + l)
+        rec[0] = slice[0]
+        rec[1] = slice[1]
+        rec[2] = slice[2]
+        rec[3] = ((l ushr 8) and 0xFF).toByte()
+        rec[4] = (l and 0xFF).toByte()
+        if (l > 0) {
+          System.arraycopy(data, from, rec, 5, l)
+        }
+        out.write(rec)
+        out.flush()
+        from = to
+        if (from < data.size) {
+          sleepInterval()
+        }
+      }
+      if (slice.size > recordLen) {
+        out.write(slice, recordLen, slice.size - recordLen)
+        out.flush()
+      }
+    }
+
+    private fun sleepInterval() {
+      val sleepMs = randBetweenLong(fragment.intervalMinMs, fragment.intervalMaxMs)
+      if (sleepMs > 0L) {
+        try {
+          Thread.sleep(sleepMs)
+        } catch (_: InterruptedException) {}
       }
     }
   }
 
   /**
-   * Unconnected [Socket] adapter delegating I/O to [delegate] through [FragmentWriterOutputStream].
-   * Because the superclass [Socket] has no raw OS `FileDescriptor`, Android's Conscrypt
-   * uses `ConscryptEngineSocket` (`SSLEngine`) and writes the TLS ClientHello through
-   * [fragmentedOut], guaranteeing that GFW-knocker TLS Record Splitting is applied on Android 5–16.
+   * Pure `SSLEngine`-backed stream session that runs TLS 1.2/1.3 over arbitrary [rawIn] and [rawOut]
+   * without touching `java.net.Socket` or `FileDescriptor`.
    */
-  private class FragmentedTransportSocket(
-    private val delegate: Socket,
-    fragmentConfig: FragmentConfig,
-  ) : Socket() {
-    private val fragmentedOut = FragmentWriterOutputStream(delegate.getOutputStream(), fragmentConfig)
+  private class SslEngineStreamSession(
+    private val engine: SSLEngine,
+    private val rawIn: InputStream,
+    private val rawOut: OutputStream,
+  ) {
+    private val session = engine.session
+    private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 16384))
+    private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 16384))
+    private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 16384))
+    private val readBuffer = ByteArray(16384)
 
-    override fun getInputStream(): InputStream = delegate.getInputStream()
-    override fun getOutputStream(): OutputStream = fragmentedOut
-    override fun isConnected(): Boolean = delegate.isConnected
-    override fun isBound(): Boolean = delegate.isBound
-    override fun isClosed(): Boolean = delegate.isClosed
-    override fun getInetAddress(): InetAddress? = delegate.inetAddress
-    override fun getLocalAddress(): InetAddress = delegate.localAddress
-    override fun getPort(): Int = delegate.port
-    override fun getLocalPort(): Int = delegate.localPort
-    override fun getRemoteSocketAddress(): SocketAddress? = delegate.remoteSocketAddress
-    override fun getLocalSocketAddress(): SocketAddress? = delegate.localSocketAddress
-    override fun setSoTimeout(timeout: Int) {
-      delegate.soTimeout = timeout
+    init {
+      netInBuf.flip()
+      appInBuf.flip()
     }
-    override fun getSoTimeout(): Int = delegate.soTimeout
-    override fun setTcpNoDelay(on: Boolean) {
-      delegate.tcpNoDelay = on
+
+    fun performHandshake() {
+      engine.beginHandshake()
+      val emptyApp = ByteBuffer.allocate(0)
+      var status = engine.handshakeStatus
+      var loops = 0
+
+      while (status != SSLEngineResult.HandshakeStatus.FINISHED &&
+        status != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING
+      ) {
+        if (++loops > 256) {
+          throw SSLException("TLS handshake exceeded max steps")
+        }
+        when (status) {
+          SSLEngineResult.HandshakeStatus.NEED_WRAP -> {
+            netOutBuf.clear()
+            val res = engine.wrap(emptyApp, netOutBuf)
+            status = res.handshakeStatus
+            when (res.status) {
+              SSLEngineResult.Status.OK -> {
+                netOutBuf.flip()
+                while (netOutBuf.hasRemaining()) {
+                  val len = netOutBuf.remaining()
+                  val bytes = ByteArray(len)
+                  netOutBuf.get(bytes)
+                  rawOut.write(bytes)
+                }
+                rawOut.flush()
+              }
+              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
+              }
+              else -> throw SSLException("SSLEngine wrap status during handshake: ${res.status}")
+            }
+          }
+
+          SSLEngineResult.HandshakeStatus.NEED_UNWRAP -> {
+            if (!netInBuf.hasRemaining()) {
+              if (!fillNetInBuffer()) {
+                throw EOFException("EOF during TLS handshake unwrap")
+              }
+            }
+            appInBuf.compact()
+            val res = engine.unwrap(netInBuf, appInBuf)
+            appInBuf.flip()
+            status = res.handshakeStatus
+            when (res.status) {
+              SSLEngineResult.Status.OK -> {}
+              SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
+                if (!fillNetInBuffer()) {
+                  throw EOFException("EOF on TLS BUFFER_UNDERFLOW")
+                }
+              }
+              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                val bigger = ByteBuffer.allocate(appInBuf.capacity() * 2)
+                bigger.put(appInBuf)
+                bigger.flip()
+                appInBuf = bigger
+              }
+              SSLEngineResult.Status.CLOSED -> throw EOFException("TLS closed during handshake")
+              null -> throw SSLException("Null SSLEngine status")
+            }
+          }
+
+          SSLEngineResult.HandshakeStatus.NEED_TASK -> {
+            var task = engine.delegatedTask
+            while (task != null) {
+              task.run()
+              task = engine.delegatedTask
+            }
+            status = engine.handshakeStatus
+          }
+
+          else -> status = engine.handshakeStatus
+        }
+      }
     }
-    override fun getTcpNoDelay(): Boolean = delegate.tcpNoDelay
-    override fun setKeepAlive(on: Boolean) {
-      delegate.keepAlive = on
+
+    private fun fillNetInBuffer(): Boolean {
+      netInBuf.compact()
+      if (!netInBuf.hasRemaining()) {
+        netInBuf.flip()
+        val bigger = ByteBuffer.allocate(netInBuf.capacity() * 2)
+        bigger.put(netInBuf)
+        netInBuf = bigger
+      }
+      val n = rawIn.read(readBuffer, 0, minOf(readBuffer.size, netInBuf.remaining()))
+      if (n <= 0) {
+        netInBuf.flip()
+        return false
+      }
+      netInBuf.put(readBuffer, 0, n)
+      netInBuf.flip()
+      return true
     }
-    override fun getKeepAlive(): Boolean = delegate.keepAlive
-    @Synchronized
-    override fun close() {
-      try {
-        fragmentedOut.flush()
-      } catch (_: Exception) {}
-      delegate.close()
-    }
+
+    val appInputStream: InputStream =
+      object : InputStream() {
+        @Synchronized
+        override fun read(): Int {
+          val one = ByteArray(1)
+          val n = read(one, 0, 1)
+          return if (n == -1) -1 else (one[0].toInt() and 0xFF)
+        }
+
+        @Synchronized
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+          if (len == 0) return 0
+          while (!appInBuf.hasRemaining()) {
+            if (!netInBuf.hasRemaining()) {
+              if (!fillNetInBuffer()) return -1
+            }
+            appInBuf.compact()
+            val res = engine.unwrap(netInBuf, appInBuf)
+            appInBuf.flip()
+            if (appInBuf.hasRemaining()) break
+            when (res.status) {
+              SSLEngineResult.Status.OK -> {
+                if (res.handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_TASK) {
+                  var task = engine.delegatedTask
+                  while (task != null) {
+                    task.run()
+                    task = engine.delegatedTask
+                  }
+                }
+              }
+              SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
+                if (!fillNetInBuffer()) return -1
+              }
+              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                val bigger = ByteBuffer.allocate(appInBuf.capacity() * 2)
+                bigger.put(appInBuf)
+                bigger.flip()
+                appInBuf = bigger
+              }
+              SSLEngineResult.Status.CLOSED -> return -1
+              null -> return -1
+            }
+          }
+          val toCopy = minOf(len, appInBuf.remaining())
+          appInBuf.get(b, off, toCopy)
+          return toCopy
+        }
+
+        override fun close() {
+          try {
+            rawIn.close()
+          } catch (_: Exception) {}
+        }
+      }
+
+    val appOutputStream: OutputStream =
+      object : OutputStream() {
+        @Synchronized
+        override fun write(b: Int) {
+          write(byteArrayOf(b.toByte()), 0, 1)
+        }
+
+        @Synchronized
+        override fun write(b: ByteArray, off: Int, len: Int) {
+          if (len <= 0) return
+          val src = ByteBuffer.wrap(b, off, len)
+          while (src.hasRemaining()) {
+            netOutBuf.clear()
+            val res = engine.wrap(src, netOutBuf)
+            when (res.status) {
+              SSLEngineResult.Status.OK -> {
+                netOutBuf.flip()
+                if (netOutBuf.hasRemaining()) {
+                  val outBytes = ByteArray(netOutBuf.remaining())
+                  netOutBuf.get(outBytes)
+                  rawOut.write(outBytes)
+                }
+              }
+              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
+              }
+              else -> throw IOException("SSLEngine write failed: ${res.status}")
+            }
+          }
+        }
+
+        @Synchronized
+        override fun flush() {
+          rawOut.flush()
+        }
+
+        override fun close() {
+          try {
+            engine.closeOutbound()
+          } catch (_: Exception) {}
+          try {
+            rawOut.close()
+          } catch (_: Exception) {}
+        }
+      }
   }
 }

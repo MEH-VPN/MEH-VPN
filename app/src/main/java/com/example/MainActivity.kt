@@ -3,6 +3,7 @@ package com.example
 import android.app.Activity
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -31,6 +32,7 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -43,13 +45,25 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PowerSettingsNew
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
@@ -72,16 +86,22 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.data.MehConnectionMethod
 import com.example.telemetry.MehTelemetry
 import com.example.ui.MehPhase
 import com.example.ui.MehUiState
 import com.example.ui.MehViewModel
+import com.example.ui.MethodItemState
+import com.example.ui.MethodRunStatus
 import com.example.ui.theme.AmberPulse
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.CyberCyan
@@ -127,16 +147,31 @@ class MainActivity : ComponentActivity() {
               },
             )
           },
+          onOpenMethodsSheet = { mehViewModel.openMethodSheet() },
+          onCloseMethodsSheet = { mehViewModel.closeMethodSheet() },
+          onSelectMethod = { method ->
+            mehViewModel.testAndConnectSingleMethod(
+              context = context,
+              method = method,
+              onRequestVpnPermission = { prepareIntent ->
+                vpnPermissionLauncher.launch(prepareIntent)
+              },
+            )
+          },
         )
       }
     }
   }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MehMinimalScreen(
   uiState: MehUiState,
   onPowerToggle: () -> Unit,
+  onOpenMethodsSheet: () -> Unit = {},
+  onCloseMethodsSheet: () -> Unit = {},
+  onSelectMethod: (MehConnectionMethod) -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor by
@@ -153,6 +188,10 @@ fun MehMinimalScreen(
       animationSpec = tween(durationMillis = 450),
       label = "accentColor",
     )
+
+  if (uiState.isMethodSheetOpen) {
+    BackHandler { onCloseMethodsSheet() }
+  }
 
   Scaffold(
     modifier = modifier.fillMaxSize(),
@@ -171,11 +210,10 @@ fun MehMinimalScreen(
                 ),
             )
           )
-          .padding(innerPadding)
-          .windowInsetsPadding(WindowInsets.safeDrawing),
+          .padding(innerPadding),
       contentAlignment = Alignment.Center,
     ) {
-      // Center column: strictly the circular power button and the single live status log line below it
+      // Center column: circular power button, single live status log line, and prominent troubleshooting button below
       Column(
         modifier =
           Modifier.fillMaxWidth()
@@ -190,12 +228,314 @@ fun MehMinimalScreen(
           onClick = onPowerToggle,
         )
 
-        Spacer(modifier = Modifier.height(44.dp))
+        Spacer(modifier = Modifier.height(32.dp))
 
         SingleLineLiveLog(
           logText = uiState.liveLogLine,
           phase = uiState.phase,
           accentColor = accentColor,
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        TroubleshootMethodsLink(
+          onClick = onOpenMethodsSheet,
+        )
+      }
+    }
+
+    if (uiState.isMethodSheetOpen) {
+      val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+      ModalBottomSheet(
+        onDismissRequest = onCloseMethodsSheet,
+        sheetState = sheetState,
+        containerColor = ObsidianSurface,
+        contentColor = TextPrimary,
+      ) {
+        MethodsSelectionSheetContent(
+          uiState = uiState,
+          onSelectMethod = onSelectMethod,
+        )
+      }
+    }
+  }
+}
+
+@Composable
+private fun TroubleshootMethodsLink(
+  onClick: () -> Unit,
+) {
+  val linkText = stringResource(R.string.troubleshoot_link_title)
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Surface(
+      modifier =
+        Modifier.clip(RoundedCornerShape(28.dp))
+          .border(
+            width = 1.2.dp,
+            color = CyberCyan.copy(alpha = 0.65f),
+            shape = RoundedCornerShape(28.dp),
+          )
+          .clickable(
+            role = Role.Button,
+            onClick = onClick,
+          )
+          .testTag("troubleshoot_methods_link"),
+      color = ObsidianElevated,
+      shape = RoundedCornerShape(28.dp),
+    ) {
+      Row(
+        modifier = Modifier.padding(horizontal = 22.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+      ) {
+        Icon(
+          imageVector = Icons.Rounded.Tune,
+          contentDescription = null,
+          tint = CyberCyan,
+          modifier = Modifier.size(18.dp),
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(
+          text = linkText,
+          style = MaterialTheme.typography.bodyMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = FontWeight.Bold,
+          color = TextPrimary,
+          textDecoration = TextDecoration.Underline,
+          textAlign = TextAlign.Center,
+        )
+      }
+    }
+  }
+}
+
+@Composable
+private fun MethodsSelectionSheetContent(
+  uiState: MehUiState,
+  onSelectMethod: (MehConnectionMethod) -> Unit,
+) {
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Column(
+      modifier =
+        Modifier.fillMaxWidth()
+          .widthIn(max = 560.dp)
+          .padding(horizontal = 20.dp)
+          .padding(bottom = 28.dp)
+          .testTag("methods_bottom_sheet"),
+    ) {
+      Text(
+        text = stringResource(R.string.methods_sheet_title),
+        style = MaterialTheme.typography.titleMedium,
+        fontFamily = VazirmatnFontFamily,
+        fontWeight = FontWeight.Bold,
+        color = TextPrimary,
+        modifier = Modifier.fillMaxWidth(),
+      )
+
+      Spacer(modifier = Modifier.height(4.dp))
+
+      Text(
+        text = stringResource(R.string.methods_sheet_subtitle),
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = VazirmatnFontFamily,
+        color = TextSecondary,
+        modifier = Modifier.fillMaxWidth(),
+      )
+
+      if (uiState.liveLogLine.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(10.dp))
+        Box(
+          modifier =
+            Modifier.fillMaxWidth()
+              .clip(RoundedCornerShape(10.dp))
+              .background(ObsidianBackground)
+              .padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+          Text(
+            text = uiState.liveLogLine,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = VazirmatnFontFamily,
+            fontWeight = FontWeight.Medium,
+            color =
+              when (uiState.phase) {
+                MehPhase.CONNECTED -> NeonEmeraldGlow
+                MehPhase.ERROR -> CrimsonAlert
+                else -> CyberCyan
+              },
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+        }
+      }
+
+      Spacer(modifier = Modifier.height(14.dp))
+
+      LazyColumn(
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = 12.dp),
+      ) {
+        items(
+          items = MehConnectionMethod.entries,
+          key = { it.id },
+        ) { method ->
+          val itemState =
+            uiState.methodStates[method] ?: MethodItemState(method = method)
+          val isCurrentActive =
+            uiState.activeMethod == method &&
+              (uiState.phase == MehPhase.CONNECTED || uiState.isBusy)
+
+          MethodTestRowCard(
+            method = method,
+            itemState = itemState,
+            isActive = isCurrentActive,
+            onClick = { onSelectMethod(method) },
+          )
+        }
+      }
+    }
+  }
+}
+
+@Composable
+private fun MethodTestRowCard(
+  method: MehConnectionMethod,
+  itemState: MethodItemState,
+  isActive: Boolean,
+  onClick: () -> Unit,
+) {
+  val borderColor =
+    when (itemState.status) {
+      MethodRunStatus.CONNECTED -> NeonEmerald
+      MethodRunStatus.TESTING -> CyberCyan
+      MethodRunStatus.FAILED -> CrimsonAlert.copy(alpha = 0.65f)
+      MethodRunStatus.IDLE -> if (isActive) CyberCyan.copy(alpha = 0.6f) else TextMuted.copy(alpha = 0.25f)
+    }
+
+  val statusColor =
+    when (itemState.status) {
+      MethodRunStatus.CONNECTED -> NeonEmeraldGlow
+      MethodRunStatus.TESTING -> AmberPulse
+      MethodRunStatus.FAILED -> CrimsonAlert
+      MethodRunStatus.IDLE -> CyberCyan
+    }
+
+  Surface(
+    modifier =
+      Modifier.fillMaxWidth()
+        .clip(RoundedCornerShape(16.dp))
+        .border(
+          width = if (itemState.status == MethodRunStatus.CONNECTED || itemState.status == MethodRunStatus.TESTING) 1.5.dp else 1.dp,
+          color = borderColor,
+          shape = RoundedCornerShape(16.dp),
+        )
+        .clickable(
+          role = Role.Button,
+          onClick = onClick,
+        )
+        .testTag("method_card_${method.id}"),
+    color = ObsidianElevated,
+    shape = RoundedCornerShape(16.dp),
+  ) {
+    Row(
+      modifier =
+        Modifier.fillMaxWidth()
+          .padding(horizontal = 16.dp, vertical = 14.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+      Column(
+        modifier = Modifier.weight(1f),
+      ) {
+        Row(
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Text(
+            text = method.titleFa,
+            style = MaterialTheme.typography.bodyLarge,
+            fontFamily = VazirmatnFontFamily,
+            fontWeight = FontWeight.Bold,
+            color = TextPrimary,
+          )
+          Spacer(modifier = Modifier.width(8.dp))
+          Box(
+            modifier =
+              Modifier.clip(RoundedCornerShape(6.dp))
+                .background(CyberCyan.copy(alpha = 0.14f))
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+          ) {
+            Text(
+              text = method.badgeLabel,
+              fontSize = 10.sp,
+              fontFamily = VazirmatnFontFamily,
+              fontWeight = FontWeight.Medium,
+              color = CyberCyan,
+            )
+          }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+          text = method.subtitleFa,
+          style = MaterialTheme.typography.bodySmall,
+          fontFamily = VazirmatnFontFamily,
+          color = TextSecondary,
+          maxLines = 2,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+
+      Spacer(modifier = Modifier.width(12.dp))
+
+      Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier =
+          Modifier.clip(RoundedCornerShape(12.dp))
+            .background(statusColor.copy(alpha = 0.12f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+      ) {
+        when (itemState.status) {
+          MethodRunStatus.TESTING -> {
+            CircularProgressIndicator(
+              modifier = Modifier.size(14.dp),
+              strokeWidth = 2.dp,
+              color = statusColor,
+            )
+          }
+          MethodRunStatus.CONNECTED -> {
+            Icon(
+              imageVector = Icons.Rounded.CheckCircle,
+              contentDescription = null,
+              tint = statusColor,
+              modifier = Modifier.size(15.dp),
+            )
+          }
+          MethodRunStatus.FAILED -> {
+            Icon(
+              imageVector = Icons.Rounded.ErrorOutline,
+              contentDescription = null,
+              tint = statusColor,
+              modifier = Modifier.size(15.dp),
+            )
+          }
+          MethodRunStatus.IDLE -> {
+            Icon(
+              imageVector = Icons.Rounded.PlayArrow,
+              contentDescription = null,
+              tint = statusColor,
+              modifier = Modifier.size(15.dp),
+            )
+          }
+        }
+
+        Spacer(modifier = Modifier.width(6.dp))
+
+        Text(
+          text = itemState.statusTextFa,
+          style = MaterialTheme.typography.labelMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = FontWeight.Medium,
+          color = statusColor,
         )
       }
     }

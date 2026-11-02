@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.MehConnectionMethod
 import com.example.data.SoliSpiritRepository
 import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
@@ -28,10 +29,28 @@ enum class MehPhase {
   ERROR,
 }
 
+enum class MethodRunStatus {
+  IDLE,
+  TESTING,
+  CONNECTED,
+  FAILED,
+}
+
+data class MethodItemState(
+  val method: MehConnectionMethod,
+  val status: MethodRunStatus = MethodRunStatus.IDLE,
+  val statusTextFa: String = "تست و اتصال",
+  val latencyMs: Long? = null,
+)
+
 data class MehUiState(
   val phase: MehPhase = MehPhase.DISCONNECTED,
   val liveLogLine: String = "",
   val selectedConfig: V2RayConfig? = null,
+  val activeMethod: MehConnectionMethod? = null,
+  val isMethodSheetOpen: Boolean = false,
+  val methodStates: Map<MehConnectionMethod, MethodItemState> =
+    MehConnectionMethod.entries.associateWith { MethodItemState(method = it) },
 ) {
   val isBusy: Boolean
     get() =
@@ -58,6 +77,7 @@ class MehViewModel(
 
   private var workflowJob: Job? = null
   private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
+  private var pendingMethodForPermission: MehConnectionMethod? = null
 
   init {
     viewModelScope.launch {
@@ -86,11 +106,20 @@ class MehViewModel(
               phase = MehPhase.DISCONNECTED,
               liveLogLine = "",
               selectedConfig = null,
+              activeMethod = null,
             )
           }
         }
       }
     }
+  }
+
+  fun openMethodSheet() {
+    _uiState.update { it.copy(isMethodSheetOpen = true) }
+  }
+
+  fun closeMethodSheet() {
+    _uiState.update { it.copy(isMethodSheetOpen = false) }
   }
 
   fun onPowerButtonClicked(
@@ -105,6 +134,16 @@ class MehViewModel(
     }
   }
 
+  /**
+   * Automatic sequential connection pipeline:
+   * 1. First tries standard V2Ray (`SoliSpirit/v2ray-configs` + `GFW-knocker/Xray-core`).
+   * 2. If V2Ray fails, automatically falls back through all `patterniha` methods in order:
+   *    - `PATTERNIHA_FREE_CONFIGS` (`patterniha/Free-Configs` F&F)
+   *    - `PATTERNIHA_ZEUS` (`patterniha/Z-E-U-S` clean Cloudflare IP)
+   *    - `PATTERNIHA_SERVERLESS_FRAG_A` (`patterniha/Serverless-for-Iran` Frag-A)
+   *    - `PATTERNIHA_SERVERLESS_FRAG_B` (`patterniha/Serverless-for-Iran` Frag-B)
+   *    - `PATTERNIHA_SNI_SPOOFING_MMDF` (`patterniha/SNI-Spoofing` & `MMDF`)
+   */
   private fun startAutoConnectPipeline(
     context: Context,
     onRequestVpnPermission: (Intent) -> Unit,
@@ -121,15 +160,101 @@ class MehViewModel(
               phase = MehPhase.FETCHING_CONFIGS,
               liveLogLine = LOG_FETCHING,
               selectedConfig = null,
+              activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
             )
           }
 
-          val configs = repository.fetchConfigsFromSoliSpirit { _ -> }
+          val orderedMethods = MehConnectionMethod.entries
+          var winningCandidates: List<V2RayConfig> = emptyList()
+          var winningMethod: MehConnectionMethod = MehConnectionMethod.V2RAY_SOLISPIRIT
 
-          if (configs.isEmpty()) {
+          for ((index, method) in orderedMethods.withIndex()) {
+            updateMethodState(
+              method = method,
+              status = MethodRunStatus.TESTING,
+              statusTextFa = "در حال تست...",
+              latencyMs = null,
+            )
+
+            if (index == 0) {
+              // Primary V2Ray method preserves exact LOG_FETCHING -> LOG_TESTING logs
+              val configs = repository.fetchConfigsFromSoliSpirit { _ -> }
+              if (configs.isNotEmpty()) {
+                MehTelemetry.logConfigsFetched(configs.size)
+                _uiState.update {
+                  it.copy(
+                    phase = MehPhase.TESTING_SPEED,
+                    liveLogLine = LOG_TESTING,
+                  )
+                }
+                delay(150L)
+                val verified =
+                  repository.testAndSelectFastestCandidates(
+                    configs = configs,
+                    maxCount = 6,
+                  ) { _ -> }
+                if (verified.isNotEmpty()) {
+                  winningCandidates = verified
+                  winningMethod = method
+                  val ping = verified.first().latencyMs
+                  updateMethodState(
+                    method = method,
+                    status = MethodRunStatus.CONNECTED,
+                    statusTextFa = "آماده اتصال (${ping}ms)",
+                    latencyMs = ping,
+                  )
+                  break
+                }
+              }
+              updateMethodState(
+                method = method,
+                status = MethodRunStatus.FAILED,
+                statusTextFa = "عدم پاسخ - رفتن به روش بعدی",
+                latencyMs = null,
+              )
+            } else {
+              // Sequential fallback through Patterniha methods
+              _uiState.update {
+                it.copy(
+                  phase = MehPhase.TESTING_SPEED,
+                  activeMethod = method,
+                  liveLogLine = "تست ${method.titleFa}",
+                )
+              }
+              val candidates =
+                repository.executeMethodAndSelectCandidates(
+                  method = method,
+                  maxCount = 6,
+                  onLogUpdate = { log ->
+                    _uiState.update { state -> state.copy(liveLogLine = log) }
+                  },
+                )
+              if (candidates.isNotEmpty()) {
+                winningCandidates = candidates
+                winningMethod = method
+                val ping = candidates.first().latencyMs
+                updateMethodState(
+                  method = method,
+                  status = MethodRunStatus.CONNECTED,
+                  statusTextFa = "آماده اتصال (${ping}ms)",
+                  latencyMs = ping,
+                )
+                break
+              } else {
+                updateMethodState(
+                  method = method,
+                  status = MethodRunStatus.FAILED,
+                  statusTextFa = "عدم پاسخ - تست مجدد",
+                  latencyMs = null,
+                )
+              }
+            }
+          }
+
+          if (winningCandidates.isEmpty()) {
             MehTelemetry.logError(
-              stage = "fetch_configs",
-              errorMessage = "Empty config list returned from SoliSpirit/v2ray-configs",
+              stage = "auto_fallback_pipeline",
+              errorMessage = "All connection methods failed to find a responsive candidate",
             )
             _uiState.update {
               it.copy(
@@ -140,55 +265,12 @@ class MehViewModel(
             return@launch
           }
 
-          MehTelemetry.logConfigsFetched(configs.size)
-
-          // Stage 2: تست سرور ها
-          _uiState.update {
-            it.copy(
-              phase = MehPhase.TESTING_SPEED,
-              liveLogLine = LOG_TESTING,
-            )
-          }
-          delay(200L)
-
-          val verifiedCandidates =
-            repository.testAndSelectFastestCandidates(
-              configs = configs,
-              maxCount = 6,
-            ) { _ -> }
-
-          if (verifiedCandidates.isEmpty()) {
-            MehTelemetry.logError(
-              stage = "speed_test",
-              errorMessage = "No responsive V2Ray server found among ${configs.size} configs",
-            )
-            _uiState.update {
-              it.copy(
-                phase = MehPhase.ERROR,
-                liveLogLine = "",
-              )
-            }
-            return@launch
-          }
-
-          val prepareIntent =
-            try {
-              android.net.VpnService.prepare(context)
-            } catch (e: Exception) {
-              MehTelemetry.logError(
-                stage = "vpn_prepare",
-                errorMessage = e.localizedMessage ?: "VpnService.prepare failed",
-                throwable = e,
-              )
-              null
-            }
-
-          if (prepareIntent != null) {
-            pendingCandidatesForPermission = verifiedCandidates
-            onRequestVpnPermission(prepareIntent)
-          } else {
-            launchVpnService(context, verifiedCandidates)
-          }
+          prepareAndStartVpn(
+            context = context,
+            method = winningMethod,
+            candidates = winningCandidates,
+            onRequestVpnPermission = onRequestVpnPermission,
+          )
         } catch (ce: CancellationException) {
           throw ce
         } catch (e: Exception) {
@@ -207,12 +289,166 @@ class MehViewModel(
       }
   }
 
+  /**
+   * Called when the user clicks on a specific method inside the "اگه وصل نشدید اینجا کلیک کنید" sheet
+   * to test and connect with that individual method.
+   */
+  fun testAndConnectSingleMethod(
+    context: Context,
+    method: MehConnectionMethod,
+    onRequestVpnPermission: (Intent) -> Unit,
+  ) {
+    workflowJob?.cancel()
+    workflowJob =
+      viewModelScope.launch {
+        try {
+          MehTelemetry.logConnectAttempt()
+
+          // Reset any previously connected method badge to IDLE while testing the chosen method
+          _uiState.update { current ->
+            val updatedMap = current.methodStates.toMutableMap()
+            updatedMap.forEach { (k, v) ->
+              if (k != method && v.status == MethodRunStatus.CONNECTED) {
+                updatedMap[k] = v.copy(status = MethodRunStatus.IDLE, statusTextFa = "تست و اتصال")
+              }
+            }
+            updatedMap[method] =
+              MethodItemState(
+                method = method,
+                status = MethodRunStatus.TESTING,
+                statusTextFa = "در حال دریافت و تست...",
+                latencyMs = null,
+              )
+            current.copy(
+              phase = MehPhase.FETCHING_CONFIGS,
+              activeMethod = method,
+              liveLogLine =
+                if (method == MehConnectionMethod.V2RAY_SOLISPIRIT) {
+                  LOG_FETCHING
+                } else {
+                  "تست ${method.titleFa}"
+                },
+              methodStates = updatedMap,
+            )
+          }
+
+          val candidates =
+            repository.executeMethodAndSelectCandidates(
+              method = method,
+              maxCount = 6,
+              onLogUpdate = { logMsg ->
+                _uiState.update { state ->
+                  state.copy(
+                    phase = MehPhase.TESTING_SPEED,
+                    liveLogLine = logMsg,
+                  )
+                }
+              },
+            )
+
+          if (candidates.isEmpty()) {
+            updateMethodState(
+              method = method,
+              status = MethodRunStatus.FAILED,
+              statusTextFa = "ناموفق - دوباره امتحان کنید",
+              latencyMs = null,
+            )
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.ERROR,
+                liveLogLine = "",
+              )
+            }
+            return@launch
+          }
+
+          val bestPing = candidates.first().latencyMs
+          updateMethodState(
+            method = method,
+            status = MethodRunStatus.CONNECTED,
+            statusTextFa = "متصل (${bestPing}ms)",
+            latencyMs = bestPing,
+          )
+
+          prepareAndStartVpn(
+            context = context,
+            method = method,
+            candidates = candidates,
+            onRequestVpnPermission = onRequestVpnPermission,
+          )
+        } catch (ce: CancellationException) {
+          throw ce
+        } catch (e: Exception) {
+          updateMethodState(
+            method = method,
+            status = MethodRunStatus.FAILED,
+            statusTextFa = "خطا در تست روش",
+            latencyMs = null,
+          )
+          _uiState.update {
+            it.copy(
+              phase = MehPhase.ERROR,
+              liveLogLine = "",
+            )
+          }
+        }
+      }
+  }
+
+  private fun updateMethodState(
+    method: MehConnectionMethod,
+    status: MethodRunStatus,
+    statusTextFa: String,
+    latencyMs: Long?,
+  ) {
+    _uiState.update { current ->
+      val updated = current.methodStates.toMutableMap()
+      updated[method] =
+        MethodItemState(
+          method = method,
+          status = status,
+          statusTextFa = statusTextFa,
+          latencyMs = latencyMs,
+        )
+      current.copy(methodStates = updated)
+    }
+  }
+
+  private fun prepareAndStartVpn(
+    context: Context,
+    method: MehConnectionMethod,
+    candidates: List<V2RayConfig>,
+    onRequestVpnPermission: (Intent) -> Unit,
+  ) {
+    val prepareIntent =
+      try {
+        android.net.VpnService.prepare(context)
+      } catch (e: Exception) {
+        MehTelemetry.logError(
+          stage = "vpn_prepare",
+          errorMessage = e.localizedMessage ?: "VpnService.prepare failed",
+          throwable = e,
+        )
+        null
+      }
+
+    if (prepareIntent != null) {
+      pendingCandidatesForPermission = candidates
+      pendingMethodForPermission = method
+      onRequestVpnPermission(prepareIntent)
+    } else {
+      launchVpnService(context, method, candidates)
+    }
+  }
+
   fun onVpnPermissionResult(context: Context, granted: Boolean) {
     val candidates = pendingCandidatesForPermission
+    val method = pendingMethodForPermission ?: MehConnectionMethod.V2RAY_SOLISPIRIT
     pendingCandidatesForPermission = emptyList()
+    pendingMethodForPermission = null
 
     if (granted && candidates.isNotEmpty()) {
-      launchVpnService(context, candidates)
+      launchVpnService(context, method, candidates)
     } else {
       MehTelemetry.logError(
         stage = "vpn_permission",
@@ -227,7 +463,11 @@ class MehViewModel(
     }
   }
 
-  private fun launchVpnService(context: Context, candidates: List<V2RayConfig>) {
+  private fun launchVpnService(
+    context: Context,
+    method: MehConnectionMethod,
+    candidates: List<V2RayConfig>,
+  ) {
     val config = candidates.first()
     val intent =
       Intent(context, MehVpnService::class.java).apply {
@@ -262,8 +502,15 @@ class MehViewModel(
     }
 
     MehTelemetry.logServerConnected(
-      protocol = config.protocol.label,
+      protocol = "${method.badgeLabel}:${config.protocol.label}",
       serverName = config.cleanTitle,
+      latencyMs = config.latencyMs,
+    )
+
+    updateMethodState(
+      method = method,
+      status = MethodRunStatus.CONNECTED,
+      statusTextFa = "متصل (${config.latencyMs}ms)",
       latencyMs = config.latencyMs,
     )
 
@@ -271,6 +518,7 @@ class MehViewModel(
       it.copy(
         phase = MehPhase.CONNECTED,
         selectedConfig = config,
+        activeMethod = method,
         liveLogLine = LOG_CONNECTED,
       )
     }
@@ -280,6 +528,7 @@ class MehViewModel(
     workflowJob?.cancel()
     workflowJob = null
     pendingCandidatesForPermission = emptyList()
+    pendingMethodForPermission = null
 
     try {
       val stopIntent =
@@ -291,11 +540,21 @@ class MehViewModel(
 
     MehTelemetry.logDisconnected()
 
-    _uiState.update {
-      it.copy(
+    _uiState.update { current ->
+      val resetMethods =
+        current.methodStates.mapValues { (m, state) ->
+          if (state.status == MethodRunStatus.CONNECTED || state.status == MethodRunStatus.TESTING) {
+            MethodItemState(method = m)
+          } else {
+            state
+          }
+        }
+      current.copy(
         phase = MehPhase.DISCONNECTED,
         selectedConfig = null,
+        activeMethod = null,
         liveLogLine = "",
+        methodStates = resetMethods,
       )
     }
   }

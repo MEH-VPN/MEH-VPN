@@ -1,8 +1,8 @@
 package com.example.model
 
 import com.example.vpn.GfwKnockerXrayCore
-import org.json.JSONObject
 import java.net.URLDecoder
+import org.json.JSONObject
 
 enum class V2RayProtocol(val label: String) {
   VLESS("VLESS"),
@@ -11,6 +11,7 @@ enum class V2RayProtocol(val label: String) {
   VMESS("VMess"),
   TROJAN("Trojan"),
   SHADOWSOCKS("SS"),
+  SERVERLESS("Serverless"),
 }
 
 data class V2RayConfig(
@@ -28,39 +29,82 @@ data class V2RayConfig(
   val encryption: String = "none",
   val headerType: String = "none",
   val pbk: String = "",
+  val fragmentProfile: String = "direct_tls",
+  val cipherSuites: String = "",
   val rawUri: String,
   val resolvedIp: String = "",
   val latencyMs: Long = -1L,
   val speedScore: Double = 0.0,
 ) {
   val endpointKey: String
-    get() = "${address.lowercase()}:$port"
+    get() =
+      if (protocol == V2RayProtocol.SERVERLESS) {
+        "serverless:${fragmentProfile.lowercase()}:${address.lowercase()}:$port"
+      } else {
+        "${address.lowercase()}:$port:${sni.lowercase()}:${fragmentProfile.lowercase()}"
+      }
 
   val cleanTitle: String
     get() {
       val trimmed = remarks.trim()
-      return if (trimmed.isNotEmpty() && trimmed.length <= 28) {
+      return if (trimmed.isNotEmpty() && trimmed.length <= 32) {
         trimmed
-      } else if (trimmed.length > 28) {
-        trimmed.take(26).trim() + "…"
+      } else if (trimmed.length > 32) {
+        trimmed.take(30).trim() + "…"
       } else {
         "${protocol.label} ($address:$port)"
       }
     }
 
   /**
-   * Builds a GFW-knocker/Xray-core JSON configuration (with `fragment` freedom outbound
-   * and `sockopt.dialerProxy = "fragment"`).
+   * Builds a GFW-knocker/Xray-core + Patterniha JSON configuration.
    */
   fun toV2RayCoreJson(): String {
     return GfwKnockerXrayCore.buildXrayCoreJson(this)
+  }
+
+  companion object {
+    /**
+     * Creates a direct Serverless configuration (`patterniha/Serverless-for-Iran` Frag-A, Frag-B, Aether, or SNI-Spoof).
+     */
+    fun createPatternihaServerless(
+      profileId: String,
+      remarks: String,
+      cleanEdgeIp: String = "188.114.98.0",
+    ): V2RayConfig {
+      val uri = "serverless://patterniha@$cleanEdgeIp:443?profile=$profileId#$remarks"
+      return V2RayConfig(
+        id = "SERVERLESS_${profileId}_$cleanEdgeIp",
+        protocol = V2RayProtocol.SERVERLESS,
+        remarks = remarks,
+        address = cleanEdgeIp,
+        port = 443,
+        authId = "patterniha-serverless",
+        network = "tcp",
+        security = "tls",
+        sni = "challenges.cloudflare.com",
+        hostHeader = "challenges.cloudflare.com",
+        path = "/",
+        fragmentProfile = profileId,
+        rawUri = uri,
+        resolvedIp = cleanEdgeIp,
+      )
+    }
   }
 }
 
 object V2RayConfigParser {
 
   private val SUPPORTED_SCHEMES =
-    listOf("vless://", "mvless://", "jvless://", "vmess://", "trojan://", "ss://")
+    listOf(
+      "vless://",
+      "mvless://",
+      "jvless://",
+      "vmess://",
+      "trojan://",
+      "ss://",
+      "serverless://",
+    )
 
   /**
    * Parses raw subscription text (either plain multi-line URIs or Base64-encoded subscription content)
@@ -101,6 +145,7 @@ object V2RayConfigParser {
     val line = uriString.trim().replace("&amp;", "&")
     return try {
       when {
+        line.startsWith("serverless://", ignoreCase = true) -> parseServerlessUri(line)
         line.startsWith("vless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.VLESS)
         line.startsWith("mvless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.MVLESS)
         line.startsWith("jvless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.JVLESS)
@@ -112,6 +157,23 @@ object V2RayConfigParser {
     } catch (_: Exception) {
       null
     }
+  }
+
+  private fun parseServerlessUri(uriString: String): V2RayConfig? {
+    val withoutScheme = uriString.substringAfter("://", "")
+    val rawFragment = decodeUrlSafe(withoutScheme.substringAfter("#", "Patterniha Serverless"))
+    val beforeFragment = withoutScheme.substringBefore("#")
+    val queryPart = beforeFragment.substringAfter("?", "")
+    val authorityPart = beforeFragment.substringBefore("?")
+    val hostPort = authorityPart.substringAfterLast("@", authorityPart)
+    val (host, port) = parseHostAndPort(hostPort) ?: Pair("188.114.98.0", 443)
+    val queryParams = parseQueryParams(queryPart)
+    val profile = queryParams["profile"] ?: "patterniha_frag_a"
+    return V2RayConfig.createPatternihaServerless(
+      profileId = profile,
+      remarks = rawFragment.ifBlank { "Patterniha Serverless" },
+      cleanEdgeIp = host,
+    ).copy(port = port, rawUri = uriString)
   }
 
   private fun parseVlessOrTrojan(uriString: String, protocol: V2RayProtocol): V2RayConfig? {
@@ -128,24 +190,48 @@ object V2RayConfigParser {
     val hostPort = authorityPart.substringAfterLast("@").trim()
     if (userInfo.isEmpty() || hostPort.isEmpty()) return null
 
-    val (host, port) = parseHostAndPort(hostPort) ?: return null
+    val (parsedHost, parsedPort) = parseHostAndPort(hostPort) ?: return null
     val queryParams = parseQueryParams(queryPart)
+    val decodedFragment = decodeUrlSafe(rawFragment)
 
-    val cleanRemarks = sanitizeRemarks(decodeUrlSafe(rawFragment), protocol, host, port)
-    val network = queryParams["type"]?.lowercase()?.trim() ?: "tcp"
+    // In patterniha/Free-Configs, Sni-Spoofing variants use 127.0.0.1:40443 to represent local
+    // SNI-Spoofing relay to Cloudflare edge 188.114.98.0:443. Map them natively to our built-in SNI-Spoofing engine!
+    val isPatternihaLocalSniRelay =
+      (parsedHost == "127.0.0.1" && parsedPort == 40443) ||
+        decodedFragment.contains("Sni-Spoofing", ignoreCase = true)
+
+    val host = if (parsedHost == "127.0.0.1" && parsedPort == 40443) "188.114.98.0" else parsedHost
+    val port = if (parsedHost == "127.0.0.1" && parsedPort == 40443) 443 else parsedPort
+
+    val cleanRemarks = sanitizeRemarks(decodedFragment, protocol, host, port)
+    val rawNetwork = queryParams["type"]?.lowercase()?.trim() ?: "tcp"
+    val network = if (rawNetwork == "websocket") "ws" else rawNetwork
     val security =
       queryParams["security"]?.lowercase()?.trim()
         ?: if (protocol == V2RayProtocol.TROJAN) "tls" else "none"
     val sni = (queryParams["sni"] ?: queryParams["host"] ?: "").trim().trimEnd('.')
-    val hostHeader = (queryParams["host"] ?: "").trim().trimEnd('.')
+    val hostHeader = (queryParams["host"] ?: sni).trim().trimEnd('.')
     val rawPath = queryParams["path"] ?: "/"
     val cleanPath = rawPath.substringBefore("?ed=").ifEmpty { "/" }
     val encryption = (queryParams["encryption"] ?: "none").lowercase().trim()
     val headerType = (queryParams["headerType"] ?: "none").lowercase().trim()
     val pbk = (queryParams["pbk"] ?: "").trim()
+    val fmParam = queryParams["fm"].orEmpty()
+    val csParam = queryParams["cs"].orEmpty()
+    val explicitProfile = queryParams["mehProfile"].orEmpty()
+
+    val fragmentProfile =
+      when {
+        explicitProfile.isNotEmpty() -> explicitProfile
+        isPatternihaLocalSniRelay -> "patterniha_sni_spoof"
+        fmParam.contains("\"6\"") && fmParam.contains("\"98\"") -> "patterniha_frag_a"
+        fmParam.contains("\"104\"") || decodedFragment.startsWith("F&F", ignoreCase = true) ->
+          "patterniha_frag_b"
+        else -> "direct_tls"
+      }
 
     return V2RayConfig(
-      id = "${protocol.name}_${host}_$port",
+      id = "${protocol.name}_${host}_${port}_$fragmentProfile",
       protocol = protocol,
       remarks = cleanRemarks,
       address = host,
@@ -159,6 +245,8 @@ object V2RayConfigParser {
       encryption = encryption,
       headerType = headerType,
       pbk = pbk,
+      fragmentProfile = fragmentProfile,
+      cipherSuites = csParam,
       rawUri = uriString,
     )
   }

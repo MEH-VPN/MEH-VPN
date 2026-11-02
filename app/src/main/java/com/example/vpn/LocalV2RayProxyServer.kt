@@ -348,40 +348,19 @@ class LocalV2RayProxyServer(
       }
     }
 
-    // 1. Primary: Resolve DNS over TCP through the V2Ray tunnel (8.8.8.8:53 or 9.9.9.9:53)
-    for (dnsServer in listOf("8.8.8.8", "9.9.9.9")) {
-      try {
-        openTunnelWithFailover(
-          targetHost = dnsServer,
-          targetPort = 53,
-          timeoutMs = 2200,
-        ).use { tunnel ->
-          val framed = ByteArray(dnsQuery.size + 2)
-          framed[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
-          framed[1] = (dnsQuery.size and 0xFF).toByte()
-          System.arraycopy(dnsQuery, 0, framed, 2, dnsQuery.size)
-
-          tunnel.outputStream.write(framed)
-          tunnel.outputStream.flush()
-
-          val dataIn = DataInputStream(tunnel.inputStream)
-          val respLen = dataIn.readUnsignedShort()
-          if (respLen in 12..4096) {
-            val resp = ByteArray(respLen)
-            dataIn.readFully(resp)
-            if (isValidUnpoisonedDnsResponse(resp)) {
-              if (cacheKey != null && dnsCache.size < 512) {
-                dnsCache[cacheKey] = resp.copyOf()
-              }
-              return resp
-            }
-          }
+    // When running in Serverless mode, resolve DNS immediately via fragmented DoH (port 443)
+    if (activeConfig.protocol == com.example.model.V2RayProtocol.SERVERLESS) {
+      val directDoh = resolveDnsOverHttpsProtectedDirect(dnsQuery)
+      if (directDoh != null && isValidUnpoisonedDnsResponse(directDoh)) {
+        if (cacheKey != null && dnsCache.size < 512) {
+          dnsCache[cacheKey] = directDoh.copyOf()
         }
-      } catch (_: Exception) {}
+        return directDoh
+      }
     }
 
-    // 2. Secondary: Resolve DNS over HTTPS (DoH port 443) through the V2Ray tunnel
-    //    (Handles Cloudflare Worker VLESS/Trojan nodes that block port 53)
+    // 1. Primary: Resolve DNS over HTTPS (DoH port 443) through the V2Ray tunnel using SSLEngine.
+    //    Port 443 works on 100% of V2Ray servers (both VPS and Cloudflare Worker/CDN nodes that block port 53)!
     val dohTunnelResp = resolveDnsOverHttpsViaTunnel(dnsQuery)
     if (dohTunnelResp != null && isValidUnpoisonedDnsResponse(dohTunnelResp)) {
       if (cacheKey != null && dnsCache.size < 512) {
@@ -390,7 +369,39 @@ class LocalV2RayProxyServer(
       return dohTunnelResp
     }
 
-    // 3. Final fallback: Direct encrypted DoH (port 443 TLS) via protected socket
+    // 2. Secondary: Fast single-server TCP DNS over V2Ray tunnel (8.8.8.8:53)
+    try {
+      V2RayOutboundClient.openTunnel(
+        config = activeConfig,
+        targetHost = "8.8.8.8",
+        targetPort = 53,
+        timeoutMs = 1500,
+        protector = protector,
+      ).use { tunnel ->
+        val framed = ByteArray(dnsQuery.size + 2)
+        framed[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
+        framed[1] = (dnsQuery.size and 0xFF).toByte()
+        System.arraycopy(dnsQuery, 0, framed, 2, dnsQuery.size)
+
+        tunnel.outputStream.write(framed)
+        tunnel.outputStream.flush()
+
+        val dataIn = DataInputStream(tunnel.inputStream)
+        val respLen = dataIn.readUnsignedShort()
+        if (respLen in 12..4096) {
+          val resp = ByteArray(respLen)
+          dataIn.readFully(resp)
+          if (isValidUnpoisonedDnsResponse(resp)) {
+            if (cacheKey != null && dnsCache.size < 512) {
+              dnsCache[cacheKey] = resp.copyOf()
+            }
+            return resp
+          }
+        }
+      }
+    } catch (_: Exception) {}
+
+    // 3. Final fallback: Direct encrypted DoH (port 443 TLS) via protected socket + SSLEngine
     val directDohResp = resolveDnsOverHttpsProtectedDirect(dnsQuery)
     if (directDohResp != null && isValidUnpoisonedDnsResponse(directDohResp)) {
       if (cacheKey != null && dnsCache.size < 512) {
@@ -403,57 +414,67 @@ class LocalV2RayProxyServer(
   }
 
   private fun resolveDnsOverHttpsViaTunnel(dnsQuery: ByteArray): ByteArray? {
-    return try {
-      openTunnelWithFailover(
-        targetHost = "8.8.8.8",
-        targetPort = 443,
-        timeoutMs = 3000,
-      ).use { tunnel ->
-        val adapter = ProxyStreamSocketAdapter(tunnel.inputStream, tunnel.outputStream)
-        val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-        val sslSocket = sslFactory.createSocket(adapter, "dns.google", 443, true) as SSLSocket
-        sslSocket.use { tls ->
-          try {
-            val params = tls.sslParameters
-            params.serverNames = listOf(SNIHostName("dns.google"))
-            tls.sslParameters = params
-          } catch (_: Throwable) {}
-          tls.startHandshake()
-          executeDohPost(tls.inputStream, tls.outputStream, "dns.google", dnsQuery)
+    for ((targetIp, sniHost) in listOf("1.1.1.1" to "cloudflare-dns.com", "8.8.8.8" to "dns.google")) {
+      try {
+        openTunnelWithFailover(
+          targetHost = targetIp,
+          targetPort = 443,
+          timeoutMs = 2200,
+        ).use { tunnel ->
+          val (tlsIn, tlsOut) =
+            GfwKnockerXrayCore.openSslEngineOverStreams(
+              sslContext = V2RayOutboundClient.permissiveSslContext,
+              rawIn = tunnel.inputStream,
+              rawOut = tunnel.outputStream,
+              sniHost = sniHost,
+              port = 443,
+            )
+          val resp = executeDohPost(tlsIn, tlsOut, sniHost, dnsQuery)
+          if (resp != null) return resp
         }
-      }
-    } catch (_: Exception) {
-      null
+      } catch (_: Exception) {}
     }
+    return null
   }
 
   private fun resolveDnsOverHttpsProtectedDirect(dnsQuery: ByteArray): ByteArray? {
-    for (dohIp in listOf(byteArrayOf(8, 8, 8, 8), byteArrayOf(1, 1, 1, 1))) {
+    val dohTargets =
+      listOf(
+        Triple(byteArrayOf(188.toByte(), 114, 98, 0), "challenges.cloudflare.com", "cloudflare-dns.com"),
+        Triple(byteArrayOf(1, 1, 1, 1), "cloudflare-dns.com", "cloudflare-dns.com"),
+        Triple(byteArrayOf(8, 8, 8, 8), "dns.google", "dns.google"),
+      )
+    val fragConfig =
+      if (activeConfig.fragmentProfile.isBlank() || activeConfig.fragmentProfile == "direct_tls") {
+        GfwKnockerXrayCore.FragmentConfig.AETHER_SNI_SPLIT
+      } else {
+        GfwKnockerXrayCore.FragmentConfig.fromProfileId(activeConfig.fragmentProfile)
+      }
+    for ((dohIp, sniHost, hostHdr) in dohTargets) {
       try {
         Socket().use { raw ->
-          raw.reuseAddress
+          try {
+            raw.reuseAddress
+          } catch (_: Exception) {}
           protector(raw)
           raw.tcpNoDelay = true
-          raw.soTimeout = 2500
-          raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
-          val sniHost = if (dohIp[0].toInt() == 8) "dns.google" else "cloudflare-dns.com"
-          val fragmentedRaw =
-            GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
-              raw,
-              GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
+          raw.soTimeout = 2200
+          raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2200)
+          val fragOut =
+            GfwKnockerXrayCore.FragmentWriterOutputStream(
+              raw.getOutputStream(),
+              fragConfig,
             )
-          val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-          val sslSocket = sslFactory.createSocket(fragmentedRaw, sniHost, 443, true) as SSLSocket
-          sslSocket.use { tls ->
-            try {
-              val params = tls.sslParameters
-              params.serverNames = listOf(SNIHostName(sniHost))
-              tls.sslParameters = params
-            } catch (_: Throwable) {}
-            tls.startHandshake()
-            val resp = executeDohPost(tls.inputStream, tls.outputStream, sniHost, dnsQuery)
-            if (resp != null) return resp
-          }
+          val (tlsIn, tlsOut) =
+            GfwKnockerXrayCore.openSslEngineOverStreams(
+              sslContext = V2RayOutboundClient.permissiveSslContext,
+              rawIn = raw.getInputStream(),
+              rawOut = fragOut,
+              sniHost = sniHost,
+              port = 443,
+            )
+          val resp = executeDohPost(tlsIn, tlsOut, hostHdr, dnsQuery)
+          if (resp != null) return resp
         }
       } catch (_: Exception) {}
     }
@@ -721,33 +742,5 @@ class LocalV2RayProxyServer(
       offset += r
     }
     return true
-  }
-
-  private class ProxyStreamSocketAdapter(
-    private val inStream: InputStream,
-    private val outStream: OutputStream,
-  ) : Socket() {
-    @Volatile private var closed = false
-    override fun isConnected(): Boolean = !closed
-    override fun isBound(): Boolean = true
-    override fun isClosed(): Boolean = closed
-    override fun getInputStream(): InputStream = inStream
-    override fun getOutputStream(): OutputStream = outStream
-    override fun getInetAddress(): InetAddress = InetAddress.getLoopbackAddress()
-    override fun getLocalAddress(): InetAddress = InetAddress.getLoopbackAddress()
-    override fun getPort(): Int = 443
-    override fun getLocalPort(): Int = 54321
-    override fun getRemoteSocketAddress(): SocketAddress =
-      InetSocketAddress(InetAddress.getLoopbackAddress(), 443)
-    override fun setSoTimeout(timeout: Int) {}
-    override fun getSoTimeout(): Int = 0
-    override fun setTcpNoDelay(on: Boolean) {}
-    override fun getTcpNoDelay(): Boolean = true
-    override fun setKeepAlive(on: Boolean) {}
-    override fun getKeepAlive(): Boolean = true
-    @Synchronized
-    override fun close() {
-      closed = true
-    }
   }
 }

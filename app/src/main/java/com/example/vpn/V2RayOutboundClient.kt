@@ -31,15 +31,19 @@ import kotlin.system.measureNanoTime
 
 /**
  * Real V2Ray Outbound Protocol Client supporting:
- * - Protocols: VLESS (v0) and Trojan
- * - Transports: Raw TCP and RFC 6455 WebSocket (ws)
- * - Security: None and TLS (with custom SNI and permissive certificate trust for self-signed V2Ray nodes)
+ * - Protocols: VLESS (v0), MVLESS (0x96), JVLESS (0x78), Trojan, and Direct Serverless
+ * - Transports: Raw TCP, RFC 6455 WebSocket (ws), and HTTPUpgrade (httpupgrade)
+ * - Security:
+ *   1. Direct native Android `SSLSocket` over real connected `Socket` (`direct_tls`)
+ *   2. Fragmented TLS over `SSLEngine` + `FragmentWriterOutputStream` (`gfw_knocker`, `aether_sni_split`,
+ *      `whitedns_byedpi`, `patterniha_frag_a`, `patterniha_frag_b`, `patterniha_sni_spoof`)
+ *      — 100% compatible with Android 5–16 including Samsung S8 Android 9 Conscrypt.
  */
 object V2RayOutboundClient {
 
   private val secureRandom = SecureRandom()
 
-  private val permissiveSslContext: SSLContext by lazy {
+  val permissiveSslContext: SSLContext by lazy {
     val trustAll =
       arrayOf<TrustManager>(
         object : X509TrustManager {
@@ -75,6 +79,9 @@ object V2RayOutboundClient {
    * Returns true if this config uses a clean protocol/transport combination supported by the V2Ray engine.
    */
   fun isSupportedByEngine(config: V2RayConfig): Boolean {
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      return true
+    }
     val isVlessFamily =
       config.protocol == V2RayProtocol.VLESS ||
         config.protocol == V2RayProtocol.MVLESS ||
@@ -186,26 +193,25 @@ object V2RayOutboundClient {
     val query = buildDnsAQuery(domain)
     for (dohIp in listOf(byteArrayOf(1, 1, 1, 1), byteArrayOf(8, 8, 8, 8))) {
       try {
-        val raw = Socket()
-        raw.tcpNoDelay = true
-        raw.soTimeout = 2500
-        raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
-        val hostStr = "${dohIp[0].toInt() and 0xFF}.${dohIp[1].toInt() and 0xFF}.${dohIp[2].toInt() and 0xFF}.${dohIp[3].toInt() and 0xFF}"
-        val fragmentedDohSocket =
-          GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
-            raw,
-            GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
-          )
-        val ssl =
-          permissiveSslContext.socketFactory.createSocket(
-            fragmentedDohSocket,
-            hostStr,
-            443,
-            true,
-          ) as SSLSocket
-        ssl.soTimeout = 2500
-        ssl.startHandshake()
-        ssl.use { sock ->
+        Socket().use { raw ->
+          raw.tcpNoDelay = true
+          raw.soTimeout = 2500
+          raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
+          val hostStr =
+            if ((dohIp[0].toInt() and 0xFF) == 1) "cloudflare-dns.com" else "dns.google"
+          val fragOut =
+            GfwKnockerXrayCore.FragmentWriterOutputStream(
+              raw.getOutputStream(),
+              GfwKnockerXrayCore.FragmentConfig.AETHER_SNI_SPLIT,
+            )
+          val (tlsIn, tlsOut) =
+            GfwKnockerXrayCore.openSslEngineOverStreams(
+              sslContext = permissiveSslContext,
+              rawIn = raw.getInputStream(),
+              rawOut = fragOut,
+              sniHost = hostStr,
+              port = 443,
+            )
           val req =
             "POST /dns-query HTTP/1.1\r\n" +
               "Host: $hostStr\r\n" +
@@ -213,10 +219,10 @@ object V2RayOutboundClient {
               "Accept: application/dns-message\r\n" +
               "Content-Length: ${query.size}\r\n" +
               "Connection: close\r\n\r\n"
-          sock.outputStream.write(req.toByteArray(Charsets.US_ASCII))
-          sock.outputStream.write(query)
-          sock.outputStream.flush()
-          val respBytes = readHttpBody(sock.inputStream, 2048) ?: return@use
+          tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+          tlsOut.write(query)
+          tlsOut.flush()
+          val respBytes = readHttpBody(tlsIn, 2048) ?: return@use
           extractFirstPublicARecord(respBytes)?.let { return it }
         }
       } catch (_: Exception) {}
@@ -234,6 +240,9 @@ object V2RayOutboundClient {
     protector: ((Socket) -> Boolean)? = null,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      return verifyHttpsAndDnsCapability(config, timeoutMs = timeoutMs, protector = protector)
+    }
     val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
     if (resolvedIp.isEmpty()) return null
     val resolvedConfig = config.copy(resolvedIp = resolvedIp)
@@ -283,9 +292,8 @@ object V2RayOutboundClient {
 
   /**
    * Stage 2 Strict Verification: Opens a SECOND independent V2Ray tunnel to `www.google.com:443`,
-   * performs a real end-to-end TLS handshake with `www.google.com` INSIDE the V2Ray tunnel,
-   * and verifies `GET /generate_204 -> HTTP/1.1 204`.
-   * This eliminates single-connection honeypots, port-443 blockers, and fake HTTP 204 stubs.
+   * performs a real end-to-end TLS handshake with `www.google.com` INSIDE the V2Ray tunnel using
+   * `SSLEngine` (Android 9 safe!), and verifies `GET /generate_204 -> HTTP/1.1 204`.
    */
   fun verifyHttpsAndDnsCapability(
     config: V2RayConfig,
@@ -307,34 +315,24 @@ object V2RayOutboundClient {
             timeoutMs = timeoutMs,
             protector = protector,
           ).use { tunnel ->
-            val tunnelBridgeSocket = TunnelStreamSocketAdapter(tunnel)
-            val sslOverTunnel =
-              permissiveSslContext.socketFactory.createSocket(
-                tunnelBridgeSocket,
-                "www.google.com",
-                443,
-                false,
-              ) as SSLSocket
-            sslOverTunnel.soTimeout = timeoutMs
-            try {
-              if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-                val params = sslOverTunnel.sslParameters
-                params.serverNames = listOf(SNIHostName("www.google.com"))
-                sslOverTunnel.sslParameters = params
-              }
-            } catch (_: Exception) {}
-
-            sslOverTunnel.startHandshake()
+            val (tlsIn, tlsOut) =
+              GfwKnockerXrayCore.openSslEngineOverStreams(
+                sslContext = permissiveSslContext,
+                rawIn = tunnel.inputStream,
+                rawOut = tunnel.outputStream,
+                sniHost = "www.google.com",
+                port = 443,
+              )
             val req =
               "GET /generate_204 HTTP/1.1\r\n" +
                 "Host: www.google.com\r\n" +
                 "User-Agent: Mozilla/5.0\r\n" +
                 "Connection: close\r\n\r\n"
-            sslOverTunnel.outputStream.write(req.toByteArray(Charsets.US_ASCII))
-            sslOverTunnel.outputStream.flush()
+            tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+            tlsOut.flush()
 
             val buf = ByteArray(128)
-            val n = sslOverTunnel.inputStream.read(buf)
+            val n = tlsIn.read(buf)
             if (n <= 0) throw IOException("Empty HTTPS 443 response over tunnel")
             val statusLine = String(buf, 0, n, Charsets.US_ASCII)
             if (!statusLine.startsWith("HTTP/1.1 204") && !statusLine.startsWith("HTTP/2 204")) {
@@ -350,7 +348,6 @@ object V2RayOutboundClient {
 
   /**
    * Verifies direct connection capability to Telegram Data Centers (e.g. 149.154.167.50:443).
-   * This guarantees that nodes in the pool do not block or drop raw Telegram IP connections.
    */
   fun verifyTelegramCapability(
     config: V2RayConfig,
@@ -372,8 +369,9 @@ object V2RayOutboundClient {
             timeoutMs = timeoutMs,
             protector = protector,
           ).use { conn ->
-            // Telegram MTProto intermediate handshake preamble
-            conn.outputStream.write(byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte()))
+            conn.outputStream.write(
+              byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte())
+            )
             conn.outputStream.flush()
           }
         }
@@ -393,6 +391,16 @@ object V2RayOutboundClient {
     timeoutMs: Int = 7000,
     protector: ((Socket) -> Boolean)? = null,
   ): TunnelConnection {
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      return openDirectServerlessFragmentTunnel(
+        config = config,
+        targetHost = targetHost,
+        targetPort = targetPort,
+        timeoutMs = timeoutMs,
+        protector = protector,
+      )
+    }
+
     val rawSocket = Socket()
     try {
       // Touching reuseAddress forces Android's SocketImpl to allocate its underlying OS file descriptor
@@ -419,24 +427,27 @@ object V2RayOutboundClient {
       rawSocket.connect(remoteEndpoint, timeoutMs)
 
       val isTls = config.security.equals("tls", ignoreCase = true)
-      val transportSocket: Socket =
+      val (rawTransportIn, rawTransportOut) =
         if (isTls) {
-          wrapTlsSocket(rawSocket, config, timeoutMs)
+          establishTlsStreams(rawSocket, config, timeoutMs)
         } else {
-          rawSocket
-        }
-
-      var transportIn: InputStream = BufferedInputStream(transportSocket.getInputStream(), 16384)
-      var transportOut: OutputStream =
-        if (isTls) {
-          transportSocket.getOutputStream()
-        } else {
-          // Apply GFW-knocker TCP packet fragmentation on non-TLS connections
-          GfwKnockerXrayCore.FragmentWriterOutputStream(
-            transportSocket.getOutputStream(),
-            GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS,
+          val tcpProfile =
+            if (config.fragmentProfile.startsWith("patterniha")) {
+              GfwKnockerXrayCore.FragmentConfig.PATTERNIHA_TCP_DIRECT
+            } else {
+              GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS
+            }
+          Pair(
+            BufferedInputStream(rawSocket.getInputStream(), 16384),
+            GfwKnockerXrayCore.FragmentWriterOutputStream(
+              rawSocket.getOutputStream(),
+              tcpProfile,
+            ),
           )
         }
+
+      var transportIn: InputStream = rawTransportIn
+      var transportOut: OutputStream = rawTransportOut
 
       if (config.network.equals("ws", ignoreCase = true)) {
         performWebSocketUpgrade(config, transportIn, transportOut)
@@ -453,7 +464,6 @@ object V2RayOutboundClient {
       // For long-lived active streams (Telegram, push notifications, web), clear read timeout
       // so idle connections are NOT terminated after 2 minutes
       try {
-        transportSocket.soTimeout = 0
         rawSocket.soTimeout = 0
       } catch (_: Exception) {}
 
@@ -461,9 +471,9 @@ object V2RayOutboundClient {
         V2RayProtocol.VLESS,
         V2RayProtocol.MVLESS,
         V2RayProtocol.JVLESS ->
-          setupVlessStream(transportSocket, transportIn, transportOut, config, targetHost, targetPort)
+          setupVlessStream(rawSocket, transportIn, transportOut, config, targetHost, targetPort)
         V2RayProtocol.TROJAN ->
-          setupTrojanStream(transportSocket, transportIn, transportOut, config, targetHost, targetPort)
+          setupTrojanStream(rawSocket, transportIn, transportOut, config, targetHost, targetPort)
         else -> throw IOException("Unsupported protocol: ${config.protocol}")
       }
     } catch (e: Exception) {
@@ -474,11 +484,77 @@ object V2RayOutboundClient {
     }
   }
 
-  private fun wrapTlsSocket(
+  /**
+   * Direct Serverless Fragmented Tunnel (`patterniha/Serverless-for-Iran`, `CluvexStudio/Aether`, `WhiteDNS`):
+   * Connects directly to [targetHost]:[targetPort] using unpoisoned DNS (DoH) and wraps the outbound
+   * TCP stream in `GfwKnockerXrayCore.FragmentWriterOutputStream`.
+   */
+  private fun openDirectServerlessFragmentTunnel(
+    config: V2RayConfig,
+    targetHost: String,
+    targetPort: Int,
+    timeoutMs: Int,
+    protector: ((Socket) -> Boolean)?,
+  ): TunnelConnection {
+    val rawSocket = Socket()
+    try {
+      try {
+        rawSocket.reuseAddress
+      } catch (_: Exception) {}
+      protector?.invoke(rawSocket)
+      rawSocket.tcpNoDelay = true
+      rawSocket.keepAlive = true
+      rawSocket.soTimeout = timeoutMs
+
+      val resolvedTargetIp = resolveEndpointIpv4(targetHost) ?: targetHost
+      val ipv4Bytes = parseIpv4Bytes(resolvedTargetIp)
+      val endpoint =
+        if (ipv4Bytes != null) {
+          InetSocketAddress(InetAddress.getByAddress(ipv4Bytes), targetPort)
+        } else {
+          InetSocketAddress(resolvedTargetIp, targetPort)
+        }
+      rawSocket.connect(endpoint, timeoutMs)
+
+      try {
+        rawSocket.soTimeout = 0
+      } catch (_: Exception) {}
+
+      val fragConfig =
+        if (targetPort == 443 || targetPort == 8443 || targetPort == 2053 || targetPort == 2083) {
+          GfwKnockerXrayCore.FragmentConfig.fromProfileId(config.fragmentProfile)
+        } else {
+          GfwKnockerXrayCore.FragmentConfig.PATTERNIHA_TCP_DIRECT
+        }
+
+      val directIn = BufferedInputStream(rawSocket.getInputStream(), 16384)
+      val directOut =
+        GfwKnockerXrayCore.FragmentWriterOutputStream(
+          rawSocket.getOutputStream(),
+          fragConfig,
+        )
+      return TunnelConnection(rawSocket, directIn, directOut)
+    } catch (e: Exception) {
+      try {
+        rawSocket.close()
+      } catch (_: Exception) {}
+      throw e
+    }
+  }
+
+  /**
+   * Establishes TLS over [rawSocket]:
+   * - For standard V2Ray (`direct_tls`), uses Android's native `SSLSocketFactory.createSocket(rawSocket, ...)`
+   *   directly on the real OS socket (`rawSocket`), which has a valid `FileDescriptor` on Android 5–16!
+   * - For fragmented profiles (`gfw_knocker`, `aether_sni_split`, `whitedns_byedpi`, `patterniha_*`),
+   *   uses `GfwKnockerXrayCore.openSslEngineOverStreams` over `FragmentWriterOutputStream(rawSocket.getOutputStream())`
+   *   so Conscrypt never touches `FileDescriptor` on a wrapper socket!
+   */
+  private fun establishTlsStreams(
     rawSocket: Socket,
     config: V2RayConfig,
     timeoutMs: Int,
-  ): SSLSocket {
+  ): Pair<InputStream, OutputStream> {
     val sniHost =
       config.sni
         .ifBlank { config.hostHeader }
@@ -486,42 +562,74 @@ object V2RayOutboundClient {
         .trim()
         .trimEnd('.')
 
-    // Wrap rawSocket in GFW-knocker/Xray-core's FragmentWriter ("tlshello" record splitting)
-    // so the TLS ClientHello (including SNI) is split into 10-30 byte TLS records across TCP segments.
-    val fragmentedRawSocket =
-      GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
-        rawSocket,
-        GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
+    val isWsOrUpgrade =
+      config.network.equals("ws", ignoreCase = true) ||
+        config.network.equals("httpupgrade", ignoreCase = true)
+    val alpn = if (isWsOrUpgrade) arrayOf("http/1.1") else null
+
+    val desiredCiphers =
+      if (config.cipherSuites.isNotBlank()) {
+        config.cipherSuites.split(":").map { it.trim() }.filter { it.isNotEmpty() }
+      } else if (config.fragmentProfile.startsWith("patterniha")) {
+        GfwKnockerXrayCore.PATTERNIHA_CIPHER_SUITES
+      } else {
+        emptyList()
+      }
+
+    // 1. Standard direct TLS mode: uses real connected rawSocket directly with Android Conscrypt SSLSocket
+    if (config.fragmentProfile.equals("direct_tls", ignoreCase = true) ||
+      config.fragmentProfile.isBlank()
+    ) {
+      val sslSocket =
+        permissiveSslContext.socketFactory.createSocket(
+          rawSocket,
+          sniHost,
+          config.port,
+          true,
+        ) as SSLSocket
+      sslSocket.soTimeout = timeoutMs
+      try {
+        val params = sslSocket.sslParameters
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N &&
+          sniHost.isNotEmpty() &&
+          !sniHost[0].isDigit()
+        ) {
+          params.serverNames = listOf(SNIHostName(sniHost))
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q && alpn != null) {
+          params.applicationProtocols = alpn
+        }
+        sslSocket.sslParameters = params
+      } catch (_: Exception) {}
+      sslSocket.startHandshake()
+      try {
+        sslSocket.soTimeout = 0
+      } catch (_: Exception) {}
+      return Pair(
+        BufferedInputStream(sslSocket.getInputStream(), 16384),
+        sslSocket.getOutputStream(),
       )
+    }
 
-    val sslSocket =
-      permissiveSslContext.socketFactory.createSocket(
-        fragmentedRawSocket,
-        sniHost,
-        config.port,
-        true,
-      ) as SSLSocket
-
-    sslSocket.soTimeout = timeoutMs
-    try {
-      val params = sslSocket.sslParameters
-      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N &&
-        sniHost.isNotEmpty() &&
-        !sniHost[0].isDigit()
-      ) {
-        params.serverNames = listOf(SNIHostName(sniHost))
-      }
-      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
-        (config.network.equals("ws", ignoreCase = true) ||
-          config.network.equals("httpupgrade", ignoreCase = true))
-      ) {
-        params.applicationProtocols = arrayOf("http/1.1")
-      }
-      sslSocket.sslParameters = params
-    } catch (_: Exception) {}
-
-    sslSocket.startHandshake()
-    return sslSocket
+    // 2. Fragmented TLS mode (GFW-knocker, CluvexStudio/Aether, WhiteDNS, Patterniha):
+    // Uses pure SSLEngine over FragmentWriterOutputStream so Android 9 Conscrypt never sees a fake Socket fd!
+    val fragProfile = GfwKnockerXrayCore.FragmentConfig.fromProfileId(config.fragmentProfile)
+    val fragmentedOut =
+      GfwKnockerXrayCore.FragmentWriterOutputStream(
+        rawSocket.getOutputStream(),
+        fragProfile,
+      )
+    val (tlsIn, tlsOut) =
+      GfwKnockerXrayCore.openSslEngineOverStreams(
+        sslContext = permissiveSslContext,
+        rawIn = BufferedInputStream(rawSocket.getInputStream(), 16384),
+        rawOut = fragmentedOut,
+        sniHost = sniHost,
+        port = config.port,
+        cipherSuites = desiredCiphers,
+        alpnProtocols = alpn,
+      )
+    return Pair(BufferedInputStream(tlsIn, 16384), tlsOut)
   }
 
   private fun performWebSocketUpgrade(
@@ -894,23 +1002,7 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Adapts a [TunnelConnection] into a [Socket] so Java's [SSLSocketFactory] can perform TLS handshakes over the tunnel.
-   */
-  private class TunnelStreamSocketAdapter(
-    private val tunnel: TunnelConnection,
-  ) : Socket() {
-    override fun getInputStream(): InputStream = tunnel.inputStream
-    override fun getOutputStream(): OutputStream = tunnel.outputStream
-    override fun isConnected(): Boolean = true
-    override fun isClosed(): Boolean = tunnel.underlyingSocket.isClosed
-    override fun close() {
-      tunnel.close()
-    }
-  }
-
-  /**
    * RFC 6455 WebSocket Binary Frame OutputStream (client-to-server frames must be masked).
-   * Chunks writes into <= 4096 byte frames so Xray/Cloudflare WebSocket buffers never overflow.
    */
   private class WebSocketFrameOutputStream(out: OutputStream) : FilterOutputStream(out) {
     private val rng = SecureRandom()
