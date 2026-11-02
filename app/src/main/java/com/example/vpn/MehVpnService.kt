@@ -220,7 +220,7 @@ class MehVpnService : VpnService() {
       val builder =
         Builder()
           .setSession("MEH • $serverName")
-          .setMtu(1500)
+          .setMtu(1280) // RFC 2460 standard mobile MTU to prevent GTP-U packet fragmentation
           .addAddress("10.10.14.2", 24)
           .addRoute("0.0.0.0", 0)
           .addDnsServer("8.8.8.8")
@@ -247,7 +247,7 @@ class MehVpnService : VpnService() {
       try {
         val key =
           Key().apply {
-            mtu = 1500L
+            mtu = 1280L // Match TUN MTU to prevent encapsulation drops
             device = "fd://${establishedPfd.fd}"
             proxy = "socks5://127.0.0.1:$proxyPort"
             logLevel = "error"
