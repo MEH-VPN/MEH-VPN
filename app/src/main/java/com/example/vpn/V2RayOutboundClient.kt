@@ -75,14 +75,18 @@ object V2RayOutboundClient {
    * Returns true if this config uses a clean protocol/transport combination supported by the V2Ray engine.
    */
   fun isSupportedByEngine(config: V2RayConfig): Boolean {
-    if (config.protocol != V2RayProtocol.VLESS && config.protocol != V2RayProtocol.TROJAN) {
+    val isVlessFamily =
+      config.protocol == V2RayProtocol.VLESS ||
+        config.protocol == V2RayProtocol.MVLESS ||
+        config.protocol == V2RayProtocol.JVLESS
+    if (!isVlessFamily && config.protocol != V2RayProtocol.TROJAN) {
       return false
     }
     if (config.address.contains(":")) {
       return false
     }
     val net = config.network.lowercase()
-    if (net != "tcp" && net != "ws") {
+    if (net != "tcp" && net != "ws" && net != "httpupgrade") {
       return false
     }
     val sec = config.security.lowercase()
@@ -100,7 +104,7 @@ object V2RayOutboundClient {
     if (hdr != "none" && hdr != "" && hdr != "---") {
       return false
     }
-    if (config.protocol == V2RayProtocol.VLESS && parseUuidBytes(config.authId) == null) {
+    if (isVlessFamily && parseUuidBytes(config.authId) == null) {
       return false
     }
     return true
@@ -187,7 +191,18 @@ object V2RayOutboundClient {
         raw.soTimeout = 2500
         raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
         val hostStr = "${dohIp[0].toInt() and 0xFF}.${dohIp[1].toInt() and 0xFF}.${dohIp[2].toInt() and 0xFF}.${dohIp[3].toInt() and 0xFF}"
-        val ssl = permissiveSslContext.socketFactory.createSocket(raw, hostStr, 443, true) as SSLSocket
+        val fragmentedDohSocket =
+          GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
+            raw,
+            GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
+          )
+        val ssl =
+          permissiveSslContext.socketFactory.createSocket(
+            fragmentedDohSocket,
+            hostStr,
+            443,
+            true,
+          ) as SSLSocket
         ssl.soTimeout = 2500
         ssl.startHandshake()
         ssl.use { sock ->
@@ -403,15 +418,25 @@ object V2RayOutboundClient {
         }
       rawSocket.connect(remoteEndpoint, timeoutMs)
 
+      val isTls = config.security.equals("tls", ignoreCase = true)
       val transportSocket: Socket =
-        if (config.security.equals("tls", ignoreCase = true)) {
+        if (isTls) {
           wrapTlsSocket(rawSocket, config, timeoutMs)
         } else {
           rawSocket
         }
 
       var transportIn: InputStream = BufferedInputStream(transportSocket.getInputStream(), 16384)
-      var transportOut: OutputStream = transportSocket.getOutputStream()
+      var transportOut: OutputStream =
+        if (isTls) {
+          transportSocket.getOutputStream()
+        } else {
+          // Apply GFW-knocker TCP packet fragmentation on non-TLS connections
+          GfwKnockerXrayCore.FragmentWriterOutputStream(
+            transportSocket.getOutputStream(),
+            GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS,
+          )
+        }
 
       if (config.network.equals("ws", ignoreCase = true)) {
         performWebSocketUpgrade(config, transportIn, transportOut)
@@ -421,6 +446,8 @@ object V2RayOutboundClient {
         }
         transportIn = wsIn
         transportOut = wsOut
+      } else if (config.network.equals("httpupgrade", ignoreCase = true)) {
+        GfwKnockerXrayCore.performHttpUpgrade(config, transportIn, transportOut)
       }
 
       // For long-lived active streams (Telegram, push notifications, web), clear read timeout
@@ -431,7 +458,9 @@ object V2RayOutboundClient {
       } catch (_: Exception) {}
 
       return when (config.protocol) {
-        V2RayProtocol.VLESS ->
+        V2RayProtocol.VLESS,
+        V2RayProtocol.MVLESS,
+        V2RayProtocol.JVLESS ->
           setupVlessStream(transportSocket, transportIn, transportOut, config, targetHost, targetPort)
         V2RayProtocol.TROJAN ->
           setupTrojanStream(transportSocket, transportIn, transportOut, config, targetHost, targetPort)
@@ -457,9 +486,17 @@ object V2RayOutboundClient {
         .trim()
         .trimEnd('.')
 
+    // Wrap rawSocket in GFW-knocker/Xray-core's FragmentWriter ("tlshello" record splitting)
+    // so the TLS ClientHello (including SNI) is split into 10-30 byte TLS records across TCP segments.
+    val fragmentedRawSocket =
+      GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
+        rawSocket,
+        GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
+      )
+
     val sslSocket =
       permissiveSslContext.socketFactory.createSocket(
-        rawSocket,
+        fragmentedRawSocket,
         sniHost,
         config.port,
         true,
@@ -467,14 +504,20 @@ object V2RayOutboundClient {
 
     sslSocket.soTimeout = timeoutMs
     try {
+      val params = sslSocket.sslParameters
       if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N &&
         sniHost.isNotEmpty() &&
         !sniHost[0].isDigit()
       ) {
-        val params = sslSocket.sslParameters
         params.serverNames = listOf(SNIHostName(sniHost))
-        sslSocket.sslParameters = params
       }
+      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
+        (config.network.equals("ws", ignoreCase = true) ||
+          config.network.equals("httpupgrade", ignoreCase = true))
+      ) {
+        params.applicationProtocols = arrayOf("http/1.1")
+      }
+      sslSocket.sslParameters = params
     } catch (_: Exception) {}
 
     sslSocket.startHandshake()
@@ -505,7 +548,7 @@ object V2RayOutboundClient {
         "Connection: Upgrade\r\n" +
         "Sec-WebSocket-Key: $wsKey\r\n" +
         "Sec-WebSocket-Version: 13\r\n" +
-        "User-Agent: Mozilla/5.0\r\n\r\n"
+        "User-Agent: ${GfwKnockerXrayCore.GFW_KNOCKER_USER_AGENT}\r\n\r\n"
 
     output.write(requestHeaders.toByteArray(Charsets.US_ASCII))
     output.flush()
@@ -544,8 +587,10 @@ object V2RayOutboundClient {
     val uuidBytes =
       parseUuidBytes(config.authId) ?: throw IOException("Invalid VLESS UUID: ${config.authId}")
 
+    val wireVersion = GfwKnockerXrayCore.vlessWireVersionFor(config.protocol).toInt() and 0xFF
+
     val header = ByteArrayOutputStream(64)
-    header.write(0x00) // Version 0
+    header.write(wireVersion) // 0x00 (VLESS), 150/0x96 (MVLESS), or 0x78 (JVLESS)
     header.write(uuidBytes) // 16-byte UUID
     header.write(0x00) // Addons length = 0
     header.write(0x01) // Command = 0x01 (TCP)
@@ -595,7 +640,9 @@ object V2RayOutboundClient {
             responseHeaderRead = true
             val ver = `in`.read()
             if (ver == -1) throw EOFException("VLESS EOF before response header")
-            if (ver != 0) throw IOException("Invalid VLESS response version byte: $ver")
+            if (ver != wireVersion && ver != 0) {
+              throw IOException("Invalid VLESS response version byte: $ver")
+            }
             val addonLen = `in`.read()
             if (addonLen == -1) throw EOFException("VLESS EOF reading addon length")
             var remaining = addonLen

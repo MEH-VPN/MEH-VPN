@@ -433,11 +433,17 @@ class LocalV2RayProxyServer(
         Socket().use { raw ->
           raw.reuseAddress
           protector(raw)
+          raw.tcpNoDelay = true
           raw.soTimeout = 2500
           raw.connect(InetSocketAddress(InetAddress.getByAddress(dohIp), 443), 2500)
           val sniHost = if (dohIp[0].toInt() == 8) "dns.google" else "cloudflare-dns.com"
+          val fragmentedRaw =
+            GfwKnockerXrayCore.wrapSocketWithFragmentWriter(
+              raw,
+              GfwKnockerXrayCore.FragmentConfig.DEFAULT_TLS_HELLO,
+            )
           val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
-          val sslSocket = sslFactory.createSocket(raw, sniHost, 443, true) as SSLSocket
+          val sslSocket = sslFactory.createSocket(fragmentedRaw, sniHost, 443, true) as SSLSocket
           sslSocket.use { tls ->
             try {
               val params = tls.sslParameters

@@ -1,11 +1,13 @@
 package com.example.model
 
-import org.json.JSONArray
+import com.example.vpn.GfwKnockerXrayCore
 import org.json.JSONObject
 import java.net.URLDecoder
 
 enum class V2RayProtocol(val label: String) {
   VLESS("VLESS"),
+  MVLESS("MVLESS"),
+  JVLESS("JVLESS"),
   VMESS("VMess"),
   TROJAN("Trojan"),
   SHADOWSOCKS("SS"),
@@ -47,56 +49,18 @@ data class V2RayConfig(
     }
 
   /**
-   * Builds a standard V2Ray / Xray core JSON configuration for the selected node.
+   * Builds a GFW-knocker/Xray-core JSON configuration (with `fragment` freedom outbound
+   * and `sockopt.dialerProxy = "fragment"`).
    */
   fun toV2RayCoreJson(): String {
-    val root = JSONObject()
-    val inbounds = JSONArray()
-    inbounds.put(
-      JSONObject().apply {
-        put("tag", "socks-in")
-        put("port", 10808)
-        put("listen", "127.0.0.1")
-        put("protocol", "socks")
-        put("settings", JSONObject().put("auth", "noauth").put("udp", true))
-      }
-    )
-    root.put("inbounds", inbounds)
-
-    val outbounds = JSONArray()
-    outbounds.put(
-      JSONObject().apply {
-        put("tag", "proxy")
-        put("protocol", protocol.name.lowercase())
-        put(
-          "settings",
-          JSONObject().apply {
-            put("address", address)
-            put("port", port)
-            put("id", authId)
-          },
-        )
-        put(
-          "streamSettings",
-          JSONObject().apply {
-            put("network", network)
-            put("security", security)
-            if (sni.isNotEmpty()) {
-              put("tlsSettings", JSONObject().put("serverName", sni))
-            }
-          },
-        )
-      }
-    )
-    root.put("outbounds", outbounds)
-    return root.toString(2)
+    return GfwKnockerXrayCore.buildXrayCoreJson(this)
   }
 }
 
 object V2RayConfigParser {
 
   private val SUPPORTED_SCHEMES =
-    listOf("vless://", "vmess://", "trojan://", "ss://")
+    listOf("vless://", "mvless://", "jvless://", "vmess://", "trojan://", "ss://")
 
   /**
    * Parses raw subscription text (either plain multi-line URIs or Base64-encoded subscription content)
@@ -138,6 +102,8 @@ object V2RayConfigParser {
     return try {
       when {
         line.startsWith("vless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.VLESS)
+        line.startsWith("mvless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.MVLESS)
+        line.startsWith("jvless://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.JVLESS)
         line.startsWith("trojan://", ignoreCase = true) -> parseVlessOrTrojan(line, V2RayProtocol.TROJAN)
         line.startsWith("vmess://", ignoreCase = true) -> parseVmess(line)
         line.startsWith("ss://", ignoreCase = true) -> parseShadowsocks(line)

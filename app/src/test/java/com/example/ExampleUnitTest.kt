@@ -167,5 +167,64 @@ class ExampleUnitTest {
       println("TELEGRAM_TEST: -> Telegram DC2 result: $tgStatus")
     }
   }
+
+  @Test
+  fun testGfwKnockerXrayCoreTlsRecordSplittingAndProtocols() {
+    // 1. Verify TLS ClientHello Record Splitting (22, 3, 1, lenHigh, lenLow + payload)
+    val payload = ByteArray(240) { (it and 0xFF).toByte() }
+    val tlsRecord = ByteArray(5 + payload.size)
+    tlsRecord[0] = 22 // Handshake
+    tlsRecord[1] = 3
+    tlsRecord[2] = 1
+    tlsRecord[3] = ((payload.size ushr 8) and 0xFF).toByte()
+    tlsRecord[4] = (payload.size and 0xFF).toByte()
+    System.arraycopy(payload, 0, tlsRecord, 5, payload.size)
+
+    val rawOut = java.io.ByteArrayOutputStream()
+    val fragOut =
+      com.example.vpn.GfwKnockerXrayCore.FragmentWriterOutputStream(
+        rawOut,
+        com.example.vpn.GfwKnockerXrayCore.FragmentConfig(
+          packetsFrom = 0,
+          packetsTo = 1,
+          lengthMin = 10,
+          lengthMax = 25,
+          intervalMinMs = 0L,
+          intervalMaxMs = 1L,
+        ),
+      )
+    fragOut.write(tlsRecord)
+    val fragmentedBytes = rawOut.toByteArray()
+
+    // Reassemble split TLS records and verify multiple records were emitted and payload matches 100%
+    val reassembled = java.io.ByteArrayOutputStream()
+    var pos = 0
+    var recordCount = 0
+    while (pos < fragmentedBytes.size) {
+      assertEquals(22, fragmentedBytes[pos].toInt() and 0xFF)
+      assertEquals(3, fragmentedBytes[pos + 1].toInt() and 0xFF)
+      assertEquals(1, fragmentedBytes[pos + 2].toInt() and 0xFF)
+      val rLen =
+        ((fragmentedBytes[pos + 3].toInt() and 0xFF) shl 8) or
+          (fragmentedBytes[pos + 4].toInt() and 0xFF)
+      assertTrue("Each split TLS record should be <= 25 bytes, got $rLen", rLen in 1..25)
+      reassembled.write(fragmentedBytes, pos + 5, rLen)
+      pos += 5 + rLen
+      recordCount++
+    }
+    assertTrue("Expected at least 10 split TLS records, got $recordCount", recordCount >= 10)
+    org.junit.Assert.assertArrayEquals(payload, reassembled.toByteArray())
+
+    // 2. Verify mvless:// and jvless:// and httpupgrade support in GFW-knocker/Xray-core
+    val mvlessUri =
+      "mvless://11111111-2222-3333-4444-555555555555@edge.example.com:443?security=tls&sni=edge.example.com&type=httpupgrade&path=%2Fupgrade#MahsaMVLESS"
+    val parsedMvless = V2RayConfigParser.parseSingleUri(mvlessUri)
+    assertNotNull(parsedMvless)
+    assertEquals(V2RayProtocol.MVLESS, parsedMvless?.protocol)
+    assertEquals(150.toByte(), com.example.vpn.GfwKnockerXrayCore.vlessWireVersionFor(parsedMvless!!.protocol))
+    assertTrue(V2RayOutboundClient.isSupportedByEngine(parsedMvless))
+    assertTrue(parsedMvless.toV2RayCoreJson().contains("\"dialerProxy\": \"fragment\""))
+    assertTrue(parsedMvless.toV2RayCoreJson().contains("\"packets\": \"tlshello\""))
+  }
 }
 
