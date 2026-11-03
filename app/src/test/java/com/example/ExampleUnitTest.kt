@@ -337,10 +337,20 @@ class ExampleUnitTest {
     assertTrue(V2RayOutboundClient.isSupportedByEngine(serverlessA))
     assertTrue(serverlessA.toV2RayCoreJson().contains("[\"6\", \"98\", \"1\"]"))
 
-    // 6. Verify FakeDNS 198.18.0.0/15 virtual IP allocation and domain mapping
-    val fakeIp = LocalV2RayProxyServer.allocateFakeIpForDomain("i.instagram.com")
-    assertTrue("Expected FakeIP in 198.18.0.0/15, got $fakeIp", LocalV2RayProxyServer.isFakeIpAddress(fakeIp))
-    assertEquals("i.instagram.com", LocalV2RayProxyServer.resolveFakeIpDomain(fakeIp))
+    // 6. Verify Real Public Anycast IP Coalescing for Twitter/X and Instagram + collision-free FakeIP
+    assertEquals("104.244.42.129", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("api.x.com"))
+    assertEquals("104.244.42.129", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("api.twitter.com"))
+    assertEquals("151.101.1.140", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("pbs.twimg.com"))
+    assertEquals("157.240.241.174", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("i.instagram.com"))
+    assertEquals("157.240.241.63", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("scontent-fra5-1.cdninstagram.com"))
+
+    val seenFakeIps = HashSet<String>()
+    for (i in 1..300) {
+      val dom = "sub-$i.custom-test-domain.org"
+      val fakeIp = LocalV2RayProxyServer.allocateFakeIpForDomain(dom)
+      assertTrue("Expected unique FakeIP for $dom, got duplicate $fakeIp", seenFakeIps.add(fakeIp))
+      assertEquals(dom, LocalV2RayProxyServer.resolveFakeIpDomain(fakeIp))
+    }
 
     // 7. Verify TLS ClientHello SNI extraction for destOverride: ["tls"]
     val extractedSni = com.example.vpn.GfwKnockerXrayCore.extractTlsSniHostname(clientHello.array())

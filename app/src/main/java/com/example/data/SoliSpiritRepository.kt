@@ -881,8 +881,8 @@ class SoliSpiritRepository(
 
         if (stage1Passed.isEmpty()) continue
 
-        // Stage 2: Strictly verify real encrypted HTTPS port 443 (`www.google.com:443`)
-        // AND raw IP connection to Telegram DC2 (`149.154.167.50:443`)
+        // Stage 2: Strictly verify real encrypted HTTPS port 443 (`www.google.com:443`),
+        // Twitter/X (`api.x.com:443`), AND Telegram DC2 (`149.154.167.50:443`)
         val topToVerify = stage1Passed.take(16)
         val stage2Verified =
           coroutineScope {
@@ -896,23 +896,35 @@ class SoliSpiritRepository(
                       timeoutMs = 2800,
                     ) ?: return@async null
 
+                  val socialLatency =
+                    V2RayOutboundClient.verifySocialMediaCapability(
+                      config = candidate,
+                      timeoutMs = 2600,
+                    )
+
                   val tgLatency =
                     V2RayOutboundClient.verifyTelegramCapability(
                       config = candidate,
                       timeoutMs = 2000,
                     )
 
-                  val effectiveLatency =
-                    if (tgLatency != null) {
-                      (candidate.latencyMs + httpsLatency + tgLatency) / 3L
-                    } else {
-                      // Penalize nodes that cannot reach Telegram DC IPs so Telegram-capable nodes rank first
-                      ((candidate.latencyMs + httpsLatency) / 2L) + 250L
+                  val baseLatency =
+                    when {
+                      socialLatency != null && tgLatency != null ->
+                        (candidate.latencyMs + httpsLatency + socialLatency + tgLatency) / 4L
+                      socialLatency != null ->
+                        ((candidate.latencyMs + httpsLatency + socialLatency) / 3L) + 120L
+                      tgLatency != null ->
+                        // Penalize nodes that cannot reach Twitter/X (e.g. restricted Cloudflare Workers)
+                        // so full-access VPS/unrestricted nodes are always primary!
+                        ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 600L
+                      else ->
+                        ((candidate.latencyMs + httpsLatency) / 2L) + 900L
                     }
 
                   candidate.copy(
-                    latencyMs = effectiveLatency.coerceAtLeast(1L),
-                    speedScore = 10_000.0 / effectiveLatency.coerceAtLeast(1L).toDouble(),
+                    latencyMs = baseLatency.coerceAtLeast(1L),
+                    speedScore = 10_000.0 / baseLatency.coerceAtLeast(1L).toDouble(),
                   )
                 }
               }
@@ -922,7 +934,8 @@ class SoliSpiritRepository(
           }
 
         verifiedPool.addAll(stage2Verified)
-        if (verifiedPool.size >= 2) {
+        // Return immediately once we have at least 2 full-access nodes (latencyMs < 550ms means socialLatency succeeded!)
+        if (verifiedPool.count { it.latencyMs < 550L } >= 2 || verifiedPool.size >= 4) {
           return@withContext verifiedPool
             .distinctBy { it.endpointKey }
             .sortedBy { it.latencyMs }

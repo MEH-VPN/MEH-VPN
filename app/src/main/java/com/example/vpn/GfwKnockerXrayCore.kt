@@ -826,6 +826,7 @@ object GfwKnockerXrayCore {
     private val rawOut: OutputStream,
   ) {
     private val session = engine.session
+    private val wrapLock = Any()
     private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
     private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
     private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 32768))
@@ -836,9 +837,34 @@ object GfwKnockerXrayCore {
       appInBuf.flip()
     }
 
+    private fun wrapEmptyHandshakePacket(): SSLEngineResult.HandshakeStatus {
+      synchronized(wrapLock) {
+        val emptyApp = ByteBuffer.allocate(0)
+        while (true) {
+          netOutBuf.clear()
+          val res = engine.wrap(emptyApp, netOutBuf)
+          when (res.status) {
+            SSLEngineResult.Status.OK -> {
+              netOutBuf.flip()
+              if (netOutBuf.hasRemaining()) {
+                val bytes = ByteArray(netOutBuf.remaining())
+                netOutBuf.get(bytes)
+                rawOut.write(bytes)
+              }
+              rawOut.flush()
+              return res.handshakeStatus
+            }
+            SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+              netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
+            }
+            else -> throw SSLException("SSLEngine wrap status: ${res.status}")
+          }
+        }
+      }
+    }
+
     fun performHandshake() {
       engine.beginHandshake()
-      val emptyApp = ByteBuffer.allocate(0)
       var status = engine.handshakeStatus
       var loops = 0
 
@@ -850,25 +876,7 @@ object GfwKnockerXrayCore {
         }
         when (status) {
           SSLEngineResult.HandshakeStatus.NEED_WRAP -> {
-            netOutBuf.clear()
-            val res = engine.wrap(emptyApp, netOutBuf)
-            status = res.handshakeStatus
-            when (res.status) {
-              SSLEngineResult.Status.OK -> {
-                netOutBuf.flip()
-                while (netOutBuf.hasRemaining()) {
-                  val len = netOutBuf.remaining()
-                  val bytes = ByteArray(len)
-                  netOutBuf.get(bytes)
-                  rawOut.write(bytes)
-                }
-                rawOut.flush()
-              }
-              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
-                netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
-              }
-              else -> throw SSLException("SSLEngine wrap status during handshake: ${res.status}")
-            }
+            status = wrapEmptyHandshakePacket()
           }
 
           SSLEngineResult.HandshakeStatus.NEED_UNWRAP -> {
@@ -915,7 +923,7 @@ object GfwKnockerXrayCore {
 
     private fun fillNetInBuffer(): Boolean {
       netInBuf.compact()
-      if (!netInBuf.hasRemaining()) {
+      if (netInBuf.remaining() < 16384) {
         netInBuf.flip()
         val bigger = ByteBuffer.allocate(netInBuf.capacity() * 2)
         bigger.put(netInBuf)
@@ -950,17 +958,19 @@ object GfwKnockerXrayCore {
             appInBuf.compact()
             val res = engine.unwrap(netInBuf, appInBuf)
             appInBuf.flip()
+            if (res.handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_TASK) {
+              var task = engine.delegatedTask
+              while (task != null) {
+                task.run()
+                task = engine.delegatedTask
+              }
+            }
+            if (engine.handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+              wrapEmptyHandshakePacket()
+            }
             if (appInBuf.hasRemaining()) break
             when (res.status) {
-              SSLEngineResult.Status.OK -> {
-                if (res.handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_TASK) {
-                  var task = engine.delegatedTask
-                  while (task != null) {
-                    task.run()
-                    task = engine.delegatedTask
-                  }
-                }
-              }
+              SSLEngineResult.Status.OK -> {}
               SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
                 if (!fillNetInBuffer()) return -1
               }
@@ -988,38 +998,39 @@ object GfwKnockerXrayCore {
 
     val appOutputStream: OutputStream =
       object : OutputStream() {
-        @Synchronized
         override fun write(b: Int) {
           write(byteArrayOf(b.toByte()), 0, 1)
         }
 
-        @Synchronized
         override fun write(b: ByteArray, off: Int, len: Int) {
           if (len <= 0) return
-          val src = ByteBuffer.wrap(b, off, len)
-          while (src.hasRemaining()) {
-            netOutBuf.clear()
-            val res = engine.wrap(src, netOutBuf)
-            when (res.status) {
-              SSLEngineResult.Status.OK -> {
-                netOutBuf.flip()
-                if (netOutBuf.hasRemaining()) {
-                  val outBytes = ByteArray(netOutBuf.remaining())
-                  netOutBuf.get(outBytes)
-                  rawOut.write(outBytes)
+          synchronized(wrapLock) {
+            val src = ByteBuffer.wrap(b, off, len)
+            while (src.hasRemaining()) {
+              netOutBuf.clear()
+              val res = engine.wrap(src, netOutBuf)
+              when (res.status) {
+                SSLEngineResult.Status.OK -> {
+                  netOutBuf.flip()
+                  if (netOutBuf.hasRemaining()) {
+                    val outBytes = ByteArray(netOutBuf.remaining())
+                    netOutBuf.get(outBytes)
+                    rawOut.write(outBytes)
+                  }
                 }
+                SSLEngineResult.Status.BUFFER_OVERFLOW -> {
+                  netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
+                }
+                else -> throw IOException("SSLEngine write failed: ${res.status}")
               }
-              SSLEngineResult.Status.BUFFER_OVERFLOW -> {
-                netOutBuf = ByteBuffer.allocate(netOutBuf.capacity() * 2)
-              }
-              else -> throw IOException("SSLEngine write failed: ${res.status}")
             }
           }
         }
 
-        @Synchronized
         override fun flush() {
-          rawOut.flush()
+          synchronized(wrapLock) {
+            rawOut.flush()
+          }
         }
 
         override fun close() {

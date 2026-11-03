@@ -382,6 +382,62 @@ object V2RayOutboundClient {
   }
 
   /**
+   * Verifies that this V2Ray server can establish a real end-to-end TLS 443 session to Twitter/X
+   * (`api.x.com:443`) and receive an HTTP response. This filters out restricted Cloudflare Workers
+   * that pass `www.google.com` but reject/drop connections to Twitter/X or Instagram CDNs!
+   */
+  fun verifySocialMediaCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2800,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    if (!isSupportedByEngine(config)) return null
+    val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
+    if (resolvedIp.isEmpty()) return null
+    val resolvedConfig = config.copy(resolvedIp = resolvedIp)
+
+    return try {
+      val elapsedNanos =
+        measureNanoTime {
+          openTunnel(
+            config = resolvedConfig,
+            targetHost = "api.x.com",
+            targetPort = 443,
+            timeoutMs = timeoutMs,
+            protector = protector,
+          ).use { tunnel ->
+            val (tlsIn, tlsOut) =
+              GfwKnockerXrayCore.openSslEngineOverStreams(
+                sslContext = permissiveSslContext,
+                rawIn = tunnel.inputStream,
+                rawOut = tunnel.outputStream,
+                sniHost = "api.x.com",
+                port = 443,
+              )
+            val req =
+              "HEAD / HTTP/1.1\r\n" +
+                "Host: api.x.com\r\n" +
+                "User-Agent: Mozilla/5.0\r\n" +
+                "Connection: close\r\n\r\n"
+            tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+            tlsOut.flush()
+
+            val buf = ByteArray(64)
+            val n = tlsIn.read(buf)
+            if (n <= 0) throw IOException("Empty response from api.x.com over tunnel")
+            val statusLine = String(buf, 0, n, Charsets.US_ASCII)
+            if (!statusLine.startsWith("HTTP/1.1 ") && !statusLine.startsWith("HTTP/2")) {
+              throw IOException("Unexpected api.x.com status: ${statusLine.take(24)}")
+            }
+          }
+        }
+      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  /**
    * Establishes an outbound V2Ray tunnel to [targetHost]:[targetPort] through [config].
    */
   fun openTunnel(
