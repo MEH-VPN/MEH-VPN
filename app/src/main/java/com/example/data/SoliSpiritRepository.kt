@@ -853,7 +853,9 @@ class SoliSpiritRepository(
 
       onLogUpdate("تست سرور ها")
 
-      val verifiedPool = mutableListOf<V2RayConfig>()
+      val fullSocialPool = mutableListOf<V2RayConfig>()
+      val fallbackHttpsPool = mutableListOf<V2RayConfig>()
+      val stage2Semaphore = Semaphore(6)
 
       val waves = supported.chunked(WAVE_SIZE).take(3)
       for (wave in waves) {
@@ -874,94 +876,110 @@ class SoliSpiritRepository(
               .awaitAll()
               .filterNotNull()
               .sortedWith(
-                compareBy<V2RayConfig> { it.latencyMs }
-                  .thenByDescending { it.speedScore }
+                compareBy<V2RayConfig> {
+                  // Slight sorting preference for nodes that have an explicit TLS SNI/Host domain
+                  // over raw-IP nodes with empty SNI (which are easily throttled in Iran)
+                  val noSniPenalty = if (it.sni.isBlank() && it.hostHeader.isBlank()) 120L else 0L
+                  it.latencyMs + noSniPenalty
+                }.thenByDescending { it.speedScore }
               )
           }
 
         if (stage1Passed.isEmpty()) continue
 
-        // Stage 2: Strictly verify 4 concurrent streams over the candidate node in parallel:
-        // 1. Google HTTPS 443 (`www.google.com:443`)
-        // 2. Twitter/X API 443 (`api.x.com:443`)
-        // 3. Instagram API 443 (`i.instagram.com:443`)
-        // 4. Telegram DC2 (`149.154.167.50:443`)
-        // Running these 4 probes concurrently both speeds up verification by 3x AND filters out
-        // servers that choke when an app opens multiple parallel streams!
-        val topToVerify = stage1Passed.take(16)
-        val stage2Verified =
+        // Stage 2: Verify candidate nodes with bounded concurrency (`stage2Semaphore = Semaphore(6)`)
+        // so we never congest the mobile radio with 64 simultaneous TLS handshakes at once!
+        val topToVerify = stage1Passed.take(12)
+        val stage2Results =
           coroutineScope {
             topToVerify
               .map { candidate ->
                 async {
-                  coroutineContext.ensureActive()
-                  kotlinx.coroutines.withTimeoutOrNull(3800L) {
-                    val httpsJob = async {
-                      V2RayOutboundClient.verifyHttpsAndDnsCapability(
-                        config = candidate,
-                        timeoutMs = 2600,
-                      )
-                    }
-                    val twitterJob = async {
-                      V2RayOutboundClient.verifySocialMediaCapability(
-                        config = candidate,
-                        timeoutMs = 2600,
-                      )
-                    }
-                    val instagramJob = async {
-                      V2RayOutboundClient.verifyInstagramCapability(
-                        config = candidate,
-                        timeoutMs = 2600,
-                      )
-                    }
-                    val tgJob = async {
-                      V2RayOutboundClient.verifyTelegramCapability(
-                        config = candidate,
-                        timeoutMs = 2000,
-                      )
-                    }
-
-                    val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
-                    val twitterLatency = twitterJob.await()
-                    val instagramLatency = instagramJob.await()
-                    val tgLatency = tgJob.await()
-
-                    val baseLatency =
-                      when {
-                        twitterLatency != null && instagramLatency != null && tgLatency != null ->
-                          (candidate.latencyMs + httpsLatency + twitterLatency + instagramLatency + tgLatency) / 5L
-                        twitterLatency != null && instagramLatency != null ->
-                          ((candidate.latencyMs + httpsLatency + twitterLatency + instagramLatency) / 4L) + 60L
-                        twitterLatency != null || instagramLatency != null -> {
-                          val soc = twitterLatency ?: instagramLatency ?: httpsLatency
-                          ((candidate.latencyMs + httpsLatency + soc) / 3L) + 250L
-                        }
-                        tgLatency != null ->
-                          ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 900L
-                        else ->
-                          ((candidate.latencyMs + httpsLatency) / 2L) + 1200L
+                  stage2Semaphore.withPermit {
+                    coroutineContext.ensureActive()
+                    kotlinx.coroutines.withTimeoutOrNull(4800L) {
+                      val httpsJob = async {
+                        V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                          config = candidate,
+                          timeoutMs = 3000,
+                        )
+                      }
+                      val twitterJob = async {
+                        V2RayOutboundClient.verifySocialMediaCapability(
+                          config = candidate,
+                          timeoutMs = 3000,
+                        )
+                      }
+                      val instagramJob = async {
+                        V2RayOutboundClient.verifyInstagramCapability(
+                          config = candidate,
+                          timeoutMs = 3000,
+                        )
+                      }
+                      val tgJob = async {
+                        V2RayOutboundClient.verifyTelegramCapability(
+                          config = candidate,
+                          timeoutMs = 2400,
+                        )
                       }
 
-                    candidate.copy(
-                      latencyMs = baseLatency.coerceAtLeast(1L),
-                      speedScore = 10_000.0 / baseLatency.coerceAtLeast(1L).toDouble(),
-                    )
+                      val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
+                      val twitterLatency = twitterJob.await()
+                      val instagramLatency = instagramJob.await()
+                      val tgLatency = tgJob.await()
+
+                      val passedBothSocial = twitterLatency != null && instagramLatency != null
+                      val passedAtLeastOneSocial = twitterLatency != null || instagramLatency != null
+
+                      val effectiveLatency =
+                        when {
+                          passedBothSocial && tgLatency != null ->
+                            (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!! + tgLatency) / 5L
+                          passedBothSocial ->
+                            ((candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!!) / 4L) + 40L
+                          passedAtLeastOneSocial -> {
+                            val soc = twitterLatency ?: instagramLatency ?: httpsLatency
+                            ((candidate.latencyMs + httpsLatency + soc) / 3L) + 200L
+                          }
+                          tgLatency != null ->
+                            ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 800L
+                          else ->
+                            ((candidate.latencyMs + httpsLatency) / 2L) + 1000L
+                        }
+
+                      Pair(
+                        passedBothSocial || passedAtLeastOneSocial,
+                        candidate.copy(
+                          latencyMs = effectiveLatency.coerceAtLeast(1L),
+                          speedScore = 10_000.0 / effectiveLatency.coerceAtLeast(1L).toDouble(),
+                        ),
+                      )
+                    }
                   }
                 }
               }
               .awaitAll()
               .filterNotNull()
-              .sortedBy { it.latencyMs }
           }
 
-        verifiedPool.addAll(stage2Verified)
-        val fullSocialCount = verifiedPool.count { it.latencyMs < 550L }
-        if (fullSocialCount >= 4) {
-          return@withContext selectDiverseCandidates(verifiedPool, maxCount)
+        for ((passedSocial, cfg) in stage2Results) {
+          if (passedSocial) {
+            fullSocialPool.add(cfg)
+          } else {
+            fallbackHttpsPool.add(cfg)
+          }
+        }
+
+        if (fullSocialPool.count { it.latencyMs < 550L } >= 4) {
+          return@withContext selectDiverseCandidates(fullSocialPool, maxCount)
         }
       }
 
-      selectDiverseCandidates(verifiedPool, maxCount)
+      if (fullSocialPool.isNotEmpty()) {
+        selectDiverseCandidates(fullSocialPool, maxCount)
+      } else {
+        selectDiverseCandidates(fallbackHttpsPool, maxCount)
+      }
     }
 
   /**

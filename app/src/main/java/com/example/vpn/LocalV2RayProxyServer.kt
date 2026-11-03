@@ -162,7 +162,9 @@ class LocalV2RayProxyServer(
     }
   private val activeConfigIndex = AtomicInteger(0)
   private val streamDispatchCounter = AtomicInteger(0)
+  private val penalizedIndices = ConcurrentHashMap.newKeySet<Int>()
   private val dnsCache = ConcurrentHashMap<String, ByteArray>()
+  private val inFlightDnsLocks = ConcurrentHashMap<String, Any>()
   private val running = AtomicBoolean(false)
 
   private val relayExecutor: ExecutorService =
@@ -240,6 +242,8 @@ class LocalV2RayProxyServer(
     serverSocket = null
     udpRelaySocket = null
     dnsCache.clear()
+    inFlightDnsLocks.clear()
+    penalizedIndices.clear()
     try {
       relayExecutor.shutdownNow()
     } catch (_: Exception) {}
@@ -247,74 +251,103 @@ class LocalV2RayProxyServer(
 
   /**
    * Opens a V2Ray tunnel across `serverPool` with:
-   * 1. Load distribution across the top verified servers when apps (Instagram/Twitter) burst
+   * 1. Load distribution across healthy verified servers when apps (Instagram/Twitter) burst
    *    15–30 parallel connections, avoiding single-Cloudflare-Worker 6-connection throttling.
    * 2. End-to-end first-response verification (`awaitFirstResponse = true`): when the client sends
    *    an initial TLS `ClientHello` or HTTP request, we verify that the V2Ray server actually
    *    connected to `targetHost:targetPort` and returned at least 1 response byte (`ServerHello`).
-   *    If `candidate` drops the stream (`EOFException`) or blocks `targetHost` (e.g. Twitter on
-   *    a restricted Worker), we immediately fail over to the next candidate in `serverPool`!
+   * 3. Dual-target fallback (`fallbackIpv4`): if a candidate server fails to connect using the
+   *    domain name `targetHost` (e.g. a Cloudflare Worker with restricted DNS), we also try
+   *    connecting via the clean public IPv4 `fallbackIpv4` before failing over to the next server!
    */
   private fun openTunnelWithVerifiedFailover(
     targetHost: String,
     targetPort: Int,
-    timeoutMs: Int = 5200,
+    timeoutMs: Int = 5000,
     initialPayload: ByteArray? = null,
     initialPayloadLen: Int = 0,
     awaitFirstResponse: Boolean = false,
+    fallbackIpv4: String? = null,
   ): OpenedTunnelWithReply {
     val poolSize = serverPool.size
-    // Spread burst connections across up to 6 verified servers so no single Cloudflare Worker or
-    // VPS hits its concurrency/rate limit when Instagram or Twitter opens 15-25 streams in parallel!
-    val primaryWindow = minOf(poolSize, 6)
-    val baseIdx =
-      if (primaryWindow > 1 && initialPayloadLen > 0) {
-        (activeConfigIndex.get() + (streamDispatchCounter.getAndIncrement() % primaryWindow)) % poolSize
+    val healthyIndices = (0 until poolSize).filter { it !in penalizedIndices }
+    val activeWindow = if (healthyIndices.isNotEmpty()) healthyIndices else (0 until poolSize).toList()
+    val windowSize = minOf(activeWindow.size, 4)
+
+    val startSlot =
+      if (windowSize > 1 && initialPayloadLen > 0) {
+        (streamDispatchCounter.getAndIncrement() and 0x7FFFFFFF) % windowSize
       } else {
-        activeConfigIndex.get().coerceIn(0, poolSize - 1)
+        0
+      }
+
+    // Order candidate indices: first the healthy window starting at startSlot, then remaining pool
+    val orderedIndices = ArrayList<Int>(poolSize)
+    for (i in activeWindow.indices) {
+      orderedIndices.add(activeWindow[(startSlot + i) % activeWindow.size])
+    }
+    for (idx in 0 until poolSize) {
+      if (idx !in orderedIndices) {
+        orderedIndices.add(idx)
+      }
+    }
+
+    val targetsToTry =
+      if (!fallbackIpv4.isNullOrBlank() &&
+        fallbackIpv4 != targetHost &&
+        !isFakeIpAddress(fallbackIpv4) &&
+        V2RayOutboundClient.parseIpv4Bytes(fallbackIpv4)?.let { V2RayOutboundClient.isPublicRoutableIpv4(it) } == true
+      ) {
+        listOf(targetHost, fallbackIpv4)
+      } else {
+        listOf(targetHost)
       }
 
     var lastError: Exception? = null
 
-    for (offset in 0 until poolSize) {
-      val idx = (baseIdx + offset) % poolSize
+    for ((attemptIdx, idx) in orderedIndices.withIndex()) {
       val candidate = serverPool[idx]
-      var conn: V2RayOutboundClient.TunnelConnection? = null
-      try {
-        val connectTimeout = if (offset == 0) timeoutMs else 4000
-        conn =
-          V2RayOutboundClient.openTunnel(
-            config = candidate,
-            targetHost = targetHost,
-            targetPort = targetPort,
-            timeoutMs = connectTimeout,
-            protector = protector,
-          )
-        if (initialPayload != null && initialPayloadLen > 0) {
-          conn.outputStream.write(initialPayload, 0, initialPayloadLen)
-          conn.outputStream.flush()
-
-          if (awaitFirstResponse) {
-            conn.setReadTimeout(4200)
-            val replyBuf = ByteArray(16384)
-            val replyLen = conn.inputStream.read(replyBuf)
-            if (replyLen <= 0) {
-              throw IOException("V2Ray server ${candidate.address} closed stream before replying for $targetHost:$targetPort")
-            }
-            conn.setReadTimeout(60_000)
-            if (offset > 0 && baseIdx == activeConfigIndex.get()) {
-              activeConfigIndex.set(idx)
-            }
-            return OpenedTunnelWithReply(conn, replyBuf, replyLen)
-          }
-        }
-        conn.setReadTimeout(60_000)
-        return OpenedTunnelWithReply(conn, null, 0)
-      } catch (e: Exception) {
+      for (hostCandidate in targetsToTry) {
+        var conn: V2RayOutboundClient.TunnelConnection? = null
         try {
-          conn?.close()
-        } catch (_: Exception) {}
-        lastError = e
+          val connectTimeout = if (attemptIdx == 0) timeoutMs else 3800
+          conn =
+            V2RayOutboundClient.openTunnel(
+              config = candidate,
+              targetHost = hostCandidate,
+              targetPort = targetPort,
+              timeoutMs = connectTimeout,
+              protector = protector,
+            )
+          if (initialPayload != null && initialPayloadLen > 0) {
+            conn.outputStream.write(initialPayload, 0, initialPayloadLen)
+            conn.outputStream.flush()
+
+            if (awaitFirstResponse) {
+              conn.setReadTimeout(4000)
+              val replyBuf = ByteArray(16384)
+              val replyLen = conn.inputStream.read(replyBuf)
+              if (replyLen <= 0) {
+                throw IOException("V2Ray server ${candidate.address} closed stream before replying for $hostCandidate:$targetPort")
+              }
+              conn.setReadTimeout(60_000)
+              penalizedIndices.remove(idx)
+              activeConfigIndex.set(idx)
+              return OpenedTunnelWithReply(conn, replyBuf, replyLen)
+            }
+          }
+          conn.setReadTimeout(60_000)
+          return OpenedTunnelWithReply(conn, null, 0)
+        } catch (e: Exception) {
+          try {
+            conn?.close()
+          } catch (_: Exception) {}
+          lastError = e
+        }
+      }
+      // If this candidate failed for all host targets, mark it penalized so burst streams prefer working nodes
+      if (poolSize > 1) {
+        penalizedIndices.add(idx)
       }
     }
     throw lastError ?: IOException("All V2Ray servers in pool failed for $targetHost:$targetPort")
@@ -339,10 +372,10 @@ class LocalV2RayProxyServer(
   }
 
   /**
-   * Reads the initial client payload from [clientIn]. If the payload starts with a TLS Handshake
-   * record (`0x16`), reassembles the complete TLS record (`5 + recordLen` bytes) across TCP segments
-   * so large Post-Quantum TLS 1.3 `ClientHello` packets (used by Twitter/X and Instagram) always
-   * include their `SNI` extension even when split across multiple TCP segments by the TUN MTU.
+   * Reads the initial client payload from [clientIn]. If the payload starts with a valid TLS
+   * Handshake record (`0x16, 0x03, 0x01..0x04`), reassembles the complete TLS record (`5 + recordLen`
+   * bytes) across TCP segments so large Post-Quantum TLS 1.3 `ClientHello` packets (used by Twitter/X
+   * and Instagram) always include their `SNI` extension even when split by the 1400-byte TUN MTU.
    */
   private fun readCompleteFirstClientPacket(
     clientSocket: Socket,
@@ -359,9 +392,13 @@ class LocalV2RayProxyServer(
         return 0
       }
 
-    if ((buffer[0].toInt() and 0xFF) == 0x16) {
+    if (totalRead >= 3 &&
+      (buffer[0].toInt() and 0xFF) == 0x16 &&
+      (buffer[1].toInt() and 0xFF) == 0x03 &&
+      (buffer[2].toInt() and 0xFF) in 1..4
+    ) {
       try {
-        clientSocket.soTimeout = 800
+        clientSocket.soTimeout = 600
         while (totalRead < 5) {
           val r = clientIn.read(buffer, totalRead, 5 - totalRead)
           if (r <= 0) break
@@ -370,11 +407,14 @@ class LocalV2RayProxyServer(
         if (totalRead >= 5) {
           val recordPayloadLen =
             ((buffer[3].toInt() and 0xFF) shl 8) or (buffer[4].toInt() and 0xFF)
-          val expectedTotal = (5 + recordPayloadLen).coerceAtMost(buffer.size)
-          while (totalRead < expectedTotal) {
-            val r = clientIn.read(buffer, totalRead, expectedTotal - totalRead)
-            if (r <= 0) break
-            totalRead += r
+          if (recordPayloadLen in 1..16384) {
+            val expectedTotal = (5 + recordPayloadLen).coerceAtMost(buffer.size)
+            while (totalRead < expectedTotal) {
+              // If we already have the complete SNI extension, don't block if no more bytes are immediately queued
+              val r = clientIn.read(buffer, totalRead, expectedTotal - totalRead)
+              if (r <= 0) break
+              totalRead += r
+            }
           }
         }
       } catch (_: SocketTimeoutException) {
@@ -385,15 +425,14 @@ class LocalV2RayProxyServer(
   }
 
   /**
-   * Handles RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) locally in 0.1ms so apps or
-   * Android's `netd` using TCP port 53 receive the exact same clean IPv4 answers as UDP port 53.
+   * Handles RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) locally via `resolveDnsOverV2Ray`.
    */
   private fun handleLocalTcpDnsSession(
     clientSocket: Socket,
     clientIn: InputStream,
     clientOut: OutputStream,
   ) {
-    clientSocket.soTimeout = 5000
+    clientSocket.soTimeout = 6000
     val lenBuf = ByteArray(2)
     while (running.get()) {
       if (!readExact(clientIn, lenBuf)) break
@@ -458,16 +497,7 @@ class LocalV2RayProxyServer(
 
     when (cmd) {
       0x01 -> {
-        // 1. Immediately refuse TCP port 853 (Android 9 Private DNS / DNS-over-TLS) so Android 9's
-        //    `netd` Opportunistic DoT falls back in 1ms to port 53 (`resolveDnsOverV2Ray`) instead
-        //    of bypassing our local DNS handler and leaking AAAA/QUIC records!
-        if (targetPort == 853) {
-          clientOut.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-          clientOut.flush()
-          return
-        }
-
-        // 2. Intercept TCP port 53 (DNS-over-TCP) and answer locally in 0.1ms via `resolveDnsOverV2Ray`!
+        // Intercept TCP port 53 (DNS-over-TCP) and answer locally via `resolveDnsOverV2Ray`
         if (targetPort == 53) {
           clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
           clientOut.flush()
@@ -478,7 +508,7 @@ class LocalV2RayProxyServer(
         var effectiveHost = resolveFakeIpDomain(rawTargetHost) ?: rawTargetHost
 
         // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
-        // (TLS ClientHello / HTTP request / MTProto preamble)
+        // (TLS ClientHello / HTTP request / MTProto preamble / DoT port 853 handshake)
         clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
         clientOut.flush()
 
@@ -488,7 +518,8 @@ class LocalV2RayProxyServer(
 
         // Unconditional `destOverride: ["http", "tls"]`:
         // Whenever the packet is a TLS ClientHello with an SNI hostname or an HTTP request with a
-        // Host header, ALWAYS use the sniffed hostname as the authoritative destination!
+        // Host header, use the sniffed hostname as the primary destination and keep any real public
+        // IPv4 `rawTargetHost` as fallback!
         var isHttpOrTlsRequest = false
         if (firstLen > 0) {
           val tlsSni = GfwKnockerXrayCore.extractTlsSniHostname(firstBuffer, firstLen)
@@ -521,6 +552,7 @@ class LocalV2RayProxyServer(
               initialPayload = firstBuffer,
               initialPayloadLen = firstLen,
               awaitFirstResponse = isHttpOrTlsRequest && firstLen > 0,
+              fallbackIpv4 = rawTargetHost,
             )
           } catch (_: Exception) {
             return
@@ -542,9 +574,9 @@ class LocalV2RayProxyServer(
         }
       }
       0x03 -> {
-        // UDP ASSOCIATE: keep control socket open for up to 120s so tun2socks UDP associations
-        // remain active across continuous browsing in Instagram, Twitter, and YouTube.
-        clientSocket.soTimeout = 120_000
+        // UDP ASSOCIATE: keep control socket open for the entire lifetime of the tun2socks session
+        // (soTimeout = 0) so UDP DNS associations never expire while browsing!
+        clientSocket.soTimeout = 0
         val pHigh = ((udpListenPort ushr 8) and 0xFF).toByte()
         val pLow = (udpListenPort and 0xFF).toByte()
         clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, pHigh, pLow))
@@ -687,20 +719,19 @@ class LocalV2RayProxyServer(
   }
 
   /**
-   * Builds an instant RFC 1035 DNS `A` response for [dnsQuery] returning [ipv4Bytes] with a 120s TTL.
+   * Builds an RFC 1035 DNS `A` response for [dnsQuery] returning [ipv4Bytes] with a 120s TTL,
+   * properly truncated to `questionEndOffset` so no trailing EDNS0 bytes remain when `ARCOUNT = 0`.
    */
   private fun buildSyntheticDnsAResponse(
     dnsQuery: ByteArray,
     questionEndOffset: Int,
     ipv4Bytes: ByteArray,
   ): ByteArray {
-    val questionSection = dnsQuery.copyOfRange(0, questionEndOffset)
-    val out = ByteArrayOutputStream(questionSection.size + 16)
-    out.write(questionSection)
-    val respHeader = out.toByteArray()
+    val safeEnd = questionEndOffset.coerceIn(12, dnsQuery.size)
+    val respHeader = dnsQuery.copyOfRange(0, safeEnd)
 
-    // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, RCODE=0 -> 0x8180
-    respHeader[2] = 0x81.toByte()
+    // Flags: preserve Opcode and RD from query, set QR=1, RA=1, RCODE=0
+    respHeader[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
     respHeader[3] = 0x80.toByte()
     // QDCOUNT = 1
     respHeader[4] = 0x00
@@ -729,32 +760,26 @@ class LocalV2RayProxyServer(
     return finalOut.toByteArray()
   }
 
+  /**
+   * Resolves DNS queries over the V2Ray tunnel with:
+   * 1. Instant suppression of `AAAA` (`QTYPE=28`) and `HTTPS/SVCB` (`QTYPE=65/64`) truncated to
+   *    `questionEndOffset` so Android's `ns_initparse` (`cp == eom`) accepts the response and apps
+   *    never stall on IPv6 or UDP 443 QUIC.
+   * 2. Instant `dnsCache` lookup + in-flight request deduplication (`inFlightDnsLocks`) so burst
+   *    DNS queries from Instagram/Twitter never spawn duplicate tunnels.
+   * 3. Single-RTT RFC 1035 DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) over the V2Ray tunnel
+   *    (`resolveDnsOverTcpViaTunnel`), falling back to DoH (`resolveDnsOverHttpsViaTunnel` &
+   *    `resolveDnsOverHttpsProtectedDirect`), and finally synthetic clean IP fallback if offline.
+   */
   private fun resolveDnsOverV2Ray(dnsQuery: ByteArray): ByteArray? {
     if (dnsQuery.size < 12) return null
     val question = parseDnsQuestion(dnsQuery)
     if (question != null) {
-      // 1. Suppress IPv6 (AAAA=28) and HTTPS/SVCB (65/64) queries in 0.1ms with NOERROR (0 answers)
-      //    so Android 9 and Chrome/Instagram/Twitter never stall on IPv6 or UDP 443 QUIC!
+      // Suppress IPv6 (AAAA=28) and HTTPS/SVCB (65/64) queries in 0.05ms with a properly truncated
+      // NOERROR (0 answers) response (`size == questionEndOffset`) so Android's `ns_initparse`
+      // (`cp == eom`) accepts it and apps use IPv4 TCP 443 immediately.
       if (question.qtype == 28 || question.qtype == 65 || question.qtype == 64) {
-        return buildEmptyDnsNoerrorResponse(dnsQuery)
-      }
-
-      // 2. For IPv4 (A=1) queries when connected to a V2Ray/Xray proxy server:
-      //    - First check if the domain belongs to Twitter/X, Instagram/Meta, YouTube/Google, or Telegram
-      //      and return its real public Anycast IPv4 (so Cronet/Proxygen never see a 198.18.0.0/15 bogon IP
-      //      and properly coalesce HTTP/2 connections!).
-      //    - Otherwise allocate a collision-free virtual IPv4 in `198.18.x.y` mapped to `question.domain`.
-      if (question.qtype == 1 &&
-        question.domain.isNotEmpty() &&
-        activeConfig.protocol != V2RayProtocol.SERVERLESS
-      ) {
-        val cleanIpStr =
-          resolveKnownCleanPublicIpv4(question.domain)
-            ?: allocateFakeIpForDomain(question.domain)
-        val ipBytes = V2RayOutboundClient.parseIpv4Bytes(cleanIpStr)
-        if (ipBytes != null) {
-          return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, ipBytes)
-        }
+        return buildEmptyDnsNoerrorResponse(dnsQuery, question.questionEndOffset)
       }
     }
 
@@ -764,54 +789,156 @@ class LocalV2RayProxyServer(
       } else {
         null
       }
+
     if (cacheKey != null) {
-      val cached = dnsCache[cacheKey]
-      if (cached != null && cached.size >= 12) {
-        val copy = cached.copyOf()
-        copy[0] = dnsQuery[0]
-        copy[1] = dnsQuery[1]
-        return copy
-      }
-    }
-
-    // When running in Serverless mode, resolve real IPs via fragmented DoH (port 443)
-    if (activeConfig.protocol == V2RayProtocol.SERVERLESS) {
-      val directDoh = resolveDnsOverHttpsProtectedDirect(dnsQuery)
-      if (directDoh != null && isValidUnpoisonedDnsResponse(directDoh)) {
-        if (cacheKey != null && dnsCache.size < 512) {
-          dnsCache[cacheKey] = directDoh.copyOf()
+      dnsCache[cacheKey]?.let { cached ->
+        if (cached.size >= 12) {
+          val copy = cached.copyOf()
+          copy[0] = dnsQuery[0]
+          copy[1] = dnsQuery[1]
+          return copy
         }
-        return directDoh
       }
     }
 
-    val dohTunnelResp = resolveDnsOverHttpsViaTunnel(dnsQuery)
-    if (dohTunnelResp != null && isValidUnpoisonedDnsResponse(dohTunnelResp)) {
-      if (cacheKey != null && dnsCache.size < 512) {
-        dnsCache[cacheKey] = dohTunnelResp.copyOf()
+    val lock = if (cacheKey != null) inFlightDnsLocks.computeIfAbsent(cacheKey) { Any() } else Any()
+    synchronized(lock) {
+      try {
+        if (cacheKey != null) {
+          dnsCache[cacheKey]?.let { cached ->
+            if (cached.size >= 12) {
+              val copy = cached.copyOf()
+              copy[0] = dnsQuery[0]
+              copy[1] = dnsQuery[1]
+              return copy
+            }
+          }
+        }
+
+        // 1. When running in Serverless mode, resolve real IPs via fragmented DoH (port 443)
+        if (activeConfig.protocol == V2RayProtocol.SERVERLESS) {
+          val directDoh = resolveDnsOverHttpsProtectedDirect(dnsQuery)
+          if (directDoh != null && isValidUnpoisonedDnsResponse(directDoh)) {
+            if (cacheKey != null && dnsCache.size < 1024) {
+              dnsCache[cacheKey] = directDoh.copyOf()
+            }
+            return directDoh
+          }
+        } else {
+          // 2. Fast 1-RTT DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) inside the encrypted V2Ray tunnel
+          val tcpDnsResp = resolveDnsOverTcpViaTunnel(dnsQuery)
+          if (tcpDnsResp != null && isValidUnpoisonedDnsResponse(tcpDnsResp)) {
+            if (cacheKey != null && dnsCache.size < 1024) {
+              dnsCache[cacheKey] = tcpDnsResp.copyOf()
+            }
+            return tcpDnsResp
+          }
+
+          // 3. Fallback: DNS-over-HTTPS (`8.8.8.8:443`) inside the V2Ray tunnel
+          val dohTunnelResp = resolveDnsOverHttpsViaTunnel(dnsQuery)
+          if (dohTunnelResp != null && isValidUnpoisonedDnsResponse(dohTunnelResp)) {
+            if (cacheKey != null && dnsCache.size < 1024) {
+              dnsCache[cacheKey] = dohTunnelResp.copyOf()
+            }
+            return dohTunnelResp
+          }
+        }
+
+        // 4. Fallback: Protected direct fragmented DoH (`8.8.8.8:443` / `1.1.1.1:443`)
+        val directDohResp = resolveDnsOverHttpsProtectedDirect(dnsQuery)
+        if (directDohResp != null && isValidUnpoisonedDnsResponse(directDohResp)) {
+          if (cacheKey != null && dnsCache.size < 1024) {
+            dnsCache[cacheKey] = directDohResp.copyOf()
+          }
+          return directDohResp
+        }
+
+        // 5. Emergency synthetic fallback if all remote DNS servers timed out
+        if (question != null && question.qtype == 1 && question.domain.isNotEmpty()) {
+          val fallbackIpStr =
+            resolveKnownCleanPublicIpv4(question.domain)
+              ?: allocateFakeIpForDomain(question.domain)
+          val ipBytes = V2RayOutboundClient.parseIpv4Bytes(fallbackIpStr)
+          if (ipBytes != null) {
+            return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, ipBytes)
+          }
+        }
+      } finally {
+        if (cacheKey != null) {
+          inFlightDnsLocks.remove(cacheKey, lock)
+        }
       }
-      return dohTunnelResp
     }
 
-    val directDohResp = resolveDnsOverHttpsProtectedDirect(dnsQuery)
-    if (directDohResp != null && isValidUnpoisonedDnsResponse(directDohResp)) {
-      if (cacheKey != null && dnsCache.size < 512) {
-        dnsCache[cacheKey] = directDohResp.copyOf()
-      }
-      return directDohResp
-    }
+    return buildEmptyDnsNoerrorResponse(dnsQuery, question?.questionEndOffset ?: dnsQuery.size)
+  }
 
-    return buildEmptyDnsNoerrorResponse(dnsQuery)
+  /**
+   * Resolves [dnsQuery] using RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) to `8.8.8.8:53`
+   * or `1.1.1.1:53` over the V2Ray tunnel in a single round-trip (zero inner TLS handshake).
+   */
+  private fun resolveDnsOverTcpViaTunnel(dnsQuery: ByteArray): ByteArray? {
+    val tcpFrame = ByteArray(2 + dnsQuery.size)
+    tcpFrame[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
+    tcpFrame[1] = (dnsQuery.size and 0xFF).toByte()
+    System.arraycopy(dnsQuery, 0, tcpFrame, 2, dnsQuery.size)
+
+    for (dnsServerIp in listOf("8.8.8.8", "1.1.1.1")) {
+      try {
+        val opened =
+          openTunnelWithVerifiedFailover(
+            targetHost = dnsServerIp,
+            targetPort = 53,
+            timeoutMs = 2200,
+            initialPayload = tcpFrame,
+            initialPayloadLen = tcpFrame.size,
+            awaitFirstResponse = true,
+          )
+        opened.connection.use { tunnel ->
+          val firstBytes = opened.firstReplyBytes ?: return@use
+          val firstLen = opened.firstReplyLen
+          if (firstLen <= 0) return@use
+
+          val buf = ByteArrayOutputStream(512)
+          buf.write(firstBytes, 0, firstLen)
+          val tmp = ByteArray(512)
+
+          while (buf.size() < 2) {
+            val r = tunnel.inputStream.read(tmp)
+            if (r <= 0) break
+            buf.write(tmp, 0, r)
+          }
+          val current = buf.toByteArray()
+          if (current.size < 2) return@use
+          val expectedDnsLen = ((current[0].toInt() and 0xFF) shl 8) or (current[1].toInt() and 0xFF)
+          if (expectedDnsLen !in 12..4096) return@use
+
+          while (buf.size() < 2 + expectedDnsLen) {
+            val r = tunnel.inputStream.read(tmp)
+            if (r <= 0) break
+            buf.write(tmp, 0, r)
+          }
+          val full = buf.toByteArray()
+          if (full.size >= 2 + expectedDnsLen) {
+            val dnsResp = full.copyOfRange(2, 2 + expectedDnsLen)
+            dnsResp[0] = dnsQuery[0]
+            dnsResp[1] = dnsQuery[1]
+            return dnsResp
+          }
+        }
+      } catch (_: Exception) {}
+    }
+    return null
   }
 
   private fun resolveDnsOverHttpsViaTunnel(dnsQuery: ByteArray): ByteArray? {
-    for ((targetIp, sniHost) in listOf("8.8.8.8" to "dns.google", "9.9.9.9" to "dns.quad9.net")) {
+    for ((targetIp, sniHost) in listOf("8.8.8.8" to "dns.google", "1.1.1.1" to "cloudflare-dns.com")) {
       try {
         val opened =
           openTunnelWithVerifiedFailover(
             targetHost = targetIp,
             targetPort = 443,
-            timeoutMs = 2200,
+            timeoutMs = 2500,
           )
         opened.connection.use { tunnel ->
           val (tlsIn, tlsOut) =
@@ -998,7 +1125,7 @@ class LocalV2RayProxyServer(
       val rawHost = target.substringBeforeLast(":").trim()
       val host = resolveFakeIpDomain(rawHost) ?: rawHost
       val port = target.substringAfterLast(":", "443").toIntOrNull() ?: 443
-      if (host.isEmpty() || port == 853) return
+      if (host.isEmpty()) return
 
       val established = "HTTP/1.1 200 Connection Established\r\n\r\n"
       clientOut.write(established.toByteArray(Charsets.US_ASCII))
@@ -1024,6 +1151,7 @@ class LocalV2RayProxyServer(
           initialPayload = firstBuffer,
           initialPayloadLen = firstLen,
           awaitFirstResponse = firstLen > 0,
+          fallbackIpv4 = rawHost,
         )
       opened.connection.use { tunnel ->
         if (opened.firstReplyBytes != null && opened.firstReplyLen > 0) {
@@ -1065,6 +1193,7 @@ class LocalV2RayProxyServer(
           initialPayload = rewrittenBytes,
           initialPayloadLen = rewrittenBytes.size,
           awaitFirstResponse = true,
+          fallbackIpv4 = rawHost,
         )
       opened.connection.use { tunnel ->
         if (opened.firstReplyBytes != null && opened.firstReplyLen > 0) {
@@ -1083,11 +1212,21 @@ class LocalV2RayProxyServer(
     }
   }
 
-  private fun buildEmptyDnsNoerrorResponse(dnsQuery: ByteArray): ByteArray {
-    val resp = ByteArray(dnsQuery.size)
-    System.arraycopy(dnsQuery, 0, resp, 0, dnsQuery.size)
-    resp[2] = 0x81.toByte()
+  /**
+   * Builds an RFC 1035 empty `NOERROR` response truncated to [questionEndOffset] (`QDCOUNT=1`,
+   * `ANCOUNT=0`, `NSCOUNT=0`, `ARCOUNT=0`) so no trailing EDNS0 `OPT` bytes remain and Android's
+   * `ns_initparse` (`cp == eom`) always accepts it.
+   */
+  private fun buildEmptyDnsNoerrorResponse(
+    dnsQuery: ByteArray,
+    questionEndOffset: Int = parseDnsQuestion(dnsQuery)?.questionEndOffset ?: dnsQuery.size,
+  ): ByteArray {
+    val safeLen = questionEndOffset.coerceIn(12, dnsQuery.size)
+    val resp = dnsQuery.copyOfRange(0, safeLen)
+    resp[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
     resp[3] = 0x80.toByte()
+    resp[4] = 0x00
+    resp[5] = 0x01
     resp[6] = 0x00
     resp[7] = 0x00
     resp[8] = 0x00

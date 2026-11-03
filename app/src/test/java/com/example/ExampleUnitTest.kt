@@ -384,19 +384,142 @@ class ExampleUnitTest {
     val proxy = LocalV2RayProxyServer(configs = candidates, protector = { true })
     val port = proxy.start()
     try {
-      // Simulate EXACT tun2socks behavior:
-      // 1. App queries DNS via UDP 53 -> gets IPv4 address (4 bytes).
-      // 2. App opens TCP connection to that IPv4:443.
-      // 3. tun2socks intercepts the TCP SYN to IPv4:443 and sends SOCKS5 CONNECT with ATYP=0x01 (4-byte IPv4, NOT domain name!).
-      // 4. App sends TLS ClientHello with SNI = hostname over that socket!
+      // Helper to send a real Android-style DNS query (with 11-byte EDNS0 OPT record, ARCOUNT=1)
+      // through SOCKS5 UDP ASSOCIATE (cmd = 0x03) -> LocalV2RayProxyServer UDP relay -> V2Ray tunnel
+      fun queryDnsViaSocks5UdpAssociate(hostname: String, qtype: Int): ByteArray {
+        Socket("127.0.0.1", port).use { controlSocket ->
+          controlSocket.soTimeout = 8_000
+          val out = controlSocket.getOutputStream()
+          val inp = java.io.DataInputStream(controlSocket.getInputStream())
+          out.write(byteArrayOf(0x05, 0x01, 0x00))
+          out.flush()
+          val greet = ByteArray(2)
+          inp.readFully(greet)
+          // Send CMD = 0x03 (UDP ASSOCIATE)
+          out.write(byteArrayOf(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+          out.flush()
+          val assocResp = ByteArray(10)
+          inp.readFully(assocResp)
+          assertEquals("SOCKS5 UDP ASSOCIATE must succeed", 0x00, assocResp[1].toInt())
+          val udpRelayPort = ((assocResp[8].toInt() and 0xFF) shl 8) or (assocResp[9].toInt() and 0xFF)
+
+          // Build DNS query with Android 9 EDNS0 OPT record (ARCOUNT = 1, 11 trailing bytes)
+          val qbuf = java.io.ByteArrayOutputStream()
+          qbuf.write(byteArrayOf(0x12, 0x34, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01))
+          for (label in hostname.split('.')) {
+            val lb = label.toByteArray(Charsets.US_ASCII)
+            qbuf.write(lb.size)
+            qbuf.write(lb)
+          }
+          qbuf.write(0x00)
+          qbuf.write((qtype ushr 8) and 0xFF)
+          qbuf.write(qtype and 0xFF)
+          qbuf.write(0x00)
+          qbuf.write(0x01)
+          val questionEndOffset = qbuf.size()
+          // Append 11-byte EDNS0 OPT record (root=0x00, type=41, payload=4096, rcode=0, rdlen=0)
+          qbuf.write(byteArrayOf(0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+          val dnsQueryBytes = qbuf.toByteArray()
+
+          // Wrap in SOCKS5 UDP header targeting 8.8.8.8:53
+          val socks5UdpReq = ByteArray(10 + dnsQueryBytes.size)
+          socks5UdpReq[3] = 0x01 // ATYP IPv4
+          socks5UdpReq[4] = 8
+          socks5UdpReq[5] = 8
+          socks5UdpReq[6] = 8
+          socks5UdpReq[7] = 8
+          socks5UdpReq[8] = 0
+          socks5UdpReq[9] = 53
+          System.arraycopy(dnsQueryBytes, 0, socks5UdpReq, 10, dnsQueryBytes.size)
+
+          java.net.DatagramSocket().use { udpSocket ->
+            udpSocket.soTimeout = 8_000
+            val pkt = java.net.DatagramPacket(
+              socks5UdpReq,
+              socks5UdpReq.size,
+              InetAddress.getByName("127.0.0.1"),
+              udpRelayPort,
+            )
+            udpSocket.send(pkt)
+            val recvBuf = ByteArray(2048)
+            val recvPkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
+            udpSocket.receive(recvPkt)
+            assertTrue("SOCKS5 UDP reply must be > 22 bytes", recvPkt.length > 22)
+            val dnsReply = recvBuf.copyOfRange(10, recvPkt.length)
+            if (qtype == 28) {
+              // Verify AAAA NOERROR empty response has ZERO trailing EDNS0 garbage bytes!
+              assertEquals(
+                "AAAA empty NOERROR response must truncate EDNS0 trailing bytes so Android libnetd_resolv ns_initparse (cp == eom) succeeds",
+                questionEndOffset,
+                dnsReply.size,
+              )
+            }
+            return dnsReply
+          }
+        }
+      }
+
+      // Parse first IPv4 A record from raw DNS response
+      fun extractFirstARecord(dnsReply: ByteArray): ByteArray? {
+        if (dnsReply.size < 12) return null
+        val anCount = ((dnsReply[6].toInt() and 0xFF) shl 8) or (dnsReply[7].toInt() and 0xFF)
+        if (anCount <= 0) return null
+        var idx = 12
+        // Skip QNAME
+        while (idx < dnsReply.size) {
+          val len = dnsReply[idx].toInt() and 0xFF
+          if (len == 0) {
+            idx += 1
+            break
+          }
+          if ((len and 0xC0) == 0xC0) {
+            idx += 2
+            break
+          }
+          idx += 1 + len
+        }
+        idx += 4 // QTYPE + QCLASS
+        repeat(anCount) {
+          if (idx >= dnsReply.size) return null
+          // Skip RR NAME
+          while (idx < dnsReply.size) {
+            val len = dnsReply[idx].toInt() and 0xFF
+            if (len == 0) {
+              idx += 1
+              break
+            }
+            if ((len and 0xC0) == 0xC0) {
+              idx += 2
+              break
+            }
+            idx += 1 + len
+          }
+          if (idx + 10 > dnsReply.size) return null
+          val rtype = ((dnsReply[idx].toInt() and 0xFF) shl 8) or (dnsReply[idx + 1].toInt() and 0xFF)
+          val rdlen = ((dnsReply[idx + 8].toInt() and 0xFF) shl 8) or (dnsReply[idx + 9].toInt() and 0xFF)
+          idx += 10
+          if (idx + rdlen > dnsReply.size) return null
+          if (rtype == 1 && rdlen == 4) {
+            return dnsReply.copyOfRange(idx, idx + 4)
+          }
+          idx += rdlen
+        }
+        return null
+      }
+
       val customDns = object : okhttp3.Dns {
         override fun lookup(hostname: String): List<InetAddress> {
-          val ipStr =
-            LocalV2RayProxyServer.resolveKnownCleanPublicIpv4(hostname)
-              ?: LocalV2RayProxyServer.allocateFakeIpForDomain(hostname)
-          val bytes = V2RayOutboundClient.parseIpv4Bytes(ipStr)!!
-          // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes!
-          return listOf(InetAddress.getByAddress("", bytes))
+          // 1. Test Android's simultaneous AAAA query with EDNS0
+          val aaaaReply = queryDnsViaSocks5UdpAssociate(hostname, qtype = 28)
+          assertEquals(0, ((aaaaReply[6].toInt() and 0xFF) shl 8) or (aaaaReply[7].toInt() and 0xFF))
+          // 2. Test Android's A query via SOCKS5 UDP ASSOCIATE -> real DNS over V2Ray
+          val aReply = queryDnsViaSocks5UdpAssociate(hostname, qtype = 1)
+          val ipv4Bytes = extractFirstARecord(aReply)
+          assertNotNull("Expected valid IPv4 A record from SOCKS5 UDP DNS for $hostname", ipv4Bytes)
+          val ipStr = "${ipv4Bytes!![0].toInt() and 0xFF}.${ipv4Bytes[1].toInt() and 0xFF}.${ipv4Bytes[2].toInt() and 0xFF}.${ipv4Bytes[3].toInt() and 0xFF}"
+          println("DIAG_UDP_DNS: $hostname -> $ipStr (replySize=${aReply.size} bytes)")
+          // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes (ATYP=0x01)!
+          return listOf(InetAddress.getByAddress("", ipv4Bytes))
         }
       }
 
@@ -452,6 +575,7 @@ class ExampleUnitTest {
           .build()
 
       val urls = listOf(
+        "https://www.google.com/generate_204",
         "https://www.instagram.com/",
         "https://i.instagram.com/api/v1/si/fetch_headers/",
         "https://graph.instagram.com/",

@@ -227,23 +227,18 @@ class MehVpnService : VpnService() {
       val proxyPort = proxyServer.start()
       localProxyServer = proxyServer
 
-      // 2. Establish full-device Android TUN interface (0.0.0.0/0 + IPv6 2000::/3) excluding our own app
+      // 2. Establish full-device Android IPv4 TUN interface (0.0.0.0/0) excluding our own app.
+      // Keeping the TUN interface strictly IPv4-only ensures Android's Bionic `getaddrinfo`
+      // (`AI_ADDRCONFIG` / `have_ipv6 == false`) only queries `A` (IPv4) records even when
+      // Android 9 Private DNS (DoT) is active, and prevents apps from attempting IPv6 connections.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
           .setMtu(1400)
           .addAddress("10.10.14.2", 24)
           .addRoute("0.0.0.0", 0)
-          .addDnsServer("10.10.14.1")
           .addDnsServer("8.8.8.8")
           .addDnsServer("1.1.1.1")
-
-      try {
-        // Capture IPv6 global unicast traffic on Irancell/MCI cellular APNs so it cannot bypass the VPN
-        // and gets SNI-sniffed by LocalV2RayProxyServer over our IPv4 V2Ray tunnel.
-        builder.addAddress("fd00:10:10:14::2", 128)
-        builder.addRoute("2000::", 3)
-      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
