@@ -39,7 +39,7 @@ enum class MethodRunStatus {
 data class MethodItemState(
   val method: MehConnectionMethod,
   val status: MethodRunStatus = MethodRunStatus.IDLE,
-  val statusTextFa: String = "تست و اتصال",
+  val statusTextFa: String = "تست",
   val latencyMs: Long? = null,
 )
 
@@ -136,13 +136,9 @@ class MehViewModel(
 
   /**
    * Automatic sequential connection pipeline:
-   * 1. First tries standard V2Ray (`SoliSpirit/v2ray-configs` + `GFW-knocker/Xray-core`).
-   * 2. If V2Ray fails, automatically falls back through all `patterniha` methods in order:
-   *    - `PATTERNIHA_FREE_CONFIGS` (`patterniha/Free-Configs` F&F)
-   *    - `PATTERNIHA_ZEUS` (`patterniha/Z-E-U-S` clean Cloudflare IP)
-   *    - `PATTERNIHA_SERVERLESS_FRAG_A` (`patterniha/Serverless-for-Iran` Frag-A)
-   *    - `PATTERNIHA_SERVERLESS_FRAG_B` (`patterniha/Serverless-for-Iran` Frag-B)
-   *    - `PATTERNIHA_SNI_SPOOFING_MMDF` (`patterniha/SNI-Spoofing` & `MMDF`)
+   * 1. First tries standard V2Ray (`SoliSpirit/v2ray-configs`).
+   * 2. If V2Ray fails, automatically falls back through `WhiteDNS`, `CluvexStudio/Aether`,
+   *    `GFW-knocker`, and `patterniha` methods in order.
    */
   private fun startAutoConnectPipeline(
     context: Context,
@@ -172,7 +168,7 @@ class MehViewModel(
             updateMethodState(
               method = method,
               status = MethodRunStatus.TESTING,
-              statusTextFa = "در حال تست...",
+              statusTextFa = "در حال تست",
               latencyMs = null,
             )
 
@@ -200,7 +196,7 @@ class MehViewModel(
                   updateMethodState(
                     method = method,
                     status = MethodRunStatus.CONNECTED,
-                    statusTextFa = "آماده اتصال (${ping}ms)",
+                    statusTextFa = "متصل (${ping}ms)",
                     latencyMs = ping,
                   )
                   break
@@ -209,11 +205,11 @@ class MehViewModel(
               updateMethodState(
                 method = method,
                 status = MethodRunStatus.FAILED,
-                statusTextFa = "عدم پاسخ - رفتن به روش بعدی",
+                statusTextFa = "ناموفق",
                 latencyMs = null,
               )
             } else {
-              // Sequential fallback through Patterniha methods
+              // Sequential fallback through remaining methods
               _uiState.update {
                 it.copy(
                   phase = MehPhase.TESTING_SPEED,
@@ -236,7 +232,7 @@ class MehViewModel(
                 updateMethodState(
                   method = method,
                   status = MethodRunStatus.CONNECTED,
-                  statusTextFa = "آماده اتصال (${ping}ms)",
+                  statusTextFa = "متصل (${ping}ms)",
                   latencyMs = ping,
                 )
                 break
@@ -244,7 +240,7 @@ class MehViewModel(
                 updateMethodState(
                   method = method,
                   status = MethodRunStatus.FAILED,
-                  statusTextFa = "عدم پاسخ - تست مجدد",
+                  statusTextFa = "ناموفق",
                   latencyMs = null,
                 )
               }
@@ -290,7 +286,7 @@ class MehViewModel(
   }
 
   /**
-   * Called when the user clicks on a specific method inside the "اگه وصل نشدید اینجا کلیک کنید" sheet
+   * Called when the user clicks on a specific method inside the methods sheet
    * to test and connect with that individual method.
    */
   fun testAndConnectSingleMethod(
@@ -309,14 +305,14 @@ class MehViewModel(
             val updatedMap = current.methodStates.toMutableMap()
             updatedMap.forEach { (k, v) ->
               if (k != method && v.status == MethodRunStatus.CONNECTED) {
-                updatedMap[k] = v.copy(status = MethodRunStatus.IDLE, statusTextFa = "تست و اتصال")
+                updatedMap[k] = v.copy(status = MethodRunStatus.IDLE, statusTextFa = "تست")
               }
             }
             updatedMap[method] =
               MethodItemState(
                 method = method,
                 status = MethodRunStatus.TESTING,
-                statusTextFa = "در حال دریافت و تست...",
+                statusTextFa = "در حال تست",
                 latencyMs = null,
               )
             current.copy(
@@ -350,7 +346,7 @@ class MehViewModel(
             updateMethodState(
               method = method,
               status = MethodRunStatus.FAILED,
-              statusTextFa = "ناموفق - دوباره امتحان کنید",
+              statusTextFa = "ناموفق",
               latencyMs = null,
             )
             _uiState.update {
@@ -382,7 +378,7 @@ class MehViewModel(
           updateMethodState(
             method = method,
             status = MethodRunStatus.FAILED,
-            statusTextFa = "خطا در تست روش",
+            statusTextFa = "ناموفق",
             latencyMs = null,
           )
           _uiState.update {
