@@ -143,6 +143,10 @@ object V2RayOutboundClient {
       return if (isPublicRoutableIpv4(bytes)) trimmed else null
     }
     resolvedEndpointCache[trimmed.lowercase()]?.let { return it }
+    LocalV2RayProxyServer.lookupRealIpForDomain(trimmed)?.let { tunnelResolvedIp ->
+      resolvedEndpointCache[trimmed.lowercase()] = tunnelResolvedIp
+      return tunnelResolvedIp
+    }
 
     try {
       val candidates = InetAddress.getAllByName(trimmed)
@@ -493,6 +497,7 @@ object V2RayOutboundClient {
     targetPort: Int,
     timeoutMs: Int = 7000,
     protector: ((Socket) -> Boolean)? = null,
+    fallbackIpv4: String? = null,
   ): TunnelConnection {
     if (config.protocol == V2RayProtocol.SERVERLESS) {
       return openDirectServerlessFragmentTunnel(
@@ -501,6 +506,7 @@ object V2RayOutboundClient {
         targetPort = targetPort,
         timeoutMs = timeoutMs,
         protector = protector,
+        fallbackIpv4 = fallbackIpv4,
       )
     }
 
@@ -544,7 +550,7 @@ object V2RayOutboundClient {
               GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS
             }
           Pair(
-            BufferedInputStream(rawSocket.getInputStream(), 16384),
+            BufferedInputStream(rawSocket.getInputStream(), 32768),
             GfwKnockerXrayCore.FragmentWriterOutputStream(
               rawSocket.getOutputStream(),
               tcpProfile,
@@ -605,8 +611,8 @@ object V2RayOutboundClient {
 
   /**
    * Direct Serverless Fragmented Tunnel (`patterniha/Serverless-for-Iran`, `CluvexStudio/Aether`, `WhiteDNS`):
-   * Connects directly to [targetHost]:[targetPort] using unpoisoned DNS (DoH) and wraps the outbound
-   * TCP stream in `GfwKnockerXrayCore.FragmentWriterOutputStream`.
+   * Connects directly to [targetHost]:[targetPort] using unpoisoned DNS (tunnel cache / [fallbackIpv4] / DoH)
+   * and wraps the outbound TCP stream in `GfwKnockerXrayCore.FragmentWriterOutputStream`.
    */
   private fun openDirectServerlessFragmentTunnel(
     config: V2RayConfig,
@@ -614,6 +620,7 @@ object V2RayOutboundClient {
     targetPort: Int,
     timeoutMs: Int,
     protector: ((Socket) -> Boolean)?,
+    fallbackIpv4: String? = null,
   ): TunnelConnection {
     val rawSocket = Socket()
     try {
@@ -625,7 +632,17 @@ object V2RayOutboundClient {
       rawSocket.keepAlive = true
       rawSocket.soTimeout = timeoutMs
 
-      val resolvedTargetIp = resolveEndpointIpv4(targetHost) ?: targetHost
+      val resolvedTargetIp =
+        when {
+          parseIpv4Bytes(targetHost)?.let { isPublicRoutableIpv4(it) } == true -> targetHost
+          !fallbackIpv4.isNullOrBlank() &&
+            parseIpv4Bytes(fallbackIpv4)?.let { isPublicRoutableIpv4(it) } == true -> fallbackIpv4
+          else ->
+            LocalV2RayProxyServer.lookupRealIpForDomain(targetHost)
+              ?: resolveViaDirectDoh(targetHost)
+              ?: resolveEndpointIpv4(targetHost)
+              ?: targetHost
+        }
       val ipv4Bytes = parseIpv4Bytes(resolvedTargetIp)
       val endpoint =
         if (ipv4Bytes != null) {
@@ -642,7 +659,7 @@ object V2RayOutboundClient {
           GfwKnockerXrayCore.FragmentConfig.PATTERNIHA_TCP_DIRECT
         }
 
-      val directIn = BufferedInputStream(rawSocket.getInputStream(), 16384)
+      val directIn = BufferedInputStream(rawSocket.getInputStream(), 32768)
       val directOut =
         GfwKnockerXrayCore.FragmentWriterOutputStream(
           rawSocket.getOutputStream(),
@@ -858,7 +875,7 @@ object V2RayOutboundClient {
         @Synchronized
         private fun ensureHeader() {
           if (!responseHeaderRead) {
-            headerSentLatch.await(3000, TimeUnit.MILLISECONDS)
+            headerSentLatch.await(30_000, TimeUnit.MILLISECONDS)
             responseHeaderRead = true
             val ver = `in`.read()
             if (ver == -1) throw EOFException("VLESS EOF before response header")
@@ -1151,7 +1168,7 @@ object V2RayOutboundClient {
       var cursor = off
       var remaining = len
       while (remaining > 0) {
-        val chunkLen = minOf(remaining, 4096)
+        val chunkLen = minOf(remaining, 16384)
         writeSingleFrame(b, cursor, chunkLen)
         cursor += chunkLen
         remaining -= chunkLen

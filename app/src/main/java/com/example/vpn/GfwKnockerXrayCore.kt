@@ -827,9 +827,9 @@ object GfwKnockerXrayCore {
   ) {
     private val session = engine.session
     private val wrapLock = Any()
-    private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
-    private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
-    private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 32768))
+    private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 65536))
+    private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 65536))
+    private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 65536))
     private val readBuffer = ByteArray(32768)
 
     init {

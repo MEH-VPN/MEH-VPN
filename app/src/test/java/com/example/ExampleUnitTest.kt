@@ -355,6 +355,7 @@ class ExampleUnitTest {
       )
     LocalV2RayProxyServer.recordRealDnsARecords("api.x.com", sampleDnsResp)
     assertEquals("api.x.com", LocalV2RayProxyServer.lookupDomainForRealIp("172.66.0.227"))
+    assertEquals("172.66.0.227", LocalV2RayProxyServer.lookupRealIpForDomain("api.x.com"))
 
     // 7. Verify TLS ClientHello SNI extraction for destOverride: ["tls"]
     val extractedSni = com.example.vpn.GfwKnockerXrayCore.extractTlsSniHostname(clientHello.array())
@@ -515,6 +516,7 @@ class ExampleUnitTest {
           assertNotNull("Expected valid IPv4 A record from SOCKS5 UDP DNS for $hostname", ipv4Bytes)
           val ipStr = "${ipv4Bytes!![0].toInt() and 0xFF}.${ipv4Bytes[1].toInt() and 0xFF}.${ipv4Bytes[2].toInt() and 0xFF}.${ipv4Bytes[3].toInt() and 0xFF}"
           assertNotNull("Expected real IP $ipStr to be recorded in reverse DNS table", LocalV2RayProxyServer.lookupDomainForRealIp(ipStr))
+          assertEquals("Expected forward DNS table to map $hostname -> $ipStr", ipStr, LocalV2RayProxyServer.lookupRealIpForDomain(hostname))
           println("DIAG_UDP_DNS: $hostname -> $ipStr (replySize=${aReply.size} bytes)")
           // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes (ATYP=0x01)!
           return listOf(InetAddress.getByAddress("", ipv4Bytes))
@@ -586,6 +588,7 @@ class ExampleUnitTest {
         "https://video.twimg.com/",
       )
 
+      var seqSuccess = 0
       for (url in urls) {
         try {
           val start = System.currentTimeMillis()
@@ -597,20 +600,23 @@ class ExampleUnitTest {
           ).execute().use { resp ->
             val bodyBytes = resp.body?.bytes() ?: ByteArray(0)
             val elapsed = System.currentTimeMillis() - start
+            seqSuccess++
             println("DIAG_TUN2SOCKS_SEQ: $url -> HTTP ${resp.code} (${resp.protocol}) bytes=${bodyBytes.size} in ${elapsed}ms")
           }
         } catch (e: Exception) {
           println("DIAG_TUN2SOCKS_SEQ_FAIL: $url -> ${e.javaClass.simpleName}: ${e.message}")
         }
       }
+      assertTrue("Expected at least 9 of 11 sequential Instagram/Twitter/Google URLs to succeed, got $seqSuccess", seqSuccess >= 9)
 
       // Now simulate scrolling Instagram feed & opening Twitter timeline: 16 CONCURRENT requests!
       println("DIAG_CONCURRENT: Launching 16 parallel requests...")
       val pool = java.util.concurrent.Executors.newFixedThreadPool(16)
+      var concSuccess = 0
       val futures =
         (1..16).map { idx ->
           val targetUrl = urls[idx % urls.size]
-          pool.submit<String> {
+          pool.submit<Pair<Boolean, String>> {
             try {
               val start = System.currentTimeMillis()
               client.newCall(
@@ -622,17 +628,20 @@ class ExampleUnitTest {
               ).execute().use { resp ->
                 val b = resp.body?.bytes() ?: ByteArray(0)
                 val elapsed = System.currentTimeMillis() - start
-                "CONC #$idx ($targetUrl) -> HTTP ${resp.code} (${resp.protocol}) bytes=${b.size} in ${elapsed}ms"
+                Pair(true, "CONC #$idx ($targetUrl) -> HTTP ${resp.code} (${resp.protocol}) bytes=${b.size} in ${elapsed}ms")
               }
             } catch (e: Exception) {
-              "CONC_FAIL #$idx ($targetUrl) -> ${e.javaClass.simpleName}: ${e.message}"
+              Pair(false, "CONC_FAIL #$idx ($targetUrl) -> ${e.javaClass.simpleName}: ${e.message}")
             }
           }
         }
       for (f in futures) {
-        println("DIAG_CONCURRENT: ${f.get()}")
+        val (ok, msg) = f.get()
+        if (ok) concSuccess++
+        println("DIAG_CONCURRENT: $msg")
       }
       pool.shutdownNow()
+      assertTrue("Expected at least 14 of 16 concurrent Instagram/Twitter stream requests to succeed, got $concSuccess", concSuccess >= 14)
       Unit
     } finally {
       proxy.stop()
