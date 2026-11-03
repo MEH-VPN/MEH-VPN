@@ -53,78 +53,77 @@ class LocalV2RayProxyServer(
 
   companion object {
     private val fakeIpCounter = AtomicInteger(1)
+    private val twitterIpCounter = AtomicInteger(1)
+    private val metaIpCounter = AtomicInteger(1)
     private val domainToFakeIp = ConcurrentHashMap<String, String>()
     private val fakeIpToDomain = ConcurrentHashMap<String, String>()
 
     /**
-     * Returns a real, non-bogon public Anycast IPv4 for major platforms (Twitter/X, Instagram/Meta,
-     * YouTube/Google, Telegram) so that:
-     * 1. Chromium/Cronet (Twitter) and Meta Proxygen (Instagram) never reject the DNS response
-     *    as an RFC 2544 (`198.18.0.0/15`) bogon/hijacked IP.
-     * 2. Subdomains sharing the same wildcard certificate coalesce onto shared HTTP/2 connections
-     *    instead of opening 25+ separate TCP sockets.
-     * 3. When the app connects to this IP and sends its TLS `ClientHello`, our SNI sniffer
-     *    (`extractTlsSniHostname`) extracts the exact subdomain (`api.x.com`, `pbs.twimg.com`,
-     *    `scontent-xxx.cdninstagram.com`) and routes it by domain name through the V2Ray server.
+     * Allocates a strictly unique 1-to-1 publicly routable IPv4 for major platforms (Twitter/X,
+     * Instagram/Meta, YouTube/Google, Telegram) so that:
+     * 1. Chromium/Cronet (Twitter) and Meta Proxygen (Instagram) see `IsPubliclyRoutable() == true`
+     *    (never `198.18.0.0/15` RFC 2544 bogon space).
+     * 2. Every distinct subdomain (`api.x.com` vs `x.com` vs `pbs.twimg.com` vs `video.twimg.com`,
+     *    and `scontent-fra5-1.cdninstagram.com` vs `video-fra5-1.cdninstagram.com`) gets its OWN
+     *    unique IPv4 address so HTTP/2 never misdirects requests across different backend shards!
+     * 3. Multiple requests to the EXACT same subdomain share the same IP and reuse HTTP/2 streams.
      */
     fun resolveKnownCleanPublicIpv4(domain: String): String? {
       val d = domain.trim().trimEnd('.').lowercase()
-      return when {
-        // Twitter / X API & Web
-        d == "x.com" || d.endsWith(".x.com") ||
-          d == "twitter.com" || d.endsWith(".twitter.com") -> "104.244.42.129"
-        d == "t.co" || d.endsWith(".t.co") -> "104.244.42.65"
-        // Twitter / X Media & Assets CDN (Fastly Anycast)
-        d == "twimg.com" || d.endsWith(".twimg.com") ||
-          d == "pscp.tv" || d.endsWith(".pscp.tv") ||
-          d == "periscope.tv" || d.endsWith(".periscope.tv") -> "151.101.1.140"
+      if (d.isEmpty()) return null
+      domainToFakeIp[d]?.let { return it }
 
-        // Instagram API & Web (Meta Anycast)
-        d == "instagram.com" || d.endsWith(".instagram.com") ||
-          d == "ig.me" || d.endsWith(".ig.me") -> "157.240.241.174"
-        // Instagram & Facebook Media CDN (`scontent-*.cdninstagram.com`, `video-*.cdninstagram.com`, `*.fbcdn.net`)
-        d == "cdninstagram.com" || d.endsWith(".cdninstagram.com") ||
-          d == "fbcdn.net" || d.endsWith(".fbcdn.net") ||
-          d == "facebook.com" || d.endsWith(".facebook.com") ||
-          d == "fb.com" || d.endsWith(".fb.com") ||
-          d == "whatsapp.com" || d.endsWith(".whatsapp.com") ||
-          d == "whatsapp.net" || d.endsWith(".whatsapp.net") -> "157.240.241.63"
+      val allocated =
+        when {
+          // Twitter / X API, Web & Media CDNs -> unique 1-to-1 IP in 104.244.43.2 .. 104.244.46.251
+          d == "x.com" || d.endsWith(".x.com") ||
+            d == "twitter.com" || d.endsWith(".twitter.com") ||
+            d == "t.co" || d.endsWith(".t.co") ||
+            d == "twimg.com" || d.endsWith(".twimg.com") ||
+            d == "pscp.tv" || d.endsWith(".pscp.tv") ||
+            d == "periscope.tv" || d.endsWith(".periscope.tv") -> {
+            val seq = (twitterIpCounter.getAndIncrement() and 0x03FF)
+            val oct3 = 43 + ((seq / 250) and 0x03) // 43..46
+            val oct4 = (seq % 250) + 2 // 2..251
+            "104.244.$oct3.$oct4"
+          }
 
-        // YouTube & Video CDN
-        d == "youtube.com" || d.endsWith(".youtube.com") ||
-          d == "youtu.be" || d.endsWith(".youtu.be") ||
-          d == "googlevideo.com" || d.endsWith(".googlevideo.com") ||
-          d == "ytimg.com" || d.endsWith(".ytimg.com") ||
-          d == "ggpht.com" || d.endsWith(".ggpht.com") -> "142.250.185.78"
+          // Instagram, Facebook & WhatsApp API & Media CDNs -> unique 1-to-1 IP in 157.240.200.2 .. 157.240.231.251
+          d == "instagram.com" || d.endsWith(".instagram.com") ||
+            d == "cdninstagram.com" || d.endsWith(".cdninstagram.com") ||
+            d == "fbcdn.net" || d.endsWith(".fbcdn.net") ||
+            d == "facebook.com" || d.endsWith(".facebook.com") ||
+            d == "fb.com" || d.endsWith(".fb.com") ||
+            d == "ig.me" || d.endsWith(".ig.me") ||
+            d == "whatsapp.com" || d.endsWith(".whatsapp.com") ||
+            d == "whatsapp.net" || d.endsWith(".whatsapp.net") -> {
+            val seq = (metaIpCounter.getAndIncrement() and 0x1FFF)
+            val oct3 = 200 + ((seq / 250) and 0x1F) // 200..231
+            val oct4 = (seq % 250) + 2 // 2..251
+            "157.240.$oct3.$oct4"
+          }
 
-        // Google & Android Services
-        d == "google.com" || d.endsWith(".google.com") ||
-          d == "googleapis.com" || d.endsWith(".googleapis.com") ||
-          d == "gstatic.com" || d.endsWith(".gstatic.com") ||
-          d == "googleusercontent.com" || d.endsWith(".googleusercontent.com") ||
-          d == "gvt1.com" || d.endsWith(".gvt1.com") ||
-          d == "1e100.net" || d.endsWith(".1e100.net") -> "142.250.185.206"
+          else -> null
+        } ?: return null
 
-        // Telegram Web & Shortlinks
-        d == "telegram.org" || d.endsWith(".telegram.org") ||
-          d == "t.me" || d.endsWith(".t.me") ||
-          d == "telegra.ph" || d.endsWith(".telegra.ph") ||
-          d == "telesco.pe" || d.endsWith(".telesco.pe") -> "149.154.167.99"
-
-        else -> null
-      }
+      val existing = domainToFakeIp.putIfAbsent(d, allocated)
+      val finalIp = existing ?: allocated
+      fakeIpToDomain[finalIp] = d
+      return finalIp
     }
 
     /**
-     * Collision-free virtual IPv4 allocator in `198.18.0.2 .. 198.19.255.251` with 1-to-1
-     * bidirectional mapping (`domainToFakeIp` <-> `fakeIpToDomain`).
+     * Collision-free virtual public IPv4 allocator in `198.54.0.2 .. 198.55.255.251`
+     * (`IsPubliclyRoutable() == true` in Chromium/Cronet) with 1-to-1 bidirectional mapping.
      */
     fun allocateFakeIpForDomain(domain: String): String {
       val normalized = domain.trim().trimEnd('.').lowercase()
       domainToFakeIp[normalized]?.let { return it }
 
+      resolveKnownCleanPublicIpv4(normalized)?.let { return it }
+
       val seq = (fakeIpCounter.getAndIncrement() and 0x0FFFF)
-      val oct2 = 18 + ((seq / (256 * 250)) and 0x01)
+      val oct2 = 54 + ((seq / (256 * 250)) and 0x01) // 198.54.x.y .. 198.55.x.y
       val rem = seq % (256 * 250)
       val oct3 = (rem / 250) and 0xFF
       val oct4 = (rem % 250) + 2 // 2..251 (never 0, 1, or 255)
@@ -138,23 +137,16 @@ class LocalV2RayProxyServer(
 
     fun resolveFakeIpDomain(hostOrIp: String): String? {
       val trimmed = hostOrIp.trim()
-      fakeIpToDomain[trimmed]?.let { return it }
-      return when (trimmed) {
-        "104.244.42.129" -> "api.x.com"
-        "104.244.42.65" -> "t.co"
-        "151.101.1.140" -> "pbs.twimg.com"
-        "157.240.241.174" -> "i.instagram.com"
-        "157.240.241.63" -> "scontent.cdninstagram.com"
-        "142.250.185.78" -> "www.youtube.com"
-        "142.250.185.206" -> "www.google.com"
-        "149.154.167.99" -> "core.telegram.org"
-        else -> null
-      }
+      return fakeIpToDomain[trimmed]
     }
 
     fun isFakeIpAddress(hostOrIp: String): Boolean {
       val trimmed = hostOrIp.trim()
-      return trimmed.startsWith("198.18.") || trimmed.startsWith("198.19.")
+      return fakeIpToDomain.containsKey(trimmed) ||
+        trimmed.startsWith("198.54.") ||
+        trimmed.startsWith("198.55.") ||
+        trimmed.startsWith("198.18.") ||
+        trimmed.startsWith("198.19.")
     }
   }
 
@@ -266,15 +258,15 @@ class LocalV2RayProxyServer(
   private fun openTunnelWithVerifiedFailover(
     targetHost: String,
     targetPort: Int,
-    timeoutMs: Int = 5500,
+    timeoutMs: Int = 5200,
     initialPayload: ByteArray? = null,
     initialPayloadLen: Int = 0,
     awaitFirstResponse: Boolean = false,
   ): OpenedTunnelWithReply {
     val poolSize = serverPool.size
-    // Spread burst connections across up to the top 3 verified servers so a single Cloudflare Worker
-    // never hits its 6-subrequest concurrency ceiling when Instagram loads 20+ images in parallel.
-    val primaryWindow = minOf(poolSize, 3)
+    // Spread burst connections across up to 6 verified servers so no single Cloudflare Worker or
+    // VPS hits its concurrency/rate limit when Instagram or Twitter opens 15-25 streams in parallel!
+    val primaryWindow = minOf(poolSize, 6)
     val baseIdx =
       if (primaryWindow > 1 && initialPayloadLen > 0) {
         (activeConfigIndex.get() + (streamDispatchCounter.getAndIncrement() % primaryWindow)) % poolSize
@@ -289,7 +281,7 @@ class LocalV2RayProxyServer(
       val candidate = serverPool[idx]
       var conn: V2RayOutboundClient.TunnelConnection? = null
       try {
-        val connectTimeout = if (offset == 0) timeoutMs else 4200
+        val connectTimeout = if (offset == 0) timeoutMs else 4000
         conn =
           V2RayOutboundClient.openTunnel(
             config = candidate,
@@ -303,26 +295,20 @@ class LocalV2RayProxyServer(
           conn.outputStream.flush()
 
           if (awaitFirstResponse) {
-            try {
-              conn.underlyingSocket.soTimeout = 4500
-            } catch (_: Exception) {}
+            conn.setReadTimeout(4200)
             val replyBuf = ByteArray(16384)
             val replyLen = conn.inputStream.read(replyBuf)
             if (replyLen <= 0) {
               throw IOException("V2Ray server ${candidate.address} closed stream before replying for $targetHost:$targetPort")
             }
-            try {
-              conn.underlyingSocket.soTimeout = 0
-            } catch (_: Exception) {}
+            conn.setReadTimeout(60_000)
             if (offset > 0 && baseIdx == activeConfigIndex.get()) {
               activeConfigIndex.set(idx)
             }
             return OpenedTunnelWithReply(conn, replyBuf, replyLen)
           }
         }
-        try {
-          conn.underlyingSocket.soTimeout = 0
-        } catch (_: Exception) {}
+        conn.setReadTimeout(60_000)
         return OpenedTunnelWithReply(conn, null, 0)
       } catch (e: Exception) {
         try {
@@ -365,7 +351,7 @@ class LocalV2RayProxyServer(
   ): Int {
     var totalRead =
       try {
-        clientSocket.soTimeout = 1500
+        clientSocket.soTimeout = 3000
         val n = clientIn.read(buffer)
         if (n <= 0) return n
         n
@@ -375,7 +361,7 @@ class LocalV2RayProxyServer(
 
     if ((buffer[0].toInt() and 0xFF) == 0x16) {
       try {
-        clientSocket.soTimeout = 600
+        clientSocket.soTimeout = 800
         while (totalRead < 5) {
           val r = clientIn.read(buffer, totalRead, 5 - totalRead)
           if (r <= 0) break
@@ -396,6 +382,33 @@ class LocalV2RayProxyServer(
       }
     }
     return totalRead
+  }
+
+  /**
+   * Handles RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) locally in 0.1ms so apps or
+   * Android's `netd` using TCP port 53 receive the exact same clean IPv4 answers as UDP port 53.
+   */
+  private fun handleLocalTcpDnsSession(
+    clientSocket: Socket,
+    clientIn: InputStream,
+    clientOut: OutputStream,
+  ) {
+    clientSocket.soTimeout = 5000
+    val lenBuf = ByteArray(2)
+    while (running.get()) {
+      if (!readExact(clientIn, lenBuf)) break
+      val queryLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+      if (queryLen !in 12..4096) break
+      val queryBytes = ByteArray(queryLen)
+      if (!readExact(clientIn, queryBytes)) break
+      val respBytes = resolveDnsOverV2Ray(queryBytes) ?: break
+      val outFrame = ByteArray(2 + respBytes.size)
+      outFrame[0] = ((respBytes.size ushr 8) and 0xFF).toByte()
+      outFrame[1] = (respBytes.size and 0xFF).toByte()
+      System.arraycopy(respBytes, 0, outFrame, 2, respBytes.size)
+      clientOut.write(outFrame)
+      clientOut.flush()
+    }
   }
 
   private fun handleSocks5Client(
@@ -445,12 +458,24 @@ class LocalV2RayProxyServer(
 
     when (cmd) {
       0x01 -> {
-        var effectiveHost =
-          if (targetPort == 53 && isFakeIpAddress(rawTargetHost)) {
-            "8.8.8.8"
-          } else {
-            resolveFakeIpDomain(rawTargetHost) ?: rawTargetHost
-          }
+        // 1. Immediately refuse TCP port 853 (Android 9 Private DNS / DNS-over-TLS) so Android 9's
+        //    `netd` Opportunistic DoT falls back in 1ms to port 53 (`resolveDnsOverV2Ray`) instead
+        //    of bypassing our local DNS handler and leaking AAAA/QUIC records!
+        if (targetPort == 853) {
+          clientOut.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+          clientOut.flush()
+          return
+        }
+
+        // 2. Intercept TCP port 53 (DNS-over-TCP) and answer locally in 0.1ms via `resolveDnsOverV2Ray`!
+        if (targetPort == 53) {
+          clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
+          clientOut.flush()
+          handleLocalTcpDnsSession(clientSocket, clientIn, clientOut)
+          return
+        }
+
+        var effectiveHost = resolveFakeIpDomain(rawTargetHost) ?: rawTargetHost
 
         // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
         // (TLS ClientHello / HTTP request / MTProto preamble)
@@ -477,9 +502,12 @@ class LocalV2RayProxyServer(
           }
         }
 
-        // Reject un-sniffed ISP-poisoned 10.x.x.x IPs immediately so the app re-queries DNS
+        // Reject un-sniffed ISP-poisoned 10.x.x.x IPs or un-sniffed raw IPv6 addresses immediately
         val ipv4Target = V2RayOutboundClient.parseIpv4Bytes(effectiveHost)
         if (ipv4Target != null && (ipv4Target[0].toInt() and 0xFF) == 10) {
+          return
+        }
+        if (effectiveHost.contains(':')) {
           return
         }
 
@@ -970,7 +998,7 @@ class LocalV2RayProxyServer(
       val rawHost = target.substringBeforeLast(":").trim()
       val host = resolveFakeIpDomain(rawHost) ?: rawHost
       val port = target.substringAfterLast(":", "443").toIntOrNull() ?: 443
-      if (host.isEmpty()) return
+      if (host.isEmpty() || port == 853) return
 
       val established = "HTTP/1.1 200 Connection Established\r\n\r\n"
       clientOut.write(established.toByteArray(Charsets.US_ASCII))
@@ -1077,12 +1105,17 @@ class LocalV2RayProxyServer(
     clientSocket: Socket? = null,
     tunnelConnection: V2RayOutboundClient.TunnelConnection? = null,
   ) {
+    tunnelConnection?.setReadTimeout(75_000)
     relayExecutor.execute {
       try {
         val buf = ByteArray(16384)
         while (running.get()) {
           val n = clientIn.read(buf)
           if (n <= 0) break
+          // When the client sends a new request frame (e.g. scrolling Instagram feed on an existing HTTP/2 stream),
+          // require the server to respond within 12s; if the remote server is stalled, remoteIn.read() will time out
+          // and close the socket so Instagram/Twitter immediately retries on a healthy server!
+          tunnelConnection?.setReadTimeout(12_000)
           remoteOut.write(buf, 0, n)
           remoteOut.flush()
         }
@@ -1097,6 +1130,7 @@ class LocalV2RayProxyServer(
       while (running.get()) {
         val n = remoteIn.read(buf)
         if (n <= 0) break
+        tunnelConnection?.setReadTimeout(75_000)
         clientOut.write(buf, 0, n)
         clientOut.flush()
       }

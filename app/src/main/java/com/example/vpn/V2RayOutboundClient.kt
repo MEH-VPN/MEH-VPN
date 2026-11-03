@@ -61,13 +61,26 @@ object V2RayOutboundClient {
     val underlyingSocket: Socket,
     val inputStream: InputStream,
     val outputStream: OutputStream,
+    val tlsSocket: SSLSocket? = null,
   ) : AutoCloseable {
+    fun setReadTimeout(timeoutMs: Int) {
+      try {
+        tlsSocket?.soTimeout = timeoutMs
+      } catch (_: Exception) {}
+      try {
+        underlyingSocket.soTimeout = timeoutMs
+      } catch (_: Exception) {}
+    }
+
     override fun close() {
       try {
         outputStream.close()
       } catch (_: Exception) {}
       try {
         inputStream.close()
+      } catch (_: Exception) {}
+      try {
+        tlsSocket?.close()
       } catch (_: Exception) {}
       try {
         underlyingSocket.close()
@@ -384,11 +397,45 @@ object V2RayOutboundClient {
   /**
    * Verifies that this V2Ray server can establish a real end-to-end TLS 443 session to Twitter/X
    * (`api.x.com:443`) and receive an HTTP response. This filters out restricted Cloudflare Workers
-   * that pass `www.google.com` but reject/drop connections to Twitter/X or Instagram CDNs!
+   * that pass `www.google.com` but reject/drop connections to Twitter/X!
    */
   fun verifySocialMediaCapability(
     config: V2RayConfig,
-    timeoutMs: Int = 2800,
+    timeoutMs: Int = 2600,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    return verifyTlsTargetHostCapability(
+      config = config,
+      targetHost = "api.x.com",
+      requestPath = "/1.1/help/settings.json",
+      timeoutMs = timeoutMs,
+      protector = protector,
+    )
+  }
+
+  /**
+   * Verifies that this V2Ray server can establish a real end-to-end TLS 443 session to Instagram's
+   * mobile API (`i.instagram.com:443`) and receive an HTTP response.
+   */
+  fun verifyInstagramCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2600,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    return verifyTlsTargetHostCapability(
+      config = config,
+      targetHost = "i.instagram.com",
+      requestPath = "/api/v1/si/fetch_headers/",
+      timeoutMs = timeoutMs,
+      protector = protector,
+    )
+  }
+
+  private fun verifyTlsTargetHostCapability(
+    config: V2RayConfig,
+    targetHost: String,
+    requestPath: String,
+    timeoutMs: Int = 2600,
     protector: ((Socket) -> Boolean)? = null,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
@@ -401,7 +448,7 @@ object V2RayOutboundClient {
         measureNanoTime {
           openTunnel(
             config = resolvedConfig,
-            targetHost = "api.x.com",
+            targetHost = targetHost,
             targetPort = 443,
             timeoutMs = timeoutMs,
             protector = protector,
@@ -411,23 +458,23 @@ object V2RayOutboundClient {
                 sslContext = permissiveSslContext,
                 rawIn = tunnel.inputStream,
                 rawOut = tunnel.outputStream,
-                sniHost = "api.x.com",
+                sniHost = targetHost,
                 port = 443,
               )
             val req =
-              "HEAD / HTTP/1.1\r\n" +
-                "Host: api.x.com\r\n" +
-                "User-Agent: Mozilla/5.0\r\n" +
+              "GET $requestPath HTTP/1.1\r\n" +
+                "Host: $targetHost\r\n" +
+                "User-Agent: Mozilla/5.0 (Linux; Android 9; SM-G950F) AppleWebKit/537.36\r\n" +
                 "Connection: close\r\n\r\n"
             tlsOut.write(req.toByteArray(Charsets.US_ASCII))
             tlsOut.flush()
 
-            val buf = ByteArray(64)
+            val buf = ByteArray(128)
             val n = tlsIn.read(buf)
-            if (n <= 0) throw IOException("Empty response from api.x.com over tunnel")
+            if (n <= 0) throw IOException("Empty response from $targetHost over tunnel")
             val statusLine = String(buf, 0, n, Charsets.US_ASCII)
             if (!statusLine.startsWith("HTTP/1.1 ") && !statusLine.startsWith("HTTP/2")) {
-              throw IOException("Unexpected api.x.com status: ${statusLine.take(24)}")
+              throw IOException("Unexpected $targetHost status: ${statusLine.take(24)}")
             }
           }
         }
@@ -483,9 +530,12 @@ object V2RayOutboundClient {
       rawSocket.connect(remoteEndpoint, timeoutMs)
 
       val isTls = config.security.equals("tls", ignoreCase = true)
+      var activeSslSocket: SSLSocket? = null
       val (rawTransportIn, rawTransportOut) =
         if (isTls) {
-          establishTlsStreams(rawSocket, config, timeoutMs)
+          val tlsTriple = establishTlsStreams(rawSocket, config, timeoutMs)
+          activeSslSocket = tlsTriple.third
+          Pair(tlsTriple.first, tlsTriple.second)
         } else {
           val tcpProfile =
             if (config.fragmentProfile.startsWith("patterniha")) {
@@ -517,19 +567,32 @@ object V2RayOutboundClient {
         GfwKnockerXrayCore.performHttpUpgrade(config, transportIn, transportOut)
       }
 
-      // For long-lived active streams (Telegram, push notifications, web), clear read timeout
-      // so idle connections are NOT terminated after 2 minutes
-      try {
-        rawSocket.soTimeout = 0
-      } catch (_: Exception) {}
-
+      // IMPORTANT: Keep rawSocket.soTimeout = timeoutMs and activeSslSocket.soTimeout = timeoutMs
+      // active so probe checks (measureRealProxyDelay, verifyHttpsAndDnsCapability, verifySocialMediaCapability)
+      // and first-response failover checks never hang on blackholed V2Ray nodes!
       return when (config.protocol) {
         V2RayProtocol.VLESS,
         V2RayProtocol.MVLESS,
         V2RayProtocol.JVLESS ->
-          setupVlessStream(rawSocket, transportIn, transportOut, config, targetHost, targetPort)
+          setupVlessStream(
+            rawSocket,
+            activeSslSocket,
+            transportIn,
+            transportOut,
+            config,
+            targetHost,
+            targetPort,
+          )
         V2RayProtocol.TROJAN ->
-          setupTrojanStream(rawSocket, transportIn, transportOut, config, targetHost, targetPort)
+          setupTrojanStream(
+            rawSocket,
+            activeSslSocket,
+            transportIn,
+            transportOut,
+            config,
+            targetHost,
+            targetPort,
+          )
         else -> throw IOException("Unsupported protocol: ${config.protocol}")
       }
     } catch (e: Exception) {
@@ -572,10 +635,6 @@ object V2RayOutboundClient {
         }
       rawSocket.connect(endpoint, timeoutMs)
 
-      try {
-        rawSocket.soTimeout = 0
-      } catch (_: Exception) {}
-
       val fragConfig =
         if (targetPort == 443 || targetPort == 8443 || targetPort == 2053 || targetPort == 2083) {
           GfwKnockerXrayCore.FragmentConfig.fromProfileId(config.fragmentProfile)
@@ -589,7 +648,7 @@ object V2RayOutboundClient {
           rawSocket.getOutputStream(),
           fragConfig,
         )
-      return TunnelConnection(rawSocket, directIn, directOut)
+      return TunnelConnection(rawSocket, directIn, directOut, null)
     } catch (e: Exception) {
       try {
         rawSocket.close()
@@ -610,7 +669,7 @@ object V2RayOutboundClient {
     rawSocket: Socket,
     config: V2RayConfig,
     timeoutMs: Int,
-  ): Pair<InputStream, OutputStream> {
+  ): Triple<InputStream, OutputStream, SSLSocket?> {
     val sniHost =
       config.sni
         .ifBlank { config.hostHeader }
@@ -658,12 +717,10 @@ object V2RayOutboundClient {
         sslSocket.sslParameters = params
       } catch (_: Exception) {}
       sslSocket.startHandshake()
-      try {
-        sslSocket.soTimeout = 0
-      } catch (_: Exception) {}
-      return Pair(
+      return Triple(
         BufferedInputStream(sslSocket.getInputStream(), 16384),
         sslSocket.getOutputStream(),
+        sslSocket,
       )
     }
 
@@ -685,7 +742,7 @@ object V2RayOutboundClient {
         cipherSuites = desiredCiphers,
         alpnProtocols = alpn,
       )
-    return Pair(BufferedInputStream(tlsIn, 16384), tlsOut)
+    return Triple(BufferedInputStream(tlsIn, 16384), tlsOut, null)
   }
 
   private fun performWebSocketUpgrade(
@@ -742,6 +799,7 @@ object V2RayOutboundClient {
 
   private fun setupVlessStream(
     socket: Socket,
+    tlsSocket: SSLSocket?,
     input: InputStream,
     output: OutputStream,
     config: V2RayConfig,
@@ -829,11 +887,12 @@ object V2RayOutboundClient {
         }
       }
 
-    return TunnelConnection(socket, vlessIn, vlessOut)
+    return TunnelConnection(socket, vlessIn, vlessOut, tlsSocket)
   }
 
   private fun setupTrojanStream(
     socket: Socket,
+    tlsSocket: SSLSocket?,
     input: InputStream,
     output: OutputStream,
     config: V2RayConfig,
@@ -875,7 +934,7 @@ object V2RayOutboundClient {
         }
       }
 
-    return TunnelConnection(socket, input, trojanOut)
+    return TunnelConnection(socket, input, trojanOut, tlsSocket)
   }
 
   private fun writeVlessAddress(out: ByteArrayOutputStream, host: String) {

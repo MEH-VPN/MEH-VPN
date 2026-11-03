@@ -337,12 +337,25 @@ class ExampleUnitTest {
     assertTrue(V2RayOutboundClient.isSupportedByEngine(serverlessA))
     assertTrue(serverlessA.toV2RayCoreJson().contains("[\"6\", \"98\", \"1\"]"))
 
-    // 6. Verify Real Public Anycast IP Coalescing for Twitter/X and Instagram + collision-free FakeIP
-    assertEquals("104.244.42.129", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("api.x.com"))
-    assertEquals("104.244.42.129", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("api.twitter.com"))
-    assertEquals("151.101.1.140", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("pbs.twimg.com"))
-    assertEquals("157.240.241.174", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("i.instagram.com"))
-    assertEquals("157.240.241.63", LocalV2RayProxyServer.resolveKnownCleanPublicIpv4("scontent-fra5-1.cdninstagram.com"))
+    // 6. Verify 1-to-1 unique Public IPv4 allocation for Twitter/X and Instagram + reverse lookup
+    val socialDomains = listOf(
+      "api.x.com",
+      "api.twitter.com",
+      "pbs.twimg.com",
+      "abs.twimg.com",
+      "video.twimg.com",
+      "i.instagram.com",
+      "graph.instagram.com",
+      "scontent-fra5-1.cdninstagram.com",
+      "video-fra5-1.cdninstagram.com",
+    )
+    val allocatedSocialIps = HashSet<String>()
+    for (dom in socialDomains) {
+      val ip = LocalV2RayProxyServer.resolveKnownCleanPublicIpv4(dom)
+      assertNotNull("Expected public IPv4 for $dom", ip)
+      assertTrue("Expected distinct 1-to-1 IPv4 for $dom so HTTP/2 does not coalesce across CDN shards, got duplicate $ip", allocatedSocialIps.add(ip!!))
+      assertEquals(dom, LocalV2RayProxyServer.resolveFakeIpDomain(ip))
+    }
 
     val seenFakeIps = HashSet<String>()
     for (i in 1..300) {
@@ -356,6 +369,154 @@ class ExampleUnitTest {
     val extractedSni = com.example.vpn.GfwKnockerXrayCore.extractTlsSniHostname(clientHello.array())
     assertEquals("sni.cluvex-aether.org", extractedSni)
   }
+
+  @Test
+  fun diagnoseInstagramAndTwitterOverTun2SocksSimulation() = runBlocking {
+    val repo = SoliSpiritRepository()
+    val configs = repo.fetchConfigsFromSoliSpirit {}
+    println("DIAG: Fetched ${configs.size} configs for tun2socks simulation")
+    val candidates = repo.testAndSelectFastestCandidates(configs, maxCount = 6) {}
+    println("DIAG: Selected ${candidates.size} candidates:")
+    for ((i, c) in candidates.withIndex()) {
+      println("DIAG: Candidate #$i: ${c.protocol} ${c.address}:${c.port} sni=${c.sni} host=${c.hostHeader} net=${c.network} ping=${c.latencyMs}ms")
+    }
+
+    val proxy = LocalV2RayProxyServer(configs = candidates, protector = { true })
+    val port = proxy.start()
+    try {
+      // Simulate EXACT tun2socks behavior:
+      // 1. App queries DNS via UDP 53 -> gets IPv4 address (4 bytes).
+      // 2. App opens TCP connection to that IPv4:443.
+      // 3. tun2socks intercepts the TCP SYN to IPv4:443 and sends SOCKS5 CONNECT with ATYP=0x01 (4-byte IPv4, NOT domain name!).
+      // 4. App sends TLS ClientHello with SNI = hostname over that socket!
+      val customDns = object : okhttp3.Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+          val ipStr =
+            LocalV2RayProxyServer.resolveKnownCleanPublicIpv4(hostname)
+              ?: LocalV2RayProxyServer.allocateFakeIpForDomain(hostname)
+          val bytes = V2RayOutboundClient.parseIpv4Bytes(ipStr)!!
+          // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes!
+          return listOf(InetAddress.getByAddress("", bytes))
+        }
+      }
+
+      val tun2socksSocketFactory = object : javax.net.SocketFactory() {
+        override fun createSocket(): Socket {
+          return object : Socket() {
+            override fun connect(endpoint: java.net.SocketAddress?, timeout: Int) {
+              val inetEndpoint = endpoint as InetSocketAddress
+              val targetIp = inetEndpoint.address.address
+              val targetPort = inetEndpoint.port
+              super.connect(InetSocketAddress("127.0.0.1", port), timeout.coerceAtLeast(5000))
+              this.tcpNoDelay = true
+              this.soTimeout = 10_000
+              val out = this.getOutputStream()
+              val inp = this.getInputStream()
+              out.write(byteArrayOf(0x05, 0x01, 0x00))
+              out.flush()
+              val greet = ByteArray(2)
+              java.io.DataInputStream(inp).readFully(greet)
+              val req = byteArrayOf(
+                0x05, 0x01, 0x00, 0x01,
+                targetIp[0], targetIp[1], targetIp[2], targetIp[3],
+                ((targetPort ushr 8) and 0xFF).toByte(),
+                (targetPort and 0xFF).toByte(),
+              )
+              out.write(req)
+              out.flush()
+              val resp = ByteArray(10)
+              java.io.DataInputStream(inp).readFully(resp)
+              if (resp[1].toInt() != 0x00) {
+                throw java.io.IOException("SOCKS5 CONNECT failed with code ${resp[1]}")
+              }
+            }
+          }
+        }
+
+        override fun createSocket(host: String, port: Int): Socket =
+          createSocket().apply { connect(InetSocketAddress(host, port), 5000) }
+        override fun createSocket(host: String, port: Int, localHost: InetAddress?, localPort: Int): Socket =
+          createSocket().apply { connect(InetSocketAddress(host, port), 5000) }
+        override fun createSocket(host: InetAddress, port: Int): Socket =
+          createSocket().apply { connect(InetSocketAddress(host, port), 5000) }
+        override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress?, localPort: Int): Socket =
+          createSocket().apply { connect(InetSocketAddress(address, port), 5000) }
+      }
+
+      val client =
+        OkHttpClient.Builder()
+          .socketFactory(tun2socksSocketFactory)
+          .dns(customDns)
+          .connectTimeout(10, TimeUnit.SECONDS)
+          .readTimeout(10, TimeUnit.SECONDS)
+          .build()
+
+      val urls = listOf(
+        "https://www.instagram.com/",
+        "https://i.instagram.com/api/v1/si/fetch_headers/",
+        "https://graph.instagram.com/",
+        "https://scontent.cdninstagram.com/",
+        "https://x.com/",
+        "https://api.x.com/1.1/help/settings.json",
+        "https://api.twitter.com/1.1/help/settings.json",
+        "https://abs.twimg.com/",
+        "https://pbs.twimg.com/",
+        "https://video.twimg.com/",
+      )
+
+      for (url in urls) {
+        try {
+          val start = System.currentTimeMillis()
+          client.newCall(
+            Request.Builder()
+              .url(url)
+              .header("User-Agent", "Mozilla/5.0 (Linux; Android 9; SM-G950F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+              .build()
+          ).execute().use { resp ->
+            val bodyBytes = resp.body?.bytes() ?: ByteArray(0)
+            val elapsed = System.currentTimeMillis() - start
+            println("DIAG_TUN2SOCKS_SEQ: $url -> HTTP ${resp.code} (${resp.protocol}) bytes=${bodyBytes.size} in ${elapsed}ms")
+          }
+        } catch (e: Exception) {
+          println("DIAG_TUN2SOCKS_SEQ_FAIL: $url -> ${e.javaClass.simpleName}: ${e.message}")
+        }
+      }
+
+      // Now simulate scrolling Instagram feed & opening Twitter timeline: 16 CONCURRENT requests!
+      println("DIAG_CONCURRENT: Launching 16 parallel requests...")
+      val pool = java.util.concurrent.Executors.newFixedThreadPool(16)
+      val futures =
+        (1..16).map { idx ->
+          val targetUrl = urls[idx % urls.size]
+          pool.submit<String> {
+            try {
+              val start = System.currentTimeMillis()
+              client.newCall(
+                Request.Builder()
+                  .url(targetUrl)
+                  .header("Cache-Control", "no-cache")
+                  .header("User-Agent", "Instagram 312.0.0.34.111 Android (28/9; 480dpi; 1080x2076; samsung; SM-G950F; dreamlte; samsungexynos8895; fa_IR)")
+                  .build()
+              ).execute().use { resp ->
+                val b = resp.body?.bytes() ?: ByteArray(0)
+                val elapsed = System.currentTimeMillis() - start
+                "CONC #$idx ($targetUrl) -> HTTP ${resp.code} (${resp.protocol}) bytes=${b.size} in ${elapsed}ms"
+              }
+            } catch (e: Exception) {
+              "CONC_FAIL #$idx ($targetUrl) -> ${e.javaClass.simpleName}: ${e.message}"
+            }
+          }
+        }
+      for (f in futures) {
+        println("DIAG_CONCURRENT: ${f.get()}")
+      }
+      pool.shutdownNow()
+      Unit
+    } finally {
+      proxy.stop()
+    }
+  }
 }
+
 
 

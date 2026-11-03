@@ -881,8 +881,13 @@ class SoliSpiritRepository(
 
         if (stage1Passed.isEmpty()) continue
 
-        // Stage 2: Strictly verify real encrypted HTTPS port 443 (`www.google.com:443`),
-        // Twitter/X (`api.x.com:443`), AND Telegram DC2 (`149.154.167.50:443`)
+        // Stage 2: Strictly verify 4 concurrent streams over the candidate node in parallel:
+        // 1. Google HTTPS 443 (`www.google.com:443`)
+        // 2. Twitter/X API 443 (`api.x.com:443`)
+        // 3. Instagram API 443 (`i.instagram.com:443`)
+        // 4. Telegram DC2 (`149.154.167.50:443`)
+        // Running these 4 probes concurrently both speeds up verification by 3x AND filters out
+        // servers that choke when an app opens multiple parallel streams!
         val topToVerify = stage1Passed.take(16)
         val stage2Verified =
           coroutineScope {
@@ -890,42 +895,58 @@ class SoliSpiritRepository(
               .map { candidate ->
                 async {
                   coroutineContext.ensureActive()
-                  val httpsLatency =
-                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
-                      config = candidate,
-                      timeoutMs = 2800,
-                    ) ?: return@async null
-
-                  val socialLatency =
-                    V2RayOutboundClient.verifySocialMediaCapability(
-                      config = candidate,
-                      timeoutMs = 2600,
-                    )
-
-                  val tgLatency =
-                    V2RayOutboundClient.verifyTelegramCapability(
-                      config = candidate,
-                      timeoutMs = 2000,
-                    )
-
-                  val baseLatency =
-                    when {
-                      socialLatency != null && tgLatency != null ->
-                        (candidate.latencyMs + httpsLatency + socialLatency + tgLatency) / 4L
-                      socialLatency != null ->
-                        ((candidate.latencyMs + httpsLatency + socialLatency) / 3L) + 120L
-                      tgLatency != null ->
-                        // Penalize nodes that cannot reach Twitter/X (e.g. restricted Cloudflare Workers)
-                        // so full-access VPS/unrestricted nodes are always primary!
-                        ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 600L
-                      else ->
-                        ((candidate.latencyMs + httpsLatency) / 2L) + 900L
+                  kotlinx.coroutines.withTimeoutOrNull(3800L) {
+                    val httpsJob = async {
+                      V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                        config = candidate,
+                        timeoutMs = 2600,
+                      )
+                    }
+                    val twitterJob = async {
+                      V2RayOutboundClient.verifySocialMediaCapability(
+                        config = candidate,
+                        timeoutMs = 2600,
+                      )
+                    }
+                    val instagramJob = async {
+                      V2RayOutboundClient.verifyInstagramCapability(
+                        config = candidate,
+                        timeoutMs = 2600,
+                      )
+                    }
+                    val tgJob = async {
+                      V2RayOutboundClient.verifyTelegramCapability(
+                        config = candidate,
+                        timeoutMs = 2000,
+                      )
                     }
 
-                  candidate.copy(
-                    latencyMs = baseLatency.coerceAtLeast(1L),
-                    speedScore = 10_000.0 / baseLatency.coerceAtLeast(1L).toDouble(),
-                  )
+                    val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
+                    val twitterLatency = twitterJob.await()
+                    val instagramLatency = instagramJob.await()
+                    val tgLatency = tgJob.await()
+
+                    val baseLatency =
+                      when {
+                        twitterLatency != null && instagramLatency != null && tgLatency != null ->
+                          (candidate.latencyMs + httpsLatency + twitterLatency + instagramLatency + tgLatency) / 5L
+                        twitterLatency != null && instagramLatency != null ->
+                          ((candidate.latencyMs + httpsLatency + twitterLatency + instagramLatency) / 4L) + 60L
+                        twitterLatency != null || instagramLatency != null -> {
+                          val soc = twitterLatency ?: instagramLatency ?: httpsLatency
+                          ((candidate.latencyMs + httpsLatency + soc) / 3L) + 250L
+                        }
+                        tgLatency != null ->
+                          ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 900L
+                        else ->
+                          ((candidate.latencyMs + httpsLatency) / 2L) + 1200L
+                      }
+
+                    candidate.copy(
+                      latencyMs = baseLatency.coerceAtLeast(1L),
+                      speedScore = 10_000.0 / baseLatency.coerceAtLeast(1L).toDouble(),
+                    )
+                  }
                 }
               }
               .awaitAll()
@@ -934,20 +955,63 @@ class SoliSpiritRepository(
           }
 
         verifiedPool.addAll(stage2Verified)
-        // Return immediately once we have at least 2 full-access nodes (latencyMs < 550ms means socialLatency succeeded!)
-        if (verifiedPool.count { it.latencyMs < 550L } >= 2 || verifiedPool.size >= 4) {
-          return@withContext verifiedPool
-            .distinctBy { it.endpointKey }
-            .sortedBy { it.latencyMs }
-            .take(maxCount)
+        val fullSocialCount = verifiedPool.count { it.latencyMs < 550L }
+        if (fullSocialCount >= 4) {
+          return@withContext selectDiverseCandidates(verifiedPool, maxCount)
         }
       }
 
-      verifiedPool
-        .distinctBy { it.endpointKey }
-        .sortedBy { it.latencyMs }
-        .take(maxCount)
+      selectDiverseCandidates(verifiedPool, maxCount)
     }
+
+  /**
+   * Selects up to [maxCount] verified candidates sorted by latency while enforcing subnet (/16)
+   * and root-SNI diversity so the failover pool never puts all eggs in one rate-limited cluster.
+   */
+  private fun selectDiverseCandidates(
+    pool: List<V2RayConfig>,
+    maxCount: Int,
+  ): List<V2RayConfig> {
+    val unique = pool.distinctBy { it.endpointKey }.sortedBy { it.latencyMs }
+    if (unique.size <= maxCount) return unique
+
+    val selected = mutableListOf<V2RayConfig>()
+    val subnetCounts = HashMap<String, Int>()
+    val rootDomainCounts = HashMap<String, Int>()
+
+    for (cfg in unique) {
+      if (selected.size >= maxCount) break
+      val ip = cfg.resolvedIp.ifBlank { cfg.address }
+      val parts = ip.split(".")
+      val subnetKey = if (parts.size == 4) "${parts[0]}.${parts[1]}" else ip
+      val sniParts = cfg.sni.ifBlank { cfg.hostHeader }.ifBlank { cfg.address }.lowercase().split(".")
+      val domainKey =
+        if (sniParts.size >= 2) {
+          "${sniParts[sniParts.size - 2]}.${sniParts[sniParts.size - 1]}"
+        } else {
+          cfg.sni.lowercase()
+        }
+
+      val sCount = subnetCounts.getOrDefault(subnetKey, 0)
+      val dCount = rootDomainCounts.getOrDefault(domainKey, 0)
+      if (sCount < 2 && dCount < 2) {
+        selected.add(cfg)
+        subnetCounts[subnetKey] = sCount + 1
+        rootDomainCounts[domainKey] = dCount + 1
+      }
+    }
+
+    if (selected.size < maxCount) {
+      for (cfg in unique) {
+        if (selected.size >= maxCount) break
+        if (selected.none { it.endpointKey == cfg.endpointKey }) {
+          selected.add(cfg)
+        }
+      }
+    }
+
+    return selected
+  }
 
   suspend fun testAndSelectFastest(
     configs: List<V2RayConfig>,
