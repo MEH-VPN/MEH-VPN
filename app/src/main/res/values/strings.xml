@@ -6,7 +6,9 @@
     <string name="log_fetching">دریافت لیست سرور ها</string>
     <string name="log_testing">تست سرور ها</string>
     <string name="log_connected">متصل</string>
-    <string name="troubleshoot_link_title">اگه وصل نشدید اینجا کلیک کنید و روش های دیگه رو امتحان کنید</string>
+    <string name="troubleshoot_link_title">اگه وصل نشدید اینجا کلیک کنید\nو روش های دیگه رو امتحان کنید</string>
+    <string name="troubleshoot_link_line1">اگه وصل نشدید اینجا کلیک کنید</string>
+    <string name="troubleshoot_link_line2">و روش های دیگه رو امتحان کنید</string>
     <string name="methods_sheet_title">انتخاب و تست روش اتصال</string>
     <string name="methods_sheet_subtitle">روی هر روش کلیک کنید تا به صورت مجزا تست و متصل شود</string>
     <string name="vpn_notification_channel">وضعیت اتصال MEH VPN</string>

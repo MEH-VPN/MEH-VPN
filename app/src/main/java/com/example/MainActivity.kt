@@ -78,6 +78,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
@@ -86,7 +87,9 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
@@ -228,15 +231,19 @@ fun MehMinimalScreen(
           onClick = onPowerToggle,
         )
 
-        Spacer(modifier = Modifier.height(32.dp))
+        if (uiState.liveLogLine.isNotEmpty()) {
+          Spacer(modifier = Modifier.height(8.dp))
 
-        SingleLineLiveLog(
-          logText = uiState.liveLogLine,
-          phase = uiState.phase,
-          accentColor = accentColor,
-        )
+          SingleLineLiveLog(
+            logText = uiState.liveLogLine,
+            phase = uiState.phase,
+            accentColor = accentColor,
+          )
 
-        Spacer(modifier = Modifier.height(24.dp))
+          Spacer(modifier = Modifier.height(6.dp))
+        } else {
+          Spacer(modifier = Modifier.height(4.dp))
+        }
 
         TroubleshootMethodsLink(
           onClick = onOpenMethodsSheet,
@@ -265,7 +272,25 @@ fun MehMinimalScreen(
 private fun TroubleshootMethodsLink(
   onClick: () -> Unit,
 ) {
-  val linkText = stringResource(R.string.troubleshoot_link_title)
+  val line1 = stringResource(R.string.troubleshoot_link_line1)
+  val line2 = stringResource(R.string.troubleshoot_link_line2)
+  val textMeasurer = rememberTextMeasurer()
+  val density = LocalDensity.current
+  val baseStyle =
+    MaterialTheme.typography.bodyMedium.copy(
+      fontFamily = VazirmatnFontFamily,
+      fontWeight = FontWeight.Normal,
+      color = Color.White,
+      textDecoration = TextDecoration.None,
+    )
+
+  val equalLineWidthDp =
+    remember(line1, line2, baseStyle, density) {
+      val w1 = textMeasurer.measure(text = line1, style = baseStyle, maxLines = 1).size.width
+      val w2 = textMeasurer.measure(text = line2, style = baseStyle, maxLines = 1).size.width
+      with(density) { maxOf(w1, w2).toDp() }
+    }
+
   CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
     Box(
       modifier =
@@ -274,31 +299,44 @@ private fun TroubleshootMethodsLink(
             role = Role.Button,
             onClick = onClick,
           )
-          .padding(horizontal = 12.dp, vertical = 10.dp)
+          .padding(horizontal = 12.dp, vertical = 6.dp)
           .testTag("troubleshoot_methods_link"),
       contentAlignment = Alignment.Center,
     ) {
-      Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center,
+      Column(
+        modifier = Modifier.width(equalLineWidthDp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
       ) {
-        Icon(
-          imageVector = Icons.Rounded.Tune,
-          contentDescription = null,
-          tint = Color.White,
-          modifier = Modifier.size(18.dp),
+        JustifiedPersianLine(
+          line = line1,
+          style = baseStyle,
         )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-          text = linkText,
-          style = MaterialTheme.typography.bodyMedium,
-          fontFamily = VazirmatnFontFamily,
-          fontWeight = FontWeight.Normal,
-          color = Color.White,
-          textDecoration = TextDecoration.None,
-          textAlign = TextAlign.Center,
+        JustifiedPersianLine(
+          line = line2,
+          style = baseStyle,
         )
       }
+    }
+  }
+}
+
+@Composable
+private fun JustifiedPersianLine(
+  line: String,
+  style: TextStyle,
+) {
+  val words = remember(line) { line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() } }
+  Row(
+    modifier = Modifier.fillMaxWidth(),
+    horizontalArrangement = Arrangement.SpaceBetween,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    words.forEach { word ->
+      Text(
+        text = word,
+        style = style,
+        maxLines = 1,
+      )
     }
   }
 }
