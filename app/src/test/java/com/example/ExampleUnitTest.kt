@@ -337,33 +337,24 @@ class ExampleUnitTest {
     assertTrue(V2RayOutboundClient.isSupportedByEngine(serverlessA))
     assertTrue(serverlessA.toV2RayCoreJson().contains("[\"6\", \"98\", \"1\"]"))
 
-    // 6. Verify 1-to-1 unique Public IPv4 allocation for Twitter/X and Instagram + reverse lookup
-    val socialDomains = listOf(
-      "api.x.com",
-      "api.twitter.com",
-      "pbs.twimg.com",
-      "abs.twimg.com",
-      "video.twimg.com",
-      "i.instagram.com",
-      "graph.instagram.com",
-      "scontent-fra5-1.cdninstagram.com",
-      "video-fra5-1.cdninstagram.com",
-    )
-    val allocatedSocialIps = HashSet<String>()
-    for (dom in socialDomains) {
-      val ip = LocalV2RayProxyServer.resolveKnownCleanPublicIpv4(dom)
-      assertNotNull("Expected public IPv4 for $dom", ip)
-      assertTrue("Expected distinct 1-to-1 IPv4 for $dom so HTTP/2 does not coalesce across CDN shards, got duplicate $ip", allocatedSocialIps.add(ip!!))
-      assertEquals(dom, LocalV2RayProxyServer.resolveFakeIpDomain(ip))
-    }
-
-    val seenFakeIps = HashSet<String>()
-    for (i in 1..300) {
-      val dom = "sub-$i.custom-test-domain.org"
-      val fakeIp = LocalV2RayProxyServer.allocateFakeIpForDomain(dom)
-      assertTrue("Expected unique FakeIP for $dom, got duplicate $fakeIp", seenFakeIps.add(fakeIp))
-      assertEquals(dom, LocalV2RayProxyServer.resolveFakeIpDomain(fakeIp))
-    }
+    // 6. Verify passive real-DNS reverse record recording (without synthetic FakeIP generation)
+    val sampleDnsResp =
+      byteArrayOf(
+        0x12, 0x34, 0x81.toByte(), 0x80.toByte(),
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x03, 'a'.code.toByte(), 'p'.code.toByte(), 'i'.code.toByte(),
+        0x01, 'x'.code.toByte(),
+        0x03, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(),
+        0x00,
+        0x00, 0x01, 0x00, 0x01,
+        0xC0.toByte(), 0x0C.toByte(),
+        0x00, 0x01, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x3C,
+        0x00, 0x04,
+        172.toByte(), 66.toByte(), 0, 227.toByte(),
+      )
+    LocalV2RayProxyServer.recordRealDnsARecords("api.x.com", sampleDnsResp)
+    assertEquals("api.x.com", LocalV2RayProxyServer.lookupDomainForRealIp("172.66.0.227"))
 
     // 7. Verify TLS ClientHello SNI extraction for destOverride: ["tls"]
     val extractedSni = com.example.vpn.GfwKnockerXrayCore.extractTlsSniHostname(clientHello.array())
@@ -459,6 +450,12 @@ class ExampleUnitTest {
         }
       }
 
+      // Verify HTTPS/SVCB (QTYPE=65) is genuinely resolved over the V2Ray tunnel (not synthetically suppressed!)
+      val httpsRrReply = queryDnsViaSocks5UdpAssociate("x.com", qtype = 65)
+      val httpsAnCount = ((httpsRrReply[6].toInt() and 0xFF) shl 8) or (httpsRrReply[7].toInt() and 0xFF)
+      println("DIAG_HTTPS_SVCB: x.com QTYPE=65 -> ANCOUNT=$httpsAnCount (replySize=${httpsRrReply.size} bytes)")
+      assertTrue("Expected real upstream DNS response for QTYPE=65 (HTTPS/SVCB)", httpsRrReply.size > 30)
+
       // Parse first IPv4 A record from raw DNS response
       fun extractFirstARecord(dnsReply: ByteArray): ByteArray? {
         if (dnsReply.size < 12) return null
@@ -517,6 +514,7 @@ class ExampleUnitTest {
           val ipv4Bytes = extractFirstARecord(aReply)
           assertNotNull("Expected valid IPv4 A record from SOCKS5 UDP DNS for $hostname", ipv4Bytes)
           val ipStr = "${ipv4Bytes!![0].toInt() and 0xFF}.${ipv4Bytes[1].toInt() and 0xFF}.${ipv4Bytes[2].toInt() and 0xFF}.${ipv4Bytes[3].toInt() and 0xFF}"
+          assertNotNull("Expected real IP $ipStr to be recorded in reverse DNS table", LocalV2RayProxyServer.lookupDomainForRealIp(ipStr))
           println("DIAG_UDP_DNS: $hostname -> $ipStr (replySize=${aReply.size} bytes)")
           // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes (ATYP=0x01)!
           return listOf(InetAddress.getByAddress("", ipv4Bytes))

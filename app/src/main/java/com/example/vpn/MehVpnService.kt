@@ -318,7 +318,7 @@ class MehVpnService : VpnService() {
           delay(15_000L)
           val activeCfg = proxyServer.activeConfig
           val measuredPing =
-            V2RayOutboundClient.measureRealProxyDelay(
+            V2RayOutboundClient.verifyHttpsAndDnsCapability(
               config = activeCfg,
               timeoutMs = 3500,
               protector = { socket -> protectOutboundSocket(socket) },

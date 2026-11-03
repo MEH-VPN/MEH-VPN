@@ -661,8 +661,16 @@ class SoliSpiritRepository(
                 cleanEdgeIp = "188.114.98.0",
               )
             val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directAether, timeoutMs = 2800)
-            if (ping != null) {
-              listOf(directAether.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            val socialPing =
+              if (ping != null) {
+                V2RayOutboundClient.verifyInstagramCapability(directAether, timeoutMs = 2600)
+                  ?: V2RayOutboundClient.verifySocialMediaCapability(directAether, timeoutMs = 2600)
+              } else {
+                null
+              }
+            if (ping != null && socialPing != null) {
+              val avg = (ping + socialPing) / 2L
+              listOf(directAether.copy(latencyMs = avg, speedScore = 10_000.0 / avg.coerceAtLeast(1L)))
             } else {
               emptyList()
             }
@@ -722,11 +730,19 @@ class SoliSpiritRepository(
               )
             val measuredLatency =
               V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessA, timeoutMs = 2800)
-            if (measuredLatency != null) {
+            val socialLatency =
+              if (measuredLatency != null) {
+                V2RayOutboundClient.verifyInstagramCapability(serverlessA, timeoutMs = 2600)
+                  ?: V2RayOutboundClient.verifySocialMediaCapability(serverlessA, timeoutMs = 2600)
+              } else {
+                null
+              }
+            if (measuredLatency != null && socialLatency != null) {
+              val avg = (measuredLatency + socialLatency) / 2L
               listOf(
                 serverlessA.copy(
-                  latencyMs = measuredLatency,
-                  speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
+                  latencyMs = avg,
+                  speedScore = 10_000.0 / avg.coerceAtLeast(1L),
                 )
               )
             } else {
@@ -763,11 +779,19 @@ class SoliSpiritRepository(
               )
             val measuredLatency =
               V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessB, timeoutMs = 2800)
-            if (measuredLatency != null) {
+            val socialLatency =
+              if (measuredLatency != null) {
+                V2RayOutboundClient.verifyInstagramCapability(serverlessB, timeoutMs = 2600)
+                  ?: V2RayOutboundClient.verifySocialMediaCapability(serverlessB, timeoutMs = 2600)
+              } else {
+                null
+              }
+            if (measuredLatency != null && socialLatency != null) {
+              val avg = (measuredLatency + socialLatency) / 2L
               listOf(
                 serverlessB.copy(
-                  latencyMs = measuredLatency,
-                  speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
+                  latencyMs = avg,
+                  speedScore = 10_000.0 / avg.coerceAtLeast(1L),
                 )
               )
             } else {
@@ -795,8 +819,16 @@ class SoliSpiritRepository(
                 cleanEdgeIp = "188.114.98.0",
               )
             val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directSni, timeoutMs = 2800)
-            if (ping != null) {
-              listOf(directSni.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            val socialPing =
+              if (ping != null) {
+                V2RayOutboundClient.verifyInstagramCapability(directSni, timeoutMs = 2600)
+                  ?: V2RayOutboundClient.verifySocialMediaCapability(directSni, timeoutMs = 2600)
+              } else {
+                null
+              }
+            if (ping != null && socialPing != null) {
+              val avg = (ping + socialPing) / 2L
+              listOf(directSni.copy(latencyMs = avg, speedScore = 10_000.0 / avg.coerceAtLeast(1L)))
             } else {
               emptyList()
             }
@@ -854,6 +886,7 @@ class SoliSpiritRepository(
       onLogUpdate("تست سرور ها")
 
       val fullSocialPool = mutableListOf<V2RayConfig>()
+      val partialSocialPool = mutableListOf<V2RayConfig>()
       val fallbackHttpsPool = mutableListOf<V2RayConfig>()
       val stage2Semaphore = Semaphore(6)
 
@@ -887,8 +920,8 @@ class SoliSpiritRepository(
 
         if (stage1Passed.isEmpty()) continue
 
-        // Stage 2: Verify candidate nodes with bounded concurrency (`stage2Semaphore = Semaphore(6)`)
-        // so we never congest the mobile radio with 64 simultaneous TLS handshakes at once!
+        // Stage 2: Multi-endpoint verification (Google HTTPS 443 + X/Twitter TLS 443 + Instagram TLS 443 + Telegram DC)
+        // with bounded concurrency (`stage2Semaphore = Semaphore(6)`)
         val topToVerify = stage1Passed.take(12)
         val stage2Results =
           coroutineScope {
@@ -947,8 +980,15 @@ class SoliSpiritRepository(
                             ((candidate.latencyMs + httpsLatency) / 2L) + 1000L
                         }
 
+                      val tier =
+                        when {
+                          passedBothSocial -> 1
+                          passedAtLeastOneSocial -> 2
+                          else -> 3
+                        }
+
                       Pair(
-                        passedBothSocial || passedAtLeastOneSocial,
+                        tier,
                         candidate.copy(
                           latencyMs = effectiveLatency.coerceAtLeast(1L),
                           speedScore = 10_000.0 / effectiveLatency.coerceAtLeast(1L).toDouble(),
@@ -962,11 +1002,11 @@ class SoliSpiritRepository(
               .filterNotNull()
           }
 
-        for ((passedSocial, cfg) in stage2Results) {
-          if (passedSocial) {
-            fullSocialPool.add(cfg)
-          } else {
-            fallbackHttpsPool.add(cfg)
+        for ((tier, cfg) in stage2Results) {
+          when (tier) {
+            1 -> fullSocialPool.add(cfg)
+            2 -> partialSocialPool.add(cfg)
+            else -> fallbackHttpsPool.add(cfg)
           }
         }
 
@@ -975,10 +1015,10 @@ class SoliSpiritRepository(
         }
       }
 
-      if (fullSocialPool.isNotEmpty()) {
-        selectDiverseCandidates(fullSocialPool, maxCount)
-      } else {
-        selectDiverseCandidates(fallbackHttpsPool, maxCount)
+      when {
+        fullSocialPool.isNotEmpty() -> selectDiverseCandidates(fullSocialPool + partialSocialPool, maxCount)
+        partialSocialPool.isNotEmpty() -> selectDiverseCandidates(partialSocialPool, maxCount)
+        else -> selectDiverseCandidates(fallbackHttpsPool, maxCount)
       }
     }
 

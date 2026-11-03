@@ -23,22 +23,19 @@ import java.util.concurrent.atomic.AtomicInteger
  * Local multi-protocol proxy server supporting:
  * 1. Unbounded cached thread pool (`relayExecutor`) so `tun2socks` concurrent TCP/UDP sockets
  *    never hit Kotlin's 64-thread `Dispatchers.IO` starvation deadlock on Android.
- * 2. Real Public Anycast IP Coalescing + Instant FakeDNS fallback:
- *    - Resolves Instagram (`*.instagram.com`, `*.cdninstagram.com`, `*.fbcdn.net`), Twitter/X
- *      (`*.x.com`, `*.twitter.com`, `*.twimg.com`, `t.co`), YouTube/Google, and Telegram domains
- *      in 0.1ms to their real public Anycast IPs so Cronet (Twitter) and Meta Proxygen (Instagram)
- *      never reject bogon IPs and properly coalesce HTTP/2 streams onto shared connections.
- *    - Suppresses `AAAA` (`QTYPE=28`) and `HTTPS/SVCB` (`QTYPE=65/64`) in 0.1ms so apps never stall
- *      on IPv6 or UDP 443 QUIC probes.
- * 3. Full TLS `ClientHello` Record Reassembly + Unconditional `destOverride: ["http", "tls"]`:
+ * 2. Real Tunnel DNS Resolution (`Android DNS -> TUN -> SOCKS5/V2Ray -> Remote DNS -> Real IP`):
+ *    - Never fabricates counter-based or synthetic Fake IPs for X, Instagram/Meta, or any site.
+ *    - Resolves `A` (`QTYPE=1`), `HTTPS/SVCB` (`QTYPE=65/64`), `CNAME`, etc. genuinely inside the
+ *      encrypted V2Ray tunnel (`8.8.8.8:53` / `1.1.1.1:53` and DoH fallback).
+ *    - Passively records real `A` record IPv4s (`realIpToDomain`) from unpoisoned DNS answers.
+ *    - Suppresses only `AAAA` (`QTYPE=28`) while IPv6 is disabled on the TUN interface.
+ * 3. Full TLS `ClientHello` Record Reassembly + Domain-First Outbound Routing (`destOverride: ["http", "tls"]`):
  *    - Reassembles multi-segment TLS 1.3 Post-Quantum `ClientHello` packets (`> 1240` bytes)
- *      before extracting the `SNI` hostname so Twitter/Instagram SNI at the end of the 2nd TCP
- *      segment is 100% always detected.
+ *      before extracting the `SNI` hostname so VLESS/Trojan outbounds receive the real domain name
+ *      while keeping the real DNS IPv4 as `fallbackIpv4`.
  * 4. Verified First-Response Multi-Server Failover + Concurrent Stream Load-Balancing:
  *    - Verifies that the remote V2Ray server actually connected to `targetHost:targetPort` and
- *      returned the first response bytes (`ServerHello`) before committing to that server; if a
- *      Cloudflare Worker hits its 6-connection limit (e.g. after Instagram's first 2 posts) or
- *      blocks Twitter, it transparently fails over to the next server in `serverPool`!
+ *      returned the first response bytes (`ServerHello`) before committing to that server.
  */
 class LocalV2RayProxyServer(
   configs: List<V2RayConfig>,
@@ -52,101 +49,59 @@ class LocalV2RayProxyServer(
   ) : this(listOf(config), protector, udpProtector)
 
   companion object {
-    private val fakeIpCounter = AtomicInteger(1)
-    private val twitterIpCounter = AtomicInteger(1)
-    private val metaIpCounter = AtomicInteger(1)
-    private val domainToFakeIp = ConcurrentHashMap<String, String>()
-    private val fakeIpToDomain = ConcurrentHashMap<String, String>()
+    private val realIpToDomain = ConcurrentHashMap<String, String>()
 
     /**
-     * Allocates a strictly unique 1-to-1 publicly routable IPv4 for major platforms (Twitter/X,
-     * Instagram/Meta, YouTube/Google, Telegram) so that:
-     * 1. Chromium/Cronet (Twitter) and Meta Proxygen (Instagram) see `IsPubliclyRoutable() == true`
-     *    (never `198.18.0.0/15` RFC 2544 bogon space).
-     * 2. Every distinct subdomain (`api.x.com` vs `x.com` vs `pbs.twimg.com` vs `video.twimg.com`,
-     *    and `scontent-fra5-1.cdninstagram.com` vs `video-fra5-1.cdninstagram.com`) gets its OWN
-     *    unique IPv4 address so HTTP/2 never misdirects requests across different backend shards!
-     * 3. Multiple requests to the EXACT same subdomain share the same IP and reuse HTTP/2 streams.
+     * Passively records real IPv4 `A` records from an authentic DNS response so non-SNI connections
+     * to a real resolved IPv4 can also know the domain name that resolved to it.
      */
-    fun resolveKnownCleanPublicIpv4(domain: String): String? {
-      val d = domain.trim().trimEnd('.').lowercase()
-      if (d.isEmpty()) return null
-      domainToFakeIp[d]?.let { return it }
+    fun recordRealDnsARecords(domain: String, dnsBytes: ByteArray) {
+      val cleanDomain = domain.trim().trimEnd('.').lowercase()
+      if (cleanDomain.isEmpty() || dnsBytes.size < 12) return
+      val qdCount = ((dnsBytes[4].toInt() and 0xFF) shl 8) or (dnsBytes[5].toInt() and 0xFF)
+      val anCount = ((dnsBytes[6].toInt() and 0xFF) shl 8) or (dnsBytes[7].toInt() and 0xFF)
+      if (anCount <= 0) return
 
-      val allocated =
-        when {
-          // Twitter / X API, Web & Media CDNs -> unique 1-to-1 IP in 104.244.43.2 .. 104.244.46.251
-          d == "x.com" || d.endsWith(".x.com") ||
-            d == "twitter.com" || d.endsWith(".twitter.com") ||
-            d == "t.co" || d.endsWith(".t.co") ||
-            d == "twimg.com" || d.endsWith(".twimg.com") ||
-            d == "pscp.tv" || d.endsWith(".pscp.tv") ||
-            d == "periscope.tv" || d.endsWith(".periscope.tv") -> {
-            val seq = (twitterIpCounter.getAndIncrement() and 0x03FF)
-            val oct3 = 43 + ((seq / 250) and 0x03) // 43..46
-            val oct4 = (seq % 250) + 2 // 2..251
-            "104.244.$oct3.$oct4"
+      var offset = 12
+      repeat(qdCount) {
+        offset = skipDnsNameStatic(dnsBytes, offset)
+        if (offset < 0 || offset + 4 > dnsBytes.size) return
+        offset += 4
+      }
+      repeat(anCount) {
+        offset = skipDnsNameStatic(dnsBytes, offset)
+        if (offset < 0 || offset + 10 > dnsBytes.size) return
+        val type = ((dnsBytes[offset].toInt() and 0xFF) shl 8) or (dnsBytes[offset + 1].toInt() and 0xFF)
+        val rdLen = ((dnsBytes[offset + 8].toInt() and 0xFF) shl 8) or (dnsBytes[offset + 9].toInt() and 0xFF)
+        offset += 10
+        if (offset + rdLen > dnsBytes.size) return
+        if (type == 1 && rdLen == 4) {
+          val ipv4Bytes = dnsBytes.copyOfRange(offset, offset + 4)
+          if (V2RayOutboundClient.isPublicRoutableIpv4(ipv4Bytes)) {
+            val ipStr =
+              "${ipv4Bytes[0].toInt() and 0xFF}.${ipv4Bytes[1].toInt() and 0xFF}.${ipv4Bytes[2].toInt() and 0xFF}.${ipv4Bytes[3].toInt() and 0xFF}"
+            realIpToDomain[ipStr] = cleanDomain
           }
-
-          // Instagram, Facebook & WhatsApp API & Media CDNs -> unique 1-to-1 IP in 157.240.200.2 .. 157.240.231.251
-          d == "instagram.com" || d.endsWith(".instagram.com") ||
-            d == "cdninstagram.com" || d.endsWith(".cdninstagram.com") ||
-            d == "fbcdn.net" || d.endsWith(".fbcdn.net") ||
-            d == "facebook.com" || d.endsWith(".facebook.com") ||
-            d == "fb.com" || d.endsWith(".fb.com") ||
-            d == "ig.me" || d.endsWith(".ig.me") ||
-            d == "whatsapp.com" || d.endsWith(".whatsapp.com") ||
-            d == "whatsapp.net" || d.endsWith(".whatsapp.net") -> {
-            val seq = (metaIpCounter.getAndIncrement() and 0x1FFF)
-            val oct3 = 200 + ((seq / 250) and 0x1F) // 200..231
-            val oct4 = (seq % 250) + 2 // 2..251
-            "157.240.$oct3.$oct4"
-          }
-
-          else -> null
-        } ?: return null
-
-      val existing = domainToFakeIp.putIfAbsent(d, allocated)
-      val finalIp = existing ?: allocated
-      fakeIpToDomain[finalIp] = d
-      return finalIp
+        }
+        offset += rdLen
+      }
     }
 
-    /**
-     * Collision-free virtual public IPv4 allocator in `198.54.0.2 .. 198.55.255.251`
-     * (`IsPubliclyRoutable() == true` in Chromium/Cronet) with 1-to-1 bidirectional mapping.
-     */
-    fun allocateFakeIpForDomain(domain: String): String {
-      val normalized = domain.trim().trimEnd('.').lowercase()
-      domainToFakeIp[normalized]?.let { return it }
-
-      resolveKnownCleanPublicIpv4(normalized)?.let { return it }
-
-      val seq = (fakeIpCounter.getAndIncrement() and 0x0FFFF)
-      val oct2 = 54 + ((seq / (256 * 250)) and 0x01) // 198.54.x.y .. 198.55.x.y
-      val rem = seq % (256 * 250)
-      val oct3 = (rem / 250) and 0xFF
-      val oct4 = (rem % 250) + 2 // 2..251 (never 0, 1, or 255)
-      val fakeIp = "198.$oct2.$oct3.$oct4"
-
-      val existing = domainToFakeIp.putIfAbsent(normalized, fakeIp)
-      val finalIp = existing ?: fakeIp
-      fakeIpToDomain[finalIp] = normalized
-      return finalIp
+    fun lookupDomainForRealIp(hostOrIp: String): String? {
+      return realIpToDomain[hostOrIp.trim()]
     }
 
-    fun resolveFakeIpDomain(hostOrIp: String): String? {
-      val trimmed = hostOrIp.trim()
-      return fakeIpToDomain[trimmed]
-    }
-
-    fun isFakeIpAddress(hostOrIp: String): Boolean {
-      val trimmed = hostOrIp.trim()
-      return fakeIpToDomain.containsKey(trimmed) ||
-        trimmed.startsWith("198.54.") ||
-        trimmed.startsWith("198.55.") ||
-        trimmed.startsWith("198.18.") ||
-        trimmed.startsWith("198.19.")
+    private fun skipDnsNameStatic(buf: ByteArray, startOffset: Int): Int {
+      var offset = startOffset
+      var jumps = 0
+      while (offset < buf.size && jumps < 16) {
+        val len = buf[offset].toInt() and 0xFF
+        if (len == 0) return offset + 1
+        if ((len and 0xC0) == 0xC0) return offset + 2
+        offset += 1 + len
+        jumps++
+      }
+      return -1
     }
   }
 
@@ -295,7 +250,6 @@ class LocalV2RayProxyServer(
     val targetsToTry =
       if (!fallbackIpv4.isNullOrBlank() &&
         fallbackIpv4 != targetHost &&
-        !isFakeIpAddress(fallbackIpv4) &&
         V2RayOutboundClient.parseIpv4Bytes(fallbackIpv4)?.let { V2RayOutboundClient.isPublicRoutableIpv4(it) } == true
       ) {
         listOf(targetHost, fallbackIpv4)
@@ -505,7 +459,7 @@ class LocalV2RayProxyServer(
           return
         }
 
-        var effectiveHost = resolveFakeIpDomain(rawTargetHost) ?: rawTargetHost
+        var effectiveHost = rawTargetHost
 
         // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
         // (TLS ClientHello / HTTP request / MTProto preamble / DoT port 853 handshake)
@@ -516,10 +470,10 @@ class LocalV2RayProxyServer(
         val firstLen = readCompleteFirstClientPacket(clientSocket, clientIn, firstBuffer)
         if (firstLen == -1) return
 
-        // Unconditional `destOverride: ["http", "tls"]`:
+        // Domain-first routing (`destOverride: ["http", "tls"]`):
         // Whenever the packet is a TLS ClientHello with an SNI hostname or an HTTP request with a
-        // Host header, use the sniffed hostname as the primary destination and keep any real public
-        // IPv4 `rawTargetHost` as fallback!
+        // Host header, pass the exact sniffed domain name to the VLESS/Trojan outbound so the remote
+        // V2Ray server resolves it directly, while keeping the real DNS IPv4 `rawTargetHost` as fallback!
         var isHttpOrTlsRequest = false
         if (firstLen > 0) {
           val tlsSni = GfwKnockerXrayCore.extractTlsSniHostname(firstBuffer, firstLen)
@@ -719,66 +673,22 @@ class LocalV2RayProxyServer(
   }
 
   /**
-   * Builds an RFC 1035 DNS `A` response for [dnsQuery] returning [ipv4Bytes] with a 120s TTL,
-   * properly truncated to `questionEndOffset` so no trailing EDNS0 bytes remain when `ARCOUNT = 0`.
-   */
-  private fun buildSyntheticDnsAResponse(
-    dnsQuery: ByteArray,
-    questionEndOffset: Int,
-    ipv4Bytes: ByteArray,
-  ): ByteArray {
-    val safeEnd = questionEndOffset.coerceIn(12, dnsQuery.size)
-    val respHeader = dnsQuery.copyOfRange(0, safeEnd)
-
-    // Flags: preserve Opcode and RD from query, set QR=1, RA=1, RCODE=0
-    respHeader[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
-    respHeader[3] = 0x80.toByte()
-    // QDCOUNT = 1
-    respHeader[4] = 0x00
-    respHeader[5] = 0x01
-    // ANCOUNT = 1
-    respHeader[6] = 0x00
-    respHeader[7] = 0x01
-    // NSCOUNT = 0, ARCOUNT = 0
-    respHeader[8] = 0x00
-    respHeader[9] = 0x00
-    respHeader[10] = 0x00
-    respHeader[11] = 0x00
-
-    val finalOut = ByteArrayOutputStream(respHeader.size + 16)
-    finalOut.write(respHeader)
-    // Answer RR: Name pointer to offset 12 (0xC00C)
-    finalOut.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
-    // TYPE = A (0x0001), CLASS = IN (0x0001)
-    finalOut.write(byteArrayOf(0x00, 0x01, 0x00, 0x01))
-    // TTL = 120 seconds (0x00000078)
-    finalOut.write(byteArrayOf(0x00, 0x00, 0x00, 0x78))
-    // RDLENGTH = 4
-    finalOut.write(byteArrayOf(0x00, 0x04))
-    // RDATA = 4-byte IPv4 address
-    finalOut.write(ipv4Bytes)
-    return finalOut.toByteArray()
-  }
-
-  /**
-   * Resolves DNS queries over the V2Ray tunnel with:
-   * 1. Instant suppression of `AAAA` (`QTYPE=28`) and `HTTPS/SVCB` (`QTYPE=65/64`) truncated to
-   *    `questionEndOffset` so Android's `ns_initparse` (`cp == eom`) accepts the response and apps
-   *    never stall on IPv6 or UDP 443 QUIC.
-   * 2. Instant `dnsCache` lookup + in-flight request deduplication (`inFlightDnsLocks`) so burst
-   *    DNS queries from Instagram/Twitter never spawn duplicate tunnels.
-   * 3. Single-RTT RFC 1035 DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) over the V2Ray tunnel
-   *    (`resolveDnsOverTcpViaTunnel`), falling back to DoH (`resolveDnsOverHttpsViaTunnel` &
-   *    `resolveDnsOverHttpsProtectedDirect`), and finally synthetic clean IP fallback if offline.
+   * Resolves DNS queries genuinely over the V2Ray tunnel (`Android DNS -> TUN -> SOCKS5/V2Ray -> Remote DNS`):
+   * 1. Suppresses only `AAAA` (`QTYPE=28`) while IPv6 is disabled on the TUN interface.
+   *    Does NOT suppress `HTTPS/SVCB` (`QTYPE=65/64`) so modern clients (Chromium/Cronet, Instagram, X)
+   *    receive authentic `HTTPS/SVCB` and `A` records from the upstream DNS server.
+   * 2. Uses `dnsCache` + in-flight deduplication (`inFlightDnsLocks`) and records real `A` records
+   *    into `realIpToDomain` without ever fabricating Fake IPs.
+   * 3. Resolves via 1-RTT RFC 1035 DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) inside the V2Ray tunnel,
+   *    with DoH over the V2Ray tunnel (`8.8.8.8:443` / `1.1.1.1:443`) as fallback.
    */
   private fun resolveDnsOverV2Ray(dnsQuery: ByteArray): ByteArray? {
     if (dnsQuery.size < 12) return null
     val question = parseDnsQuestion(dnsQuery)
     if (question != null) {
-      // Suppress IPv6 (AAAA=28) and HTTPS/SVCB (65/64) queries in 0.05ms with a properly truncated
-      // NOERROR (0 answers) response (`size == questionEndOffset`) so Android's `ns_initparse`
-      // (`cp == eom`) accepts it and apps use IPv4 TCP 443 immediately.
-      if (question.qtype == 28 || question.qtype == 65 || question.qtype == 64) {
+      // Only suppress IPv6 AAAA (QTYPE=28) because the TUN interface is IPv4-only.
+      // HTTPS/SVCB (QTYPE=65/64) and A (QTYPE=1) are resolved genuinely through the tunnel.
+      if (question.qtype == 28) {
         return buildEmptyDnsNoerrorResponse(dnsQuery, question.questionEndOffset)
       }
     }
@@ -819,24 +729,33 @@ class LocalV2RayProxyServer(
         if (activeConfig.protocol == V2RayProtocol.SERVERLESS) {
           val directDoh = resolveDnsOverHttpsProtectedDirect(dnsQuery)
           if (directDoh != null && isValidUnpoisonedDnsResponse(directDoh)) {
+            if (question != null) {
+              recordRealDnsARecords(question.domain, directDoh)
+            }
             if (cacheKey != null && dnsCache.size < 1024) {
               dnsCache[cacheKey] = directDoh.copyOf()
             }
             return directDoh
           }
         } else {
-          // 2. Fast 1-RTT DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) inside the encrypted V2Ray tunnel
+          // 2. Primary: Fast 1-RTT DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) inside the V2Ray tunnel
           val tcpDnsResp = resolveDnsOverTcpViaTunnel(dnsQuery)
           if (tcpDnsResp != null && isValidUnpoisonedDnsResponse(tcpDnsResp)) {
+            if (question != null) {
+              recordRealDnsARecords(question.domain, tcpDnsResp)
+            }
             if (cacheKey != null && dnsCache.size < 1024) {
               dnsCache[cacheKey] = tcpDnsResp.copyOf()
             }
             return tcpDnsResp
           }
 
-          // 3. Fallback: DNS-over-HTTPS (`8.8.8.8:443`) inside the V2Ray tunnel
+          // 3. Secondary: DNS-over-HTTPS (`8.8.8.8:443` / `1.1.1.1:443`) inside the V2Ray tunnel
           val dohTunnelResp = resolveDnsOverHttpsViaTunnel(dnsQuery)
           if (dohTunnelResp != null && isValidUnpoisonedDnsResponse(dohTunnelResp)) {
+            if (question != null) {
+              recordRealDnsARecords(question.domain, dohTunnelResp)
+            }
             if (cacheKey != null && dnsCache.size < 1024) {
               dnsCache[cacheKey] = dohTunnelResp.copyOf()
             }
@@ -844,24 +763,16 @@ class LocalV2RayProxyServer(
           }
         }
 
-        // 4. Fallback: Protected direct fragmented DoH (`8.8.8.8:443` / `1.1.1.1:443`)
+        // 4. Last-resort fallback: Protected direct fragmented DoH (`8.8.8.8:443` / `1.1.1.1:443`)
         val directDohResp = resolveDnsOverHttpsProtectedDirect(dnsQuery)
         if (directDohResp != null && isValidUnpoisonedDnsResponse(directDohResp)) {
+          if (question != null) {
+            recordRealDnsARecords(question.domain, directDohResp)
+          }
           if (cacheKey != null && dnsCache.size < 1024) {
             dnsCache[cacheKey] = directDohResp.copyOf()
           }
           return directDohResp
-        }
-
-        // 5. Emergency synthetic fallback if all remote DNS servers timed out
-        if (question != null && question.qtype == 1 && question.domain.isNotEmpty()) {
-          val fallbackIpStr =
-            resolveKnownCleanPublicIpv4(question.domain)
-              ?: allocateFakeIpForDomain(question.domain)
-          val ipBytes = V2RayOutboundClient.parseIpv4Bytes(fallbackIpStr)
-          if (ipBytes != null) {
-            return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, ipBytes)
-          }
         }
       } finally {
         if (cacheKey != null) {
@@ -870,7 +781,8 @@ class LocalV2RayProxyServer(
       }
     }
 
-    return buildEmptyDnsNoerrorResponse(dnsQuery, question?.questionEndOffset ?: dnsQuery.size)
+    // Never return a synthetic FakeIP; return a clean RFC 1035 SERVFAIL (RCODE=2) so Android retries cleanly
+    return buildDnsServfailResponse(dnsQuery, question?.questionEndOffset ?: dnsQuery.size)
   }
 
   /**
@@ -1123,7 +1035,7 @@ class LocalV2RayProxyServer(
 
     if (method == "CONNECT") {
       val rawHost = target.substringBeforeLast(":").trim()
-      val host = resolveFakeIpDomain(rawHost) ?: rawHost
+      val host = lookupDomainForRealIp(rawHost) ?: rawHost
       val port = target.substringAfterLast(":", "443").toIntOrNull() ?: 443
       if (host.isEmpty()) return
 
@@ -1172,7 +1084,7 @@ class LocalV2RayProxyServer(
       val authority = withoutHttp.substringBefore("/")
       val path = "/" + withoutHttp.substringAfter("/", "")
       val rawHost = authority.substringBeforeLast(":").trim()
-      val host = resolveFakeIpDomain(rawHost) ?: rawHost
+      val host = lookupDomainForRealIp(rawHost) ?: rawHost
       val port =
         if (authority.contains(":")) {
           authority.substringAfterLast(":").toIntOrNull() ?: 80
@@ -1225,6 +1137,26 @@ class LocalV2RayProxyServer(
     val resp = dnsQuery.copyOfRange(0, safeLen)
     resp[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
     resp[3] = 0x80.toByte()
+    resp[4] = 0x00
+    resp[5] = 0x01
+    resp[6] = 0x00
+    resp[7] = 0x00
+    resp[8] = 0x00
+    resp[9] = 0x00
+    resp[10] = 0x00
+    resp[11] = 0x00
+    return resp
+  }
+
+  private fun buildDnsServfailResponse(
+    dnsQuery: ByteArray,
+    questionEndOffset: Int = parseDnsQuestion(dnsQuery)?.questionEndOffset ?: dnsQuery.size,
+  ): ByteArray {
+    val safeLen = questionEndOffset.coerceIn(12, dnsQuery.size)
+    val resp = dnsQuery.copyOfRange(0, safeLen)
+    resp[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
+    // RA=1, RCODE=2 (SERVFAIL)
+    resp[3] = 0x82.toByte()
     resp[4] = 0x00
     resp[5] = 0x01
     resp[6] = 0x00
