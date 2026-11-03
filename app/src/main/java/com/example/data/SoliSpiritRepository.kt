@@ -660,8 +660,12 @@ class SoliSpiritRepository(
                 remarks = "CluvexStudio Aether Direct",
                 cleanEdgeIp = "188.114.98.0",
               )
-            val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directAether, timeoutMs = 2600) ?: 62L
-            listOf(directAether.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directAether, timeoutMs = 2800)
+            if (ping != null) {
+              listOf(directAether.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            } else {
+              emptyList()
+            }
           }
         }
 
@@ -691,39 +695,85 @@ class SoliSpiritRepository(
         }
 
         MehConnectionMethod.PATTERNIHA_SERVERLESS_FRAG_A -> {
-          onLogUpdate("تست روش Patterniha Serverless Frag-A")
-          val serverlessA =
-            V2RayConfig.createPatternihaServerless(
-              profileId = "patterniha_frag_a",
-              remarks = "Patterniha Serverless Frag-A",
-              cleanEdgeIp = "188.114.98.0",
-            )
-          val measuredLatency =
-            V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessA, timeoutMs = 2600) ?: 65L
-          listOf(
-            serverlessA.copy(
-              latencyMs = measuredLatency,
-              speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
-            )
-          )
+          onLogUpdate("تست روش Patterniha Frag-A")
+          val basePool = (fetchConfigsFromPatternihaFreeConfigs() + fetchConfigsFromSoliSpirit {}).take(120)
+          val fragAPool =
+            basePool.map {
+              it.copy(
+                id = "${it.id}_frag_a",
+                remarks = "Frag-A • ${it.cleanTitle}",
+                fragmentProfile = "patterniha_frag_a",
+              )
+            }
+          val verified =
+            if (fragAPool.isNotEmpty()) {
+              testAndSelectFastestCandidates(fragAPool, maxCount = maxCount, onLogUpdate = {})
+            } else {
+              emptyList()
+            }
+          if (verified.isNotEmpty()) {
+            verified
+          } else {
+            val serverlessA =
+              V2RayConfig.createPatternihaServerless(
+                profileId = "patterniha_frag_a",
+                remarks = "Patterniha Serverless Frag-A",
+                cleanEdgeIp = "188.114.98.0",
+              )
+            val measuredLatency =
+              V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessA, timeoutMs = 2800)
+            if (measuredLatency != null) {
+              listOf(
+                serverlessA.copy(
+                  latencyMs = measuredLatency,
+                  speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
+                )
+              )
+            } else {
+              emptyList()
+            }
+          }
         }
 
         MehConnectionMethod.PATTERNIHA_SERVERLESS_FRAG_B -> {
-          onLogUpdate("تست روش Patterniha Serverless Frag-B")
-          val serverlessB =
-            V2RayConfig.createPatternihaServerless(
-              profileId = "patterniha_frag_b",
-              remarks = "Patterniha Serverless Frag-B",
-              cleanEdgeIp = "188.114.98.0",
-            )
-          val measuredLatency =
-            V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessB, timeoutMs = 2600) ?: 70L
-          listOf(
-            serverlessB.copy(
-              latencyMs = measuredLatency,
-              speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
-            )
-          )
+          onLogUpdate("تست روش Patterniha Frag-B")
+          val basePool = (fetchConfigsFromPatternihaFreeConfigs() + fetchConfigsFromSoliSpirit {}).take(120)
+          val fragBPool =
+            basePool.map {
+              it.copy(
+                id = "${it.id}_frag_b",
+                remarks = "Frag-B • ${it.cleanTitle}",
+                fragmentProfile = "patterniha_frag_b",
+              )
+            }
+          val verified =
+            if (fragBPool.isNotEmpty()) {
+              testAndSelectFastestCandidates(fragBPool, maxCount = maxCount, onLogUpdate = {})
+            } else {
+              emptyList()
+            }
+          if (verified.isNotEmpty()) {
+            verified
+          } else {
+            val serverlessB =
+              V2RayConfig.createPatternihaServerless(
+                profileId = "patterniha_frag_b",
+                remarks = "Patterniha Serverless Frag-B",
+                cleanEdgeIp = "188.114.98.0",
+              )
+            val measuredLatency =
+              V2RayOutboundClient.verifyHttpsAndDnsCapability(serverlessB, timeoutMs = 2800)
+            if (measuredLatency != null) {
+              listOf(
+                serverlessB.copy(
+                  latencyMs = measuredLatency,
+                  speedScore = 10_000.0 / measuredLatency.coerceAtLeast(1L),
+                )
+              )
+            } else {
+              emptyList()
+            }
+          }
         }
 
         MehConnectionMethod.PATTERNIHA_SNI_SPOOFING_MMDF -> {
@@ -744,8 +794,12 @@ class SoliSpiritRepository(
                 remarks = "Patterniha SNI-Spoofing Direct",
                 cleanEdgeIp = "188.114.98.0",
               )
-            val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directSni, timeoutMs = 2600) ?: 75L
-            listOf(directSni.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            val ping = V2RayOutboundClient.verifyHttpsAndDnsCapability(directSni, timeoutMs = 2800)
+            if (ping != null) {
+              listOf(directSni.copy(latencyMs = ping, speedScore = 10_000.0 / ping.coerceAtLeast(1L)))
+            } else {
+              emptyList()
+            }
           }
         }
       }
@@ -782,8 +836,8 @@ class SoliSpiritRepository(
    * 1. Screens candidate V2Ray nodes concurrently with a fast HTTP 204 probe (`measureNodeSpeed`).
    * 2. Verifies the fastest candidates with a 2nd independent connection over TLS/HTTPS port 443
    *    (`V2RayOutboundClient.verifyHttpsAndDnsCapability`) + Telegram DC2 (`149.154.167.50:443`).
-   *    If stage 2 times out on restricted networks, immediately returns the fastest stage 1 nodes
-   *    so connection never fails when responsive nodes exist!
+   *    Only returns nodes that pass real encrypted HTTPS 443 verification across the waves so
+   *    ISP-spoofed plain port 80 nodes never get selected!
    */
   suspend fun testAndSelectFastestCandidates(
     configs: List<V2RayConfig>,
@@ -800,7 +854,6 @@ class SoliSpiritRepository(
       onLogUpdate("تست سرور ها")
 
       val verifiedPool = mutableListOf<V2RayConfig>()
-      val stage1Fallbacks = mutableListOf<V2RayConfig>()
 
       val waves = supported.chunked(WAVE_SIZE).take(3)
       for (wave in waves) {
@@ -827,10 +880,10 @@ class SoliSpiritRepository(
           }
 
         if (stage1Passed.isEmpty()) continue
-        stage1Fallbacks.addAll(stage1Passed)
 
-        // Stage 2: Verify real HTTPS (Google) AND raw IP connection to Telegram DC2 (149.154.167.50:443)
-        val topToVerify = stage1Passed.take(12)
+        // Stage 2: Strictly verify real encrypted HTTPS port 443 (`www.google.com:443`)
+        // AND raw IP connection to Telegram DC2 (`149.154.167.50:443`)
+        val topToVerify = stage1Passed.take(16)
         val stage2Verified =
           coroutineScope {
             topToVerify
@@ -840,7 +893,7 @@ class SoliSpiritRepository(
                   val httpsLatency =
                     V2RayOutboundClient.verifyHttpsAndDnsCapability(
                       config = candidate,
-                      timeoutMs = 2500,
+                      timeoutMs = 2800,
                     ) ?: return@async null
 
                   val tgLatency =
@@ -853,7 +906,8 @@ class SoliSpiritRepository(
                     if (tgLatency != null) {
                       (candidate.latencyMs + httpsLatency + tgLatency) / 3L
                     } else {
-                      (candidate.latencyMs + httpsLatency) / 2L
+                      // Penalize nodes that cannot reach Telegram DC IPs so Telegram-capable nodes rank first
+                      ((candidate.latencyMs + httpsLatency) / 2L) + 250L
                     }
 
                   candidate.copy(
@@ -868,22 +922,15 @@ class SoliSpiritRepository(
           }
 
         verifiedPool.addAll(stage2Verified)
-        if (verifiedPool.isNotEmpty()) {
-          return@withContext (verifiedPool + stage1Fallbacks)
-            .distinctBy { it.endpointKey }
-            .take(maxCount)
-        }
-
-        // If stage1 found responsive nodes, return them right away instead of failing!
-        if (stage1Fallbacks.size >= 2) {
-          return@withContext stage1Fallbacks
+        if (verifiedPool.size >= 2) {
+          return@withContext verifiedPool
             .distinctBy { it.endpointKey }
             .sortedBy { it.latencyMs }
             .take(maxCount)
         }
       }
 
-      stage1Fallbacks
+      verifiedPool
         .distinctBy { it.endpointKey }
         .sortedBy { it.latencyMs }
         .take(maxCount)

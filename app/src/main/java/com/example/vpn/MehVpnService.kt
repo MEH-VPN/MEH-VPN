@@ -99,29 +99,19 @@ class MehVpnService : VpnService() {
   }
 
   private fun protectOutboundSocket(socket: Socket): Boolean {
-    val protectedOk =
-      try {
-        protect(socket)
-      } catch (_: Exception) {
-        false
-      }
-    try {
-      underlyingPhysicalNetwork?.bindSocket(socket)
-    } catch (_: Exception) {}
-    return protectedOk
+    return try {
+      protect(socket)
+    } catch (_: Exception) {
+      false
+    }
   }
 
   private fun protectOutboundDatagramSocket(datagramSocket: DatagramSocket): Boolean {
-    val protectedOk =
-      try {
-        protect(datagramSocket)
-      } catch (_: Exception) {
-        false
-      }
-    try {
-      underlyingPhysicalNetwork?.bindSocket(datagramSocket)
-    } catch (_: Exception) {}
-    return protectedOk
+    return try {
+      protect(datagramSocket)
+    } catch (_: Exception) {
+      false
+    }
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -133,8 +123,12 @@ class MehVpnService : VpnService() {
       ACTION_CONNECT -> {
         val rawUri = intent.getStringExtra(EXTRA_RAW_URI).orEmpty()
         val resolvedIp = intent.getStringExtra(EXTRA_RESOLVED_IP).orEmpty()
+        val primaryProfile = intent.getStringExtra(EXTRA_FRAGMENT_PROFILE).orEmpty()
+        val primaryCiphers = intent.getStringExtra(EXTRA_CIPHER_SUITES).orEmpty()
         val candidateUris = intent.getStringArrayListExtra(EXTRA_CANDIDATE_URIS).orEmpty()
         val candidateIps = intent.getStringArrayListExtra(EXTRA_CANDIDATE_IPS).orEmpty()
+        val candidateProfiles = intent.getStringArrayListExtra(EXTRA_CANDIDATE_PROFILES).orEmpty()
+        val candidateCiphers = intent.getStringArrayListExtra(EXTRA_CANDIDATE_CIPHERS).orEmpty()
 
         val parsedPrimary = V2RayConfigParser.parseSingleUri(rawUri)
         val serverName =
@@ -148,13 +142,30 @@ class MehVpnService : VpnService() {
         }
 
         val candidateConfigs = mutableListOf<V2RayConfig>()
-        candidateConfigs.add(parsedPrimary.copy(resolvedIp = resolvedIp, latencyMs = initialPing))
+        candidateConfigs.add(
+          parsedPrimary.copy(
+            resolvedIp = resolvedIp,
+            latencyMs = initialPing,
+            fragmentProfile = primaryProfile.ifBlank { parsedPrimary.fragmentProfile },
+            cipherSuites = primaryCiphers.ifBlank { parsedPrimary.cipherSuites },
+          )
+        )
         for (i in candidateUris.indices) {
           val uri = candidateUris[i]
           val ip = candidateIps.getOrNull(i).orEmpty()
+          val prof = candidateProfiles.getOrNull(i).orEmpty()
+          val ciph = candidateCiphers.getOrNull(i).orEmpty()
           val cfg = V2RayConfigParser.parseSingleUri(uri)
-          if (cfg != null && candidateConfigs.none { it.endpointKey == cfg.endpointKey }) {
-            candidateConfigs.add(cfg.copy(resolvedIp = ip))
+          if (cfg != null) {
+            val withProfile =
+              cfg.copy(
+                resolvedIp = ip,
+                fragmentProfile = prof.ifBlank { cfg.fragmentProfile },
+                cipherSuites = ciph.ifBlank { cfg.cipherSuites },
+              )
+            if (candidateConfigs.none { it.endpointKey == withProfile.endpointKey }) {
+              candidateConfigs.add(withProfile)
+            }
           }
         }
 
@@ -436,8 +447,12 @@ class MehVpnService : VpnService() {
 
     const val EXTRA_RAW_URI = "extra_raw_uri"
     const val EXTRA_RESOLVED_IP = "extra_resolved_ip"
+    const val EXTRA_FRAGMENT_PROFILE = "extra_fragment_profile"
+    const val EXTRA_CIPHER_SUITES = "extra_cipher_suites"
     const val EXTRA_CANDIDATE_URIS = "extra_candidate_uris"
     const val EXTRA_CANDIDATE_IPS = "extra_candidate_ips"
+    const val EXTRA_CANDIDATE_PROFILES = "extra_candidate_profiles"
+    const val EXTRA_CANDIDATE_CIPHERS = "extra_candidate_ciphers"
     const val EXTRA_SERVER_NAME = "extra_server_name"
     const val EXTRA_SERVER_ADDRESS = "extra_server_address"
     const val EXTRA_SERVER_PORT = "extra_server_port"

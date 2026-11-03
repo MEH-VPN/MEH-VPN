@@ -470,6 +470,8 @@ class MehViewModel(
         action = MehVpnService.ACTION_CONNECT
         putExtra(MehVpnService.EXTRA_RAW_URI, config.rawUri)
         putExtra(MehVpnService.EXTRA_RESOLVED_IP, config.resolvedIp)
+        putExtra(MehVpnService.EXTRA_FRAGMENT_PROFILE, config.fragmentProfile)
+        putExtra(MehVpnService.EXTRA_CIPHER_SUITES, config.cipherSuites)
         putStringArrayListExtra(
           MehVpnService.EXTRA_CANDIDATE_URIS,
           ArrayList(candidates.map { it.rawUri }),
@@ -477,6 +479,14 @@ class MehViewModel(
         putStringArrayListExtra(
           MehVpnService.EXTRA_CANDIDATE_IPS,
           ArrayList(candidates.map { it.resolvedIp }),
+        )
+        putStringArrayListExtra(
+          MehVpnService.EXTRA_CANDIDATE_PROFILES,
+          ArrayList(candidates.map { it.fragmentProfile }),
+        )
+        putStringArrayListExtra(
+          MehVpnService.EXTRA_CANDIDATE_CIPHERS,
+          ArrayList(candidates.map { it.cipherSuites }),
         )
         putExtra(MehVpnService.EXTRA_SERVER_NAME, config.cleanTitle)
         putExtra(MehVpnService.EXTRA_SERVER_ADDRESS, config.address)

@@ -303,6 +303,24 @@ object GfwKnockerXrayCore {
   }
 
   /**
+   * Sniffs the TLS ClientHello SNI hostname (`server_name` extension `0x0000`) from the first
+   * client payload bytes (`destOverride: ["tls"]`), enabling `LocalV2RayProxyServer` to override
+   * poisoned/cached IPs (`10.10.34.x`) or raw Cloudflare edge IPs (`104.16.x.y`) with the real domain.
+   */
+  fun extractTlsSniHostname(buf: ByteArray, length: Int = buf.size): String? {
+    val slice = if (length < buf.size) buf.copyOfRange(0, length) else buf
+    val range = findTlsSniHostRange(slice) ?: return null
+    val len = range.last - range.first + 1
+    if (len !in 3..253) return null
+    val host = String(slice, range.first, len, Charsets.US_ASCII).trim().trimEnd('.').lowercase()
+    if (!host.contains('.')) return null
+    if (host.any { ch -> !(ch in 'a'..'z' || ch in '0'..'9' || ch == '.' || ch == '-') }) {
+      return null
+    }
+    return host
+  }
+
+  /**
    * Establishes a TLS session over ANY [rawIn] and [rawOut] streams using [SSLEngine].
    * This completely avoids `SSLSocketFactory.createSocket(Socket)` on wrapper sockets,
    * fixing the Android 9 (Samsung S8) Conscrypt `FileDescriptor` crash while allowing
@@ -344,11 +362,17 @@ object GfwKnockerXrayCore {
       ) {
         params.serverNames = listOf(SNIHostName(cleanHost))
       }
-      if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q &&
-        alpnProtocols != null &&
-        alpnProtocols.isNotEmpty()
-      ) {
-        params.applicationProtocols = alpnProtocols
+      if (alpnProtocols != null && alpnProtocols.isNotEmpty()) {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+          params.applicationProtocols = alpnProtocols
+        } else {
+          try {
+            val method =
+              engine.javaClass.getMethod("setApplicationProtocols", Array<String>::class.java)
+            method.isAccessible = true
+            method.invoke(engine, alpnProtocols)
+          } catch (_: Throwable) {}
+        }
       }
       engine.sslParameters = params
     } catch (_: Throwable) {}
@@ -802,10 +826,10 @@ object GfwKnockerXrayCore {
     private val rawOut: OutputStream,
   ) {
     private val session = engine.session
-    private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 16384))
-    private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 16384))
-    private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 16384))
-    private val readBuffer = ByteArray(16384)
+    private var netInBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
+    private var netOutBuf = ByteBuffer.allocate(maxOf(session.packetBufferSize, 32768))
+    private var appInBuf = ByteBuffer.allocate(maxOf(session.applicationBufferSize, 32768))
+    private val readBuffer = ByteArray(32768)
 
     init {
       netInBuf.flip()

@@ -336,6 +336,15 @@ class ExampleUnitTest {
       )
     assertTrue(V2RayOutboundClient.isSupportedByEngine(serverlessA))
     assertTrue(serverlessA.toV2RayCoreJson().contains("[\"6\", \"98\", \"1\"]"))
+
+    // 6. Verify FakeDNS 198.18.0.0/15 virtual IP allocation and domain mapping
+    val fakeIp = LocalV2RayProxyServer.allocateFakeIpForDomain("i.instagram.com")
+    assertTrue("Expected FakeIP in 198.18.0.0/15, got $fakeIp", LocalV2RayProxyServer.isFakeIpAddress(fakeIp))
+    assertEquals("i.instagram.com", LocalV2RayProxyServer.resolveFakeIpDomain(fakeIp))
+
+    // 7. Verify TLS ClientHello SNI extraction for destOverride: ["tls"]
+    val extractedSni = com.example.vpn.GfwKnockerXrayCore.extractTlsSniHostname(clientHello.array())
+    assertEquals("sni.cluvex-aether.org", extractedSni)
   }
 }
 
