@@ -320,6 +320,9 @@ class LocalV2RayProxyServer(
     initialPayloadLen: Int = 0,
     awaitFirstResponse: Boolean = false,
     fallbackIpv4: String? = null,
+    firstReplyTimeoutMs: Int = 3500,
+    maxNodes: Int = Int.MAX_VALUE,
+    penalizeOnFailure: Boolean = true,
   ): OpenedTunnelWithReply {
     val poolSize = serverPool.size
     val currentPrimary = activeConfigIndex.get().coerceIn(0, poolSize - 1)
@@ -361,6 +364,9 @@ class LocalV2RayProxyServer(
     var lastError: Exception? = null
 
     for ((attemptIdx, idx) in orderedIndices.withIndex()) {
+      // DNS probes must never walk the whole pool: every extra node costs another full
+      // connect + first-reply timeout while the DNS slot lock is held.
+      if (attemptIdx >= maxNodes) break
       val candidate = serverPool[idx]
       var nodeSucceeded = false
       for (hostCandidate in targetsToTry) {
@@ -381,7 +387,7 @@ class LocalV2RayProxyServer(
             conn.outputStream.flush()
 
             if (awaitFirstResponse) {
-              conn.setReadTimeout(3500)
+              conn.setReadTimeout(firstReplyTimeoutMs)
               val replyBuf = ByteArray(16384)
               val replyLen = conn.inputStream.read(replyBuf)
               if (replyLen <= 0) {
@@ -403,7 +409,9 @@ class LocalV2RayProxyServer(
           lastError = e
         }
       }
-      if (!nodeSucceeded) {
+      // A node that merely refuses/blackholes port 53 is still a perfectly good 443 node, so DNS
+      // probes (penalizeOnFailure = false) must not count towards penalizing it.
+      if (!nodeSucceeded && penalizeOnFailure) {
         recordServerTransportFailure(idx)
       }
     }
@@ -564,7 +572,8 @@ class LocalV2RayProxyServer(
         // Synthetic DNS answers (`198.54.x.y` handed out when in-tunnel DNS timed out) must be
         // mapped back to the hostname they were allocated for, otherwise a client that connects
         // without TLS SNI or an HTTP Host header would dial a meaningless IP.
-        var effectiveHost = lookupSyntheticDomainForIp(rawTargetHost) ?: rawTargetHost
+        val syntheticDomain = lookupSyntheticDomainForIp(rawTargetHost)
+        var effectiveHost = syntheticDomain ?: rawTargetHost
 
         // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
         // (TLS ClientHello / HTTP request / MTProto preamble / DoT port 853 handshake)
@@ -609,7 +618,9 @@ class LocalV2RayProxyServer(
               initialPayload = firstBuffer,
               initialPayloadLen = firstLen,
               awaitFirstResponse = false,
-              fallbackIpv4 = rawTargetHost,
+              // A synthetic 198.54.x.y address is not a real server: never offer it as the
+              // "fallback IPv4" (Serverless mode would dial it directly and black-hole).
+              fallbackIpv4 = if (syntheticDomain != null) null else rawTargetHost,
             )
           } catch (_: Exception) {
             return
@@ -799,6 +810,25 @@ class LocalV2RayProxyServer(
       // black-holed UDP 443 and stall before falling back to TCP.
       if (question.qtype == 28 || question.qtype == 65 || question.qtype == 64) {
         return buildEmptyDnsNoerrorResponse(dnsQuery, question.questionEndOffset)
+      }
+    }
+
+    // Fake-IP first (the same approach v2rayNG / sing-box / Clash use): answer every plain `A`
+    // query instantly with a stable synthetic IPv4 and let `handleSocks5Client` map it back to the
+    // hostname, so the V2Ray node resolves the name itself (VLESS/Trojan carry the domain).
+    // Previously a *real* lookup was attempted first through the tunnel (8.8.8.8:53), which needs
+    // a fresh node connection per name and stalls for seconds whenever the node refuses port 53 —
+    // apps never got an IP, never opened a socket, and only Telegram (hard-coded IPs) worked.
+    // Serverless mode dials the target directly and therefore still needs genuine IPs.
+    if (question != null &&
+      question.qtype == 1 &&
+      question.qclass == 1 &&
+      question.domain.isNotEmpty() &&
+      activeConfig.protocol != V2RayProtocol.SERVERLESS
+    ) {
+      val fakeIpBytes = V2RayOutboundClient.parseIpv4Bytes(allocateSyntheticIpForDomain(question.domain))
+      if (fakeIpBytes != null) {
+        return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, fakeIpBytes)
       }
     }
 
@@ -993,7 +1023,13 @@ class LocalV2RayProxyServer(
     // If both persistent slots were busy with concurrent queries, wait on the assigned slot
     if (remainingDnsMillis(deadlineNanos) < 500) return null
     val assignedSlot = dnsTunnelSlots[startSlotIdx]
-    assignedSlot.lock.lock()
+    // Bounded wait: an unbounded lock() here let one stuck slot stall every other DNS query.
+    val lockWaitMs = remainingDnsMillis(deadlineNanos) - 500
+    if (lockWaitMs <= 0 ||
+      !assignedSlot.lock.tryLock(lockWaitMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+    ) {
+      return null
+    }
     try {
       queryPersistentDnsSlotLocked(assignedSlot, tcpFrame, dnsQuery, deadlineNanos)?.let { return it }
     } finally {
@@ -1024,6 +1060,9 @@ class LocalV2RayProxyServer(
               initialPayload = tcpFrame,
               initialPayloadLen = tcpFrame.size,
               awaitFirstResponse = true,
+              firstReplyTimeoutMs = attemptTimeout,
+              maxNodes = 1,
+              penalizeOnFailure = false,
             )
           tunnel = opened.connection
           slot.connection = tunnel
@@ -1106,6 +1145,8 @@ class LocalV2RayProxyServer(
             targetHost = targetIp,
             targetPort = 443,
             timeoutMs = minOf(remainingMs, DNS_DOH_TIMEOUT_MS),
+            maxNodes = 1,
+            penalizeOnFailure = false,
           )
         opened.connection.use { tunnel ->
           val (tlsIn, tlsOut) =
