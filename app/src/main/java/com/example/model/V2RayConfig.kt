@@ -29,6 +29,8 @@ data class V2RayConfig(
   val encryption: String = "none",
   val headerType: String = "none",
   val pbk: String = "",
+  /** VLESS `flow` (e.g. `xtls-rprx-vision`). The built-in client cannot speak any flow. */
+  val flow: String = "",
   val fragmentProfile: String = "direct_tls",
   val cipherSuites: String = "",
   val rawUri: String,
@@ -216,6 +218,7 @@ object V2RayConfigParser {
     val encryption = (queryParams["encryption"] ?: "none").lowercase().trim()
     val headerType = (queryParams["headerType"] ?: "none").lowercase().trim()
     val pbk = (queryParams["pbk"] ?: "").trim()
+    val flow = (queryParams["flow"] ?: "").trim()
     val fmParam = queryParams["fm"].orEmpty()
     val csParam = queryParams["cs"].orEmpty()
     val explicitProfile = queryParams["mehProfile"].orEmpty()
@@ -245,6 +248,7 @@ object V2RayConfigParser {
       encryption = encryption,
       headerType = headerType,
       pbk = pbk,
+      flow = flow,
       fragmentProfile = fragmentProfile,
       cipherSuites = csParam,
       rawUri = uriString,
