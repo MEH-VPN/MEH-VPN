@@ -270,6 +270,12 @@ class MehVpnService : VpnService() {
           errorMessage = t.localizedMessage ?: "Failed to start native tun2socks",
           throwable = t,
         )
+        // Without tun2socks nothing reads the TUN fd, so every packet is black-holed while the
+        // UI would still report "connected". Abort so the outer catch calls stopTunnel(error).
+        throw IllegalStateException(
+          "tun2socks start failed: ${t.localizedMessage ?: t.javaClass.simpleName}",
+          t,
+        )
       }
 
       _tunnelSession.value =

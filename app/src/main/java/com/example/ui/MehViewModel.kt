@@ -52,6 +52,7 @@ class MehViewModel(
   companion object {
     const val LOG_FETCHING = "دریافت لیست سرور ها"
     const val LOG_TESTING = "تست سرور ها"
+    const val LOG_CONNECTING = "در حال اتصال"
     const val LOG_CONNECTED = "متصل"
   }
 
@@ -65,6 +66,15 @@ class MehViewModel(
     viewModelScope.launch {
       MehVpnService.tunnelSession.collect { session ->
         if (session.isRunning) {
+          if (_uiState.value.phase != MehPhase.CONNECTED) {
+            val cfg = _uiState.value.selectedConfig
+            MehTelemetry.logServerConnected(
+              protocol =
+                "${MehConnectionMethod.V2RAY_SOLISPIRIT.badgeLabel}:${session.protocolLabel}",
+              serverName = cfg?.cleanTitle ?: session.serverName,
+              latencyMs = session.currentPingMs,
+            )
+          }
           _uiState.update { current ->
             current.copy(
               phase = MehPhase.CONNECTED,
@@ -295,18 +305,15 @@ class MehViewModel(
       )
     }
 
-    MehTelemetry.logServerConnected(
-      protocol = "${MehConnectionMethod.V2RAY_SOLISPIRIT.badgeLabel}:${config.protocol.label}",
-      serverName = config.cleanTitle,
-      latencyMs = config.latencyMs,
-    )
-
+    // Do not report "connected" yet: the service publishes `isRunning = true` through
+    // `MehVpnService.tunnelSession` only after the TUN and tun2socks are really up, and the
+    // collector in `init` then flips the phase to CONNECTED (or ERROR if startup failed).
     _uiState.update {
       it.copy(
-        phase = MehPhase.CONNECTED,
+        phase = MehPhase.CONNECTING,
         selectedConfig = config,
         activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
-        liveLogLine = LOG_CONNECTED,
+        liveLogLine = LOG_CONNECTING,
       )
     }
   }

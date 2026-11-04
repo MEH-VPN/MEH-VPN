@@ -116,6 +116,11 @@ object V2RayOutboundClient {
     if (config.pbk.isNotEmpty()) {
       return false
     }
+    // The VLESS header below always carries an empty addons block. A server whose user has
+    // `flow=xtls-rprx-vision` rejects such requests, so the stream "connects" but never carries data.
+    if (isVlessFamily && config.flow.isNotBlank()) {
+      return false
+    }
     val enc = config.encryption.lowercase()
     if (enc != "none" && enc != "") {
       return false
