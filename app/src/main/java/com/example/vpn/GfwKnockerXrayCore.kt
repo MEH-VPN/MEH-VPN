@@ -286,7 +286,11 @@ object GfwKnockerXrayCore {
 
     while (at + 4 <= extensionsEnd && at + 4 <= buf.size) {
       val kind = take(at, 2) ?: return null
-      val len = take(at, 2) ?: return null
+      // Extension layout is [type(2)][length(2)][body]; the length lives at `at + 2`.
+      // (Reading it at `at` returned the type again, so every ClientHello whose server_name
+      // extension is not the very first one — Chrome/Cronet/BoringSSL shuffle extensions — was
+      // mis-parsed and the SNI was never found.)
+      val len = take(at + 2, 2) ?: return null
       val body = at + 4
       if (kind == 0x0000) {
         val entry = body + 2
