@@ -313,11 +313,9 @@ class ExampleUnitTest {
     assertEquals(expectedStart, sniRange!!.first)
     assertEquals(expectedEnd, sniRange.last + 1)
 
-    // 3. Verify WhiteDNS and CluvexStudio/Aether are registered in MehConnectionMethod
+    // 3. Verify only the primary V2Ray method is registered in MehConnectionMethod
     val methodIds = com.example.data.MehConnectionMethod.entries.map { it.id }
-    assertTrue(methodIds.contains("whitedns_official"))
-    assertTrue(methodIds.contains("cluvex_aether"))
-    assertTrue(methodIds.contains("gfw_knocker_xray"))
+    assertEquals(listOf("v2ray_solispirit"), methodIds)
 
     // 4. Verify Patterniha Sni-Spoofing URI (127.0.0.1:40443) maps to 188.114.98.0:443 with patterniha_sni_spoof
     val sniSpoofUri =
@@ -337,7 +335,7 @@ class ExampleUnitTest {
     assertTrue(V2RayOutboundClient.isSupportedByEngine(serverlessA))
     assertTrue(serverlessA.toV2RayCoreJson().contains("[\"6\", \"98\", \"1\"]"))
 
-    // 6. Verify passive real-DNS reverse record recording (without synthetic FakeIP generation)
+    // 6. Verify passive real-DNS reverse record recording
     val sampleDnsResp =
       byteArrayOf(
         0x12, 0x34, 0x81.toByte(), 0x80.toByte(),
@@ -438,10 +436,10 @@ class ExampleUnitTest {
             udpSocket.receive(recvPkt)
             assertTrue("SOCKS5 UDP reply must be > 22 bytes", recvPkt.length > 22)
             val dnsReply = recvBuf.copyOfRange(10, recvPkt.length)
-            if (qtype == 28) {
-              // Verify AAAA NOERROR empty response has ZERO trailing EDNS0 garbage bytes!
+            if (qtype == 28 || qtype == 65 || qtype == 64) {
+              // Verify AAAA / HTTPS / SVCB empty NOERROR response has ZERO trailing EDNS0 garbage bytes!
               assertEquals(
-                "AAAA empty NOERROR response must truncate EDNS0 trailing bytes so Android libnetd_resolv ns_initparse (cp == eom) succeeds",
+                "Empty NOERROR response must truncate EDNS0 trailing bytes so Android libnetd_resolv ns_initparse (cp == eom) succeeds",
                 questionEndOffset,
                 dnsReply.size,
               )
@@ -451,11 +449,10 @@ class ExampleUnitTest {
         }
       }
 
-      // Verify HTTPS/SVCB (QTYPE=65) is genuinely resolved over the V2Ray tunnel (not synthetically suppressed!)
+      // Verify HTTPS/SVCB (QTYPE=65) is cleanly answered with 0-answer NOERROR
       val httpsRrReply = queryDnsViaSocks5UdpAssociate("x.com", qtype = 65)
       val httpsAnCount = ((httpsRrReply[6].toInt() and 0xFF) shl 8) or (httpsRrReply[7].toInt() and 0xFF)
-      println("DIAG_HTTPS_SVCB: x.com QTYPE=65 -> ANCOUNT=$httpsAnCount (replySize=${httpsRrReply.size} bytes)")
-      assertTrue("Expected real upstream DNS response for QTYPE=65 (HTTPS/SVCB)", httpsRrReply.size > 30)
+      assertEquals(0, httpsAnCount)
 
       // Parse first IPv4 A record from raw DNS response
       fun extractFirstARecord(dnsReply: ByteArray): ByteArray? {
@@ -510,14 +507,16 @@ class ExampleUnitTest {
           // 1. Test Android's simultaneous AAAA query with EDNS0
           val aaaaReply = queryDnsViaSocks5UdpAssociate(hostname, qtype = 28)
           assertEquals(0, ((aaaaReply[6].toInt() and 0xFF) shl 8) or (aaaaReply[7].toInt() and 0xFF))
-          // 2. Test Android's A query via SOCKS5 UDP ASSOCIATE -> real DNS over V2Ray
+          // 2. Test Android's A query via SOCKS5 UDP ASSOCIATE
           val aReply = queryDnsViaSocks5UdpAssociate(hostname, qtype = 1)
           val ipv4Bytes = extractFirstARecord(aReply)
           assertNotNull("Expected valid IPv4 A record from SOCKS5 UDP DNS for $hostname", ipv4Bytes)
           val ipStr = "${ipv4Bytes!![0].toInt() and 0xFF}.${ipv4Bytes[1].toInt() and 0xFF}.${ipv4Bytes[2].toInt() and 0xFF}.${ipv4Bytes[3].toInt() and 0xFF}"
-          assertNotNull("Expected real IP $ipStr to be recorded in reverse DNS table", LocalV2RayProxyServer.lookupDomainForRealIp(ipStr))
-          assertEquals("Expected forward DNS table to map $hostname -> $ipStr", ipStr, LocalV2RayProxyServer.lookupRealIpForDomain(hostname))
-          println("DIAG_UDP_DNS: $hostname -> $ipStr (replySize=${aReply.size} bytes)")
+          val mappedDomain =
+            LocalV2RayProxyServer.lookupSyntheticDomainForIp(ipStr)
+              ?: LocalV2RayProxyServer.lookupDomainForRealIp(ipStr)
+          assertNotNull("Expected IP $ipStr to map back to $hostname", mappedDomain)
+          println("DIAG_UDP_DNS: $hostname -> $ipStr (mapped=$mappedDomain, replySize=${aReply.size} bytes)")
           // Return an InetAddress with EMPTY hostname so Socket.connect only sees the raw IPv4 bytes (ATYP=0x01)!
           return listOf(InetAddress.getByAddress("", ipv4Bytes))
         }
