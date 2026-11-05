@@ -99,6 +99,7 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     MehTelemetry.initialize(this)
+    MehTelemetry.logAppOpen("MehMinimalScreen")
     enableEdgeToEdge()
     setContent {
       MyApplicationTheme {

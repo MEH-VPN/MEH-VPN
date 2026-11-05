@@ -60,6 +60,7 @@ class MehVpnService : VpnService() {
 
   override fun onCreate() {
     super.onCreate()
+    MehTelemetry.initialize(this)
     registerPhysicalNetworkTracker()
   }
 
@@ -319,21 +320,37 @@ class MehVpnService : VpnService() {
     keepAliveJob?.cancel()
     keepAliveJob =
       serviceScope.launch {
+        val startedAtMs = System.currentTimeMillis()
         var lastPing = initialPing
+        var tickCount = 0
+        var consecutiveFailures = 0
         while (isActive) {
           delay(15_000L)
+          tickCount++
           val activeCfg = proxyServer.activeConfig
-          val measuredPing =
+          val probedPing =
             V2RayOutboundClient.verifyHttpsAndDnsCapability(
               config = activeCfg,
               timeoutMs = 3500,
               protector = { socket -> protectOutboundSocket(socket) },
-            ) ?: lastPing
-          lastPing = measuredPing
+            )
+          if (probedPing != null) {
+            lastPing = probedPing
+            consecutiveFailures = 0
+          } else {
+            consecutiveFailures++
+            if (consecutiveFailures == 3) {
+              MehTelemetry.logError(
+                stage = "keep_alive_probe",
+                errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+              )
+            }
+          }
+          val effectiveServerName = activeCfg.cleanTitle.ifBlank { serverName }
           _tunnelSession.value =
             VpnTunnelSession(
               isRunning = true,
-              serverName = activeCfg.cleanTitle.ifBlank { serverName },
+              serverName = effectiveServerName,
               serverAddress = activeCfg.address,
               serverPort = activeCfg.port,
               protocolLabel = activeCfg.protocol.label,
@@ -341,6 +358,17 @@ class MehVpnService : VpnService() {
               localProxyPort = proxyPort,
               errorMessage = null,
             )
+
+          // Report active VPN session heartbeat every 60 seconds (4 x 15s) to Firebase Analytics
+          if (tickCount % 4 == 0) {
+            val uptimeSeconds = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(1L)
+            MehTelemetry.logActiveSessionHeartbeat(
+              serverName = effectiveServerName,
+              protocol = activeCfg.protocol.label,
+              latencyMs = lastPing,
+              uptimeSeconds = uptimeSeconds,
+            )
+          }
         }
       }
   }
