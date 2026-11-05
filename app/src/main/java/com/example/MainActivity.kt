@@ -8,6 +8,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -19,8 +20,10 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -57,6 +60,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -71,6 +75,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
@@ -78,6 +83,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.telemetry.MehTelemetry
+import com.example.ui.HackerLogEntry
 import com.example.ui.MehPhase
 import com.example.ui.MehUiState
 import com.example.ui.MehViewModel
@@ -176,26 +182,55 @@ fun MehMinimalScreen(
     ) {
       Column(
         modifier =
-          Modifier.fillMaxWidth()
+          Modifier.fillMaxSize()
             .widthIn(max = 460.dp)
             .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
       ) {
+        // Equal top weight keeps the power button permanently locked at the vertical center
+        Spacer(modifier = Modifier.weight(1f))
+
+        // 1. Power Button (fixed position, never shifts when logs appear)
         CircularPowerButton(
           phase = uiState.phase,
           accentColor = accentColor,
           onClick = onPowerToggle,
         )
 
-        if (uiState.liveLogLine.isNotEmpty()) {
-          Spacer(modifier = Modifier.height(12.dp))
+        // 2 & 3. Fixed bottom region for Main Stage Status + Line-by-Line Sub-Logs
+        Box(
+          modifier =
+            Modifier.weight(1f)
+              .fillMaxWidth(),
+          contentAlignment = Alignment.TopCenter,
+        ) {
+          Column(
+            modifier =
+              Modifier.fillMaxWidth()
+                .padding(top = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+          ) {
+            if (uiState.liveLogLine.isNotEmpty()) {
+              SingleLineLiveLog(
+                logText = uiState.liveLogLine,
+                phase = uiState.phase,
+                accentColor = accentColor,
+              )
+            }
 
-          SingleLineLiveLog(
-            logText = uiState.liveLogLine,
-            phase = uiState.phase,
-            accentColor = accentColor,
-          )
+            AnimatedVisibility(
+              visible = uiState.terminalLogs.isNotEmpty(),
+              enter = fadeIn(tween(200)) + expandVertically(tween(220)),
+              exit = fadeOut(tween(160)) + shrinkVertically(tween(180)),
+            ) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Spacer(modifier = Modifier.height(8.dp))
+                MinimalLogList(
+                  logs = uiState.terminalLogs,
+                )
+              }
+            }
+          }
         }
       }
     }
@@ -296,7 +331,7 @@ private fun CircularPowerButton(
           useCenter = false,
           style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round),
           topLeft =
-            androidx.compose.ui.geometry.Offset(
+            Offset(
               x = size.width * 0.09f,
               y = size.height * 0.09f,
             ),
@@ -373,6 +408,10 @@ private fun CircularPowerButton(
   }
 }
 
+/**
+ * Primary Stage Status line directly below the power button
+ * ("دریافت لیست سرور ها", "تست سرور ها", "در حال اتصال", "متصل").
+ */
 @Composable
 private fun SingleLineLiveLog(
   logText: String,
@@ -435,6 +474,44 @@ private fun SingleLineLiveLog(
           overflow = TextOverflow.Ellipsis,
           textAlign = TextAlign.Center,
           modifier = Modifier.testTag("live_status_log"),
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Simple, minimal line-by-line sub-log list displayed BELOW the primary stage status section.
+ */
+@Composable
+private fun MinimalLogList(
+  logs: List<HackerLogEntry>,
+) {
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Column(
+      modifier =
+        Modifier.fillMaxWidth()
+          .padding(horizontal = 12.dp)
+          .testTag("minimal_sub_logs_list"),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+      logs.forEachIndexed { index, entry ->
+        val isLatest = index == logs.lastIndex
+        Text(
+          text = entry.message,
+          style = MaterialTheme.typography.bodyMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = if (isLatest) FontWeight.Medium else FontWeight.Normal,
+          color =
+            if (isLatest) {
+              TextSecondary.copy(alpha = 0.9f)
+            } else {
+              TextMuted.copy(alpha = 0.65f)
+            },
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+          textAlign = TextAlign.Center,
         )
       }
     }

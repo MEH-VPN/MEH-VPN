@@ -22,8 +22,26 @@ class ExampleRobolectricTest {
   @get:Rule val composeTestRule = createComposeRule()
 
   @Test
-  fun minimalScreen_displaysOnlyPowerButtonAndLiveLogLine() {
+  fun minimalScreen_displaysPowerButtonLiveLogAndHackerTerminalLines() {
     var clicked = false
+    val sampleTerminalLogs =
+      listOf(
+        com.example.ui.HackerLogEntry(
+          id = 1L,
+          timestamp = "12:00:01",
+          tag = "GIT",
+          message = "اتصال به مخازن SoliSpirit و MohammadBahemmat/V2ray-Collector ...",
+          level = com.example.ui.HackerLogLevel.SOURCE,
+        ),
+        com.example.ui.HackerLogEntry(
+          id = 2L,
+          timestamp = "12:00:02",
+          tag = "PASS",
+          message = "نود تایید شد: VLESS • پینگ 95ms",
+          level = com.example.ui.HackerLogLevel.SUCCESS,
+        ),
+      )
+
     composeTestRule.setContent {
       MyApplicationTheme {
         MehMinimalScreen(
@@ -31,6 +49,7 @@ class ExampleRobolectricTest {
             MehUiState(
               phase = MehPhase.FETCHING_CONFIGS,
               liveLogLine = MehViewModel.LOG_FETCHING,
+              terminalLogs = sampleTerminalLogs,
             ),
           onPowerToggle = { clicked = true },
         )
@@ -38,9 +57,19 @@ class ExampleRobolectricTest {
     }
 
     composeTestRule.onNodeWithTag("vpn_toggle_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("live_status_log_container").assertIsDisplayed()
     composeTestRule.onNodeWithTag("live_status_log").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("minimal_sub_logs_list").assertIsDisplayed()
     composeTestRule.onNodeWithTag("vpn_toggle_button").performClick()
     assertTrue(clicked)
+
+    // Verify MohammadBahemmat/V2ray-Collector is configured in SoliSpiritRepository sources
+    assertTrue(
+      "Expected MohammadBahemmat/V2ray-Collector sources to be registered",
+      com.example.data.SoliSpiritRepository.SOLISPIRIT_SOURCES.any {
+        it.url.contains("MohammadBahemmat/V2ray-Collector")
+      },
+    )
   }
 
   @Test

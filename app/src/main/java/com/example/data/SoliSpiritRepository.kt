@@ -22,6 +22,7 @@ import okhttp3.Request
 data class SubscriptionSource(
   val name: String,
   val url: String,
+  val repoLabel: String = "SoliSpirit",
 )
 
 /**
@@ -53,50 +54,123 @@ class SoliSpiritRepository(
 
   companion object {
     /**
-     * Official raw subscription endpoints from https://github.com/SoliSpirit/v2ray-configs
-     * with GitHub Raw + jsDelivr + Fastly + GCore CDN mirrors so configs are always reachable.
+     * Multi-repository V2Ray subscription sources combining:
+     * 1. https://github.com/SoliSpirit/v2ray-configs
+     * 2. https://github.com/MohammadBahemmat/V2ray-Collector
+     * Equipped with jsDelivr, Fastly, GCore CDN mirrors + GitHub Raw endpoints so both sources
+     * are reachable even under strict network filtering.
      */
     val SOLISPIRIT_SOURCES =
       listOf(
+        // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
         SubscriptionSource(
-          name = "SoliSpirit/Trojan-CDN",
-          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+          name = "Bahemmat/Tested-CDN",
+          url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/Tested.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
         ),
         SubscriptionSource(
           name = "SoliSpirit/VLESS-CDN",
           url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
-          name = "SoliSpirit/Trojan-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+          name = "Bahemmat/VLESS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/vless_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/Trojan-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        // Batch 2: Trojan & Fastly mirrors from both repositories
+        SubscriptionSource(
+          name = "Bahemmat/Trojan-CDN",
+          url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/trojan_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/Tested-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/Tested.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
         ),
         SubscriptionSource(
           name = "SoliSpirit/VLESS-Fastly",
           url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/Trojan-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        // Batch 3: Fastly & GCore mirrors for both repositories
+        SubscriptionSource(
+          name = "Bahemmat/VLESS-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/vless_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/Trojan-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/trojan_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Trojan-GCore",
           url = "https://gcore.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
           name = "SoliSpirit/VLESS-GCore",
           url = "https://gcore.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        // Batch 4: GCore & Raw GitHub endpoints for both repositories
+        SubscriptionSource(
+          name = "Bahemmat/Tested-GCore",
+          url = "https://gcore.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/Tested.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/VLESS-GCore",
+          url = "https://gcore.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/vless_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/Tested-Raw",
+          url = "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/Tested.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/VLESS-Raw",
+          url = "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/servers/vless_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        // Batch 5: Additional Raw & Sub endpoints
+        SubscriptionSource(
+          name = "Bahemmat/Trojan-Raw",
+          url = "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/servers/trojan_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Trojan-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/trojan.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
           name = "SoliSpirit/VLESS-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Sub1-CDN",
           url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Subscriptions/Sub1.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
           name = "SoliSpirit/Sub1-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Subscriptions/Sub1.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
         ),
       )
 
@@ -105,7 +179,8 @@ class SoliSpiritRepository(
   }
 
   /**
-   * Fetches V2Ray configs from SoliSpirit/v2ray-configs on GitHub (and CDN mirrors in parallel)
+   * Fetches V2Ray configs from both `SoliSpirit/v2ray-configs` and
+   * `MohammadBahemmat/V2ray-Collector` on GitHub (and CDN mirrors in parallel)
    * and filters to clean protocols supported by the built-in V2Ray tunneling engine.
    */
   suspend fun fetchConfigsFromSoliSpirit(
@@ -114,31 +189,37 @@ class SoliSpiritRepository(
     withContext(ioDispatcher) {
       val collected = LinkedHashMap<String, V2RayConfig>()
 
-      onLogUpdate("دریافت لیست سرور ها")
+      onLogUpdate("اتصال به مخازن SoliSpirit و V2ray-Collector ...")
 
       val batches = SOLISPIRIT_SOURCES.chunked(4)
-      for (batch in batches) {
+      for ((batchIdx, batch) in batches.withIndex()) {
         coroutineContext.ensureActive()
-        val batchLists =
+        val batchResults =
           coroutineScope {
             batch
               .map { source ->
                 async {
-                  fetchSingleSource(source)
+                  val parsed = fetchSingleSource(source)
+                  Pair(source, parsed)
                 }
               }
               .awaitAll()
           }
-        for (list in batchLists) {
+        for ((_, list) in batchResults) {
           for (cfg in list) {
             if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
               collected[cfg.endpointKey] = cfg
             }
           }
         }
-        if (collected.size >= 250) {
+        // Ensure we run at least the first 2 batches (covering both Bahemmat & SoliSpirit VLESS/Trojan/Tested)
+        if (batchIdx >= 1 && collected.size >= 380) {
           break
         }
+      }
+
+      if (collected.isNotEmpty()) {
+        onLogUpdate("${collected.size} سرور دریافت شد")
       }
 
       collected.values.toList()
@@ -165,7 +246,7 @@ class SoliSpiritRepository(
       val request =
         Request.Builder()
           .url(source.url)
-          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/SoliSpirit/v2ray-configs)")
+          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/MohammadBahemmat/V2ray-Collector)")
           .header("Accept", "text/plain, */*")
           .build()
 
@@ -175,7 +256,7 @@ class SoliSpiritRepository(
           response.body
             ?.charStream()
             ?.buffered()
-            ?.useLines { lines -> lines.take(600).joinToString("\n") }
+            ?.useLines { lines -> lines.take(700).joinToString("\n") }
             .orEmpty()
         V2RayConfigParser.parseSubscriptionContent(bodyText)
       }
@@ -204,7 +285,7 @@ class SoliSpiritRepository(
       val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
       val completedCount = AtomicInteger(0)
 
-      onLogUpdate("تست سرور ها")
+      onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
 
       val fullSocialPool = mutableListOf<V2RayConfig>()
       val partialSocialPool = mutableListOf<V2RayConfig>()
@@ -240,6 +321,8 @@ class SoliSpiritRepository(
         if (stage1Passed.isEmpty()) continue
 
         val topToVerify = stage1Passed.take(12)
+        onLogUpdate("بررسی کیفیت اتصال سرورهای منتخب ...")
+
         val stage2Results =
           coroutineScope {
             topToVerify
@@ -328,15 +411,22 @@ class SoliSpiritRepository(
         }
 
         if (fullSocialPool.count { it.latencyMs < 550L } >= 4) {
-          return@withContext selectDiverseCandidates(fullSocialPool, maxCount)
+          val winners = selectDiverseCandidates(fullSocialPool, maxCount)
+          onLogUpdate("بهترین سرور انتخاب شد (پینگ ${winners.first().latencyMs}ms)")
+          return@withContext winners
         }
       }
 
-      when {
-        fullSocialPool.isNotEmpty() -> selectDiverseCandidates(fullSocialPool + partialSocialPool, maxCount)
-        partialSocialPool.isNotEmpty() -> selectDiverseCandidates(partialSocialPool, maxCount)
-        else -> selectDiverseCandidates(fallbackHttpsPool, maxCount)
+      val finalSelection =
+        when {
+          fullSocialPool.isNotEmpty() -> selectDiverseCandidates(fullSocialPool + partialSocialPool, maxCount)
+          partialSocialPool.isNotEmpty() -> selectDiverseCandidates(partialSocialPool, maxCount)
+          else -> selectDiverseCandidates(fallbackHttpsPool, maxCount)
+        }
+      if (finalSelection.isNotEmpty()) {
+        onLogUpdate("بهترین سرور انتخاب شد (پینگ ${finalSelection.first().latencyMs}ms)")
       }
+      finalSelection
     }
 
   private fun selectDiverseCandidates(

@@ -11,6 +11,7 @@ import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
 import com.example.vpn.MehVpnService
 import java.util.ArrayList
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -29,9 +30,26 @@ enum class MehPhase {
   ERROR,
 }
 
+enum class HackerLogLevel {
+  SYSTEM,
+  SOURCE,
+  SCAN,
+  SUCCESS,
+  ERROR,
+}
+
+data class HackerLogEntry(
+  val id: Long,
+  val timestamp: String = "",
+  val tag: String = "",
+  val message: String,
+  val level: HackerLogLevel = HackerLogLevel.SYSTEM,
+)
+
 data class MehUiState(
   val phase: MehPhase = MehPhase.DISCONNECTED,
   val liveLogLine: String = "",
+  val terminalLogs: List<HackerLogEntry> = emptyList(),
   val selectedConfig: V2RayConfig? = null,
   val activeMethod: MehConnectionMethod? = null,
 ) {
@@ -54,6 +72,7 @@ class MehViewModel(
     const val LOG_TESTING = "تست سرور ها"
     const val LOG_CONNECTING = "در حال اتصال"
     const val LOG_CONNECTED = "متصل"
+    private const val MAX_LOG_LINES = 5
   }
 
   private val _uiState = MutableStateFlow(MehUiState())
@@ -61,18 +80,25 @@ class MehViewModel(
 
   private var workflowJob: Job? = null
   private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
+  private val logIdGenerator = AtomicLong(1L)
 
   init {
     viewModelScope.launch {
       MehVpnService.tunnelSession.collect { session ->
         if (session.isRunning) {
-          if (_uiState.value.phase != MehPhase.CONNECTED) {
+          val wasAlreadyConnected = _uiState.value.phase == MehPhase.CONNECTED
+          if (!wasAlreadyConnected) {
             val cfg = _uiState.value.selectedConfig
+            val srvName = cfg?.cleanTitle ?: session.serverName
             MehTelemetry.logServerConnected(
               protocol =
                 "${MehConnectionMethod.V2RAY_SOLISPIRIT.badgeLabel}:${session.protocolLabel}",
-              serverName = cfg?.cleanTitle ?: session.serverName,
+              serverName = srvName,
               latencyMs = session.currentPingMs,
+            )
+            appendLogLine(
+              message = "متصل به ${session.protocolLabel} (پینگ ${session.currentPingMs}ms)",
+              level = HackerLogLevel.SUCCESS,
             )
           }
           _uiState.update { current ->
@@ -86,6 +112,10 @@ class MehViewModel(
             stage = "vpn_tunnel_session",
             errorMessage = session.errorMessage,
           )
+          appendLogLine(
+            message = session.errorMessage,
+            level = HackerLogLevel.ERROR,
+          )
           _uiState.update { current ->
             current.copy(
               phase = MehPhase.ERROR,
@@ -97,11 +127,49 @@ class MehViewModel(
             current.copy(
               phase = MehPhase.DISCONNECTED,
               liveLogLine = "",
+              terminalLogs = emptyList(),
               selectedConfig = null,
               activeMethod = null,
             )
           }
         }
+      }
+    }
+  }
+
+  /**
+   * Appends a line-by-line sub-log below the main stage status (`liveLogLine`),
+   * without overwriting the main status text (`دریافت لیست سرور ها`, `تست سرور ها`, `در حال اتصال`, `متصل`).
+   */
+  private fun appendLogLine(
+    message: String,
+    level: HackerLogLevel = HackerLogLevel.SYSTEM,
+  ) {
+    val cleanMsg = message.trim()
+    if (cleanMsg.isEmpty()) return
+    // Do not duplicate the main stage title inside the sub-log list
+    if (cleanMsg == LOG_FETCHING ||
+      cleanMsg == LOG_TESTING ||
+      cleanMsg == LOG_CONNECTING ||
+      cleanMsg == LOG_CONNECTED
+    ) {
+      return
+    }
+
+    val entry =
+      HackerLogEntry(
+        id = logIdGenerator.getAndIncrement(),
+        message = cleanMsg,
+        level = level,
+      )
+    _uiState.update { current ->
+      if (current.terminalLogs.lastOrNull()?.message == cleanMsg) {
+        current
+      } else {
+        val updatedList = (current.terminalLogs + entry).takeLast(MAX_LOG_LINES)
+        current.copy(
+          terminalLogs = updatedList,
+        )
       }
     }
   }
@@ -120,7 +188,7 @@ class MehViewModel(
 
   /**
    * Primary V2Ray connection pipeline using the latest V2Ray core:
-   * 1. Fetches configs from `SoliSpirit/v2ray-configs`.
+   * 1. Fetches configs from `SoliSpirit/v2ray-configs` & `MohammadBahemmat/V2ray-Collector`.
    * 2. Benchmarks and selects the fastest verified candidates.
    * 3. Starts the VPN tunnel service.
    */
@@ -134,17 +202,24 @@ class MehViewModel(
         try {
           MehTelemetry.logConnectAttempt()
 
-          // Stage 1: دریافت لیست سرور ها
+          // Stage 1: دریافت لیست سرور ها (kept fixed in liveLogLine while sub-logs stream below it)
           _uiState.update {
             it.copy(
               phase = MehPhase.FETCHING_CONFIGS,
               liveLogLine = LOG_FETCHING,
+              terminalLogs = emptyList(),
               selectedConfig = null,
               activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
             )
           }
 
-          val configs = repository.fetchConfigsFromSoliSpirit { _ -> }
+          val configs =
+            repository.fetchConfigsFromSoliSpirit { logLine ->
+              appendLogLine(
+                message = logLine,
+                level = HackerLogLevel.SOURCE,
+              )
+            }
           if (configs.isEmpty()) {
             MehTelemetry.logError(
               stage = "fetch_configs",
@@ -154,6 +229,7 @@ class MehViewModel(
               it.copy(
                 phase = MehPhase.ERROR,
                 liveLogLine = "",
+                terminalLogs = emptyList(),
               )
             }
             return@launch
@@ -161,20 +237,25 @@ class MehViewModel(
 
           MehTelemetry.logConfigsFetched(configs.size)
 
-          // Stage 2: تست سرور ها
+          // Stage 2: تست سرور ها (kept fixed in liveLogLine while sub-logs stream below it)
           _uiState.update {
             it.copy(
               phase = MehPhase.TESTING_SPEED,
               liveLogLine = LOG_TESTING,
             )
           }
-          delay(150L)
+          delay(120L)
 
           val verifiedCandidates =
             repository.testAndSelectFastestCandidates(
               configs = configs,
               maxCount = 6,
-            ) { _ -> }
+            ) { logLine ->
+              appendLogLine(
+                message = logLine,
+                level = HackerLogLevel.SCAN,
+              )
+            }
 
           if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(
@@ -185,6 +266,7 @@ class MehViewModel(
               it.copy(
                 phase = MehPhase.ERROR,
                 liveLogLine = "",
+                terminalLogs = emptyList(),
               )
             }
             return@launch
@@ -207,6 +289,7 @@ class MehViewModel(
             it.copy(
               phase = MehPhase.ERROR,
               liveLogLine = "",
+              terminalLogs = emptyList(),
             )
           }
         }
@@ -253,6 +336,7 @@ class MehViewModel(
         it.copy(
           phase = MehPhase.DISCONNECTED,
           liveLogLine = "",
+          terminalLogs = emptyList(),
         )
       }
     }
@@ -263,6 +347,11 @@ class MehViewModel(
     candidates: List<V2RayConfig>,
   ) {
     val config = candidates.first()
+    appendLogLine(
+      message = "راه‌اندازی تونل ارتباطی (${config.protocol.label}) ...",
+      level = HackerLogLevel.SYSTEM,
+    )
+
     val intent =
       Intent(context, MehVpnService::class.java).apply {
         action = MehVpnService.ACTION_CONNECT
@@ -294,7 +383,6 @@ class MehViewModel(
         putExtra(MehVpnService.EXTRA_CORE_JSON, config.toV2RayCoreJson())
       }
 
-    // Stage 3: متصل
     try {
       ContextCompat.startForegroundService(context, intent)
     } catch (e: Exception) {
@@ -305,9 +393,6 @@ class MehViewModel(
       )
     }
 
-    // Do not report "connected" yet: the service publishes `isRunning = true` through
-    // `MehVpnService.tunnelSession` only after the TUN and tun2socks are really up, and the
-    // collector in `init` then flips the phase to CONNECTED (or ERROR if startup failed).
     _uiState.update {
       it.copy(
         phase = MehPhase.CONNECTING,
@@ -339,6 +424,7 @@ class MehViewModel(
         selectedConfig = null,
         activeMethod = null,
         liveLogLine = "",
+        terminalLogs = emptyList(),
       )
     }
   }
