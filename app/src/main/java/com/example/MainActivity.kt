@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -46,7 +47,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -54,6 +57,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -82,6 +86,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
 import com.example.ui.HackerLogEntry
 import com.example.ui.MehPhase
@@ -113,6 +118,10 @@ class MainActivity : ComponentActivity() {
         val uiState by mehViewModel.uiState.collectAsStateWithLifecycle()
         val context = LocalContext.current
 
+        LaunchedEffect(Unit) {
+          mehViewModel.loadSavedLastServer(context)
+        }
+
         val vpnPermissionLauncher =
           rememberLauncherForActivityResult(
             contract = ActivityResultContracts.StartActivityForResult()
@@ -133,6 +142,14 @@ class MainActivity : ComponentActivity() {
               },
             )
           },
+          onConnectLastServer = {
+            mehViewModel.onConnectWithLastServerClicked(
+              context = context,
+              onRequestVpnPermission = { prepareIntent ->
+                vpnPermissionLauncher.launch(prepareIntent)
+              },
+            )
+          },
         )
       }
     }
@@ -143,6 +160,7 @@ class MainActivity : ComponentActivity() {
 fun MehMinimalScreen(
   uiState: MehUiState,
   onPowerToggle: () -> Unit,
+  onConnectLastServer: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor by
@@ -159,6 +177,10 @@ fun MehMinimalScreen(
       animationSpec = tween(durationMillis = 450),
       label = "accentColor",
     )
+
+  val showLastServerOption =
+    (uiState.phase == MehPhase.DISCONNECTED || uiState.phase == MehPhase.ERROR) &&
+      uiState.lastConnectedConfig != null
 
   Scaffold(
     modifier = modifier.fillMaxSize(),
@@ -190,14 +212,14 @@ fun MehMinimalScreen(
         // Equal top weight keeps the power button permanently locked at the vertical center
         Spacer(modifier = Modifier.weight(1f))
 
-        // 1. Power Button (fixed position, never shifts when logs appear)
+        // 1. Power Button (fixed position, always runs main pipeline by default)
         CircularPowerButton(
           phase = uiState.phase,
           accentColor = accentColor,
           onClick = onPowerToggle,
         )
 
-        // 2 & 3. Fixed bottom region for Main Stage Status + Line-by-Line Sub-Logs
+        // 2, 3 & 4. Fixed bottom region for Main Stage Status, Line-by-Line Sub-Logs, and optional Last Server button
         Box(
           modifier =
             Modifier.weight(1f)
@@ -230,9 +252,82 @@ fun MehMinimalScreen(
                 )
               }
             }
+
+            AnimatedVisibility(
+              visible = showLastServerOption,
+              enter = fadeIn(tween(220)) + expandVertically(tween(220)),
+              exit = fadeOut(tween(160)) + shrinkVertically(tween(180)),
+            ) {
+              uiState.lastConnectedConfig?.let { lastCfg ->
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Spacer(modifier = Modifier.height(14.dp))
+                  ConnectLastServerPill(
+                    lastConfig = lastCfg,
+                    onClick = onConnectLastServer,
+                  )
+                }
+              }
+            }
           }
         }
       }
+    }
+  }
+}
+
+@Composable
+private fun ConnectLastServerPill(
+  lastConfig: V2RayConfig,
+  onClick: () -> Unit,
+) {
+  val haptic = LocalHapticFeedback.current
+  val baseLabel = stringResource(R.string.connect_last_server)
+  val buttonLabel = "$baseLabel (${lastConfig.protocol.label})"
+
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Row(
+      modifier =
+        Modifier.defaultMinSize(minHeight = 48.dp)
+          .clip(RoundedCornerShape(24.dp))
+          .background(ObsidianSurface.copy(alpha = 0.85f))
+          .border(
+            width = 1.dp,
+            color = TextMuted.copy(alpha = 0.32f),
+            shape = RoundedCornerShape(24.dp),
+          )
+          .semantics {
+            role = Role.Button
+            contentDescription = buttonLabel
+          }
+          .clickable(
+            onClick = {
+              haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+              onClick()
+            }
+          )
+          .padding(horizontal = 18.dp, vertical = 10.dp)
+          .testTag("connect_last_server_button"),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.Center,
+    ) {
+      Icon(
+        imageVector = Icons.Rounded.History,
+        contentDescription = null,
+        tint = NeonEmeraldGlow.copy(alpha = 0.85f),
+        modifier = Modifier.size(18.dp),
+      )
+
+      Spacer(modifier = Modifier.width(8.dp))
+
+      Text(
+        text = buttonLabel,
+        style = MaterialTheme.typography.bodyMedium,
+        fontFamily = VazirmatnFontFamily,
+        fontWeight = FontWeight.Medium,
+        color = TextSecondary,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
     }
   }
 }

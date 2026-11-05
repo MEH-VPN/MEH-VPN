@@ -8,11 +8,14 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.MehConnectionMethod
 import com.example.data.SoliSpiritRepository
 import com.example.model.V2RayConfig
+import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
 import com.example.vpn.MehVpnService
+import com.example.vpn.V2RayOutboundClient
 import java.util.ArrayList
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,6 +23,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class MehPhase {
   DISCONNECTED,
@@ -51,6 +57,7 @@ data class MehUiState(
   val liveLogLine: String = "",
   val terminalLogs: List<HackerLogEntry> = emptyList(),
   val selectedConfig: V2RayConfig? = null,
+  val lastConnectedConfig: V2RayConfig? = null,
   val activeMethod: MehConnectionMethod? = null,
 ) {
   val isBusy: Boolean
@@ -73,6 +80,9 @@ class MehViewModel(
     const val LOG_CONNECTING = "در حال اتصال"
     const val LOG_CONNECTED = "متصل"
     private const val MAX_LOG_LINES = 5
+
+    private const val PREFS_LAST_SERVER = "meh_last_server_prefs"
+    private const val KEY_SAVED_CANDIDATES_JSON = "saved_candidates_json"
   }
 
   private val _uiState = MutableStateFlow(MehUiState())
@@ -80,6 +90,7 @@ class MehViewModel(
 
   private var workflowJob: Job? = null
   private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
+  private var cachedLastCandidates: List<V2RayConfig> = emptyList()
   private val logIdGenerator = AtomicLong(1L)
 
   init {
@@ -105,6 +116,7 @@ class MehViewModel(
             current.copy(
               phase = MehPhase.CONNECTED,
               liveLogLine = LOG_CONNECTED,
+              lastConnectedConfig = current.selectedConfig ?: current.lastConnectedConfig,
             )
           }
         } else if (session.errorMessage != null) {
@@ -138,6 +150,70 @@ class MehViewModel(
   }
 
   /**
+   * Loads the last connected server configuration from `SharedPreferences` so the user can
+   * optionally reconnect to it with one tap.
+   */
+  fun loadSavedLastServer(context: Context) {
+    try {
+      val prefs = context.applicationContext.getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
+      val rawJson = prefs.getString(KEY_SAVED_CANDIDATES_JSON, null)
+      if (rawJson.isNullOrBlank()) return
+      val arr = JSONArray(rawJson)
+      val restored = mutableListOf<V2RayConfig>()
+      for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val uri = obj.optString("rawUri", "")
+        val parsed = V2RayConfigParser.parseSingleUri(uri) ?: continue
+        val ip = obj.optString("resolvedIp", "")
+        val profile = obj.optString("fragmentProfile", parsed.fragmentProfile)
+        val ciphers = obj.optString("cipherSuites", parsed.cipherSuites)
+        val latency = obj.optLong("latencyMs", parsed.latencyMs)
+        restored.add(
+          parsed.copy(
+            resolvedIp = ip,
+            fragmentProfile = profile.ifBlank { parsed.fragmentProfile },
+            cipherSuites = ciphers.ifBlank { parsed.cipherSuites },
+            latencyMs = latency,
+          )
+        )
+      }
+      if (restored.isNotEmpty()) {
+        cachedLastCandidates = restored
+        _uiState.update { current ->
+          current.copy(lastConnectedConfig = restored.first())
+        }
+      }
+    } catch (_: Throwable) {}
+  }
+
+  private fun saveLastConnectedCandidates(context: Context, candidates: List<V2RayConfig>) {
+    if (candidates.isEmpty()) return
+    cachedLastCandidates = candidates
+    _uiState.update { current ->
+      current.copy(lastConnectedConfig = candidates.first())
+    }
+    try {
+      val arr = JSONArray()
+      for (cfg in candidates) {
+        val obj =
+          JSONObject().apply {
+            put("rawUri", cfg.rawUri)
+            put("resolvedIp", cfg.resolvedIp)
+            put("fragmentProfile", cfg.fragmentProfile)
+            put("cipherSuites", cfg.cipherSuites)
+            put("latencyMs", cfg.latencyMs)
+          }
+        arr.put(obj)
+      }
+      context.applicationContext
+        .getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
+        .edit()
+        .putString(KEY_SAVED_CANDIDATES_JSON, arr.toString())
+        .apply()
+    } catch (_: Throwable) {}
+  }
+
+  /**
    * Appends a line-by-line sub-log below the main stage status (`liveLogLine`),
    * without overwriting the main status text (`دریافت لیست سرور ها`, `تست سرور ها`, `در حال اتصال`, `متصل`).
    */
@@ -147,7 +223,6 @@ class MehViewModel(
   ) {
     val cleanMsg = message.trim()
     if (cleanMsg.isEmpty()) return
-    // Do not duplicate the main stage title inside the sub-log list
     if (cleanMsg == LOG_FETCHING ||
       cleanMsg == LOG_TESTING ||
       cleanMsg == LOG_CONNECTING ||
@@ -174,6 +249,11 @@ class MehViewModel(
     }
   }
 
+  /**
+   * Default action when the central power button is clicked:
+   * - If connected or busy -> disconnects / cancels.
+   * - If disconnected or error -> ALWAYS starts the default full V2Ray discovery & test pipeline.
+   */
   fun onPowerButtonClicked(
     context: Context,
     onRequestVpnPermission: (Intent) -> Unit,
@@ -184,6 +264,76 @@ class MehViewModel(
     } else {
       startV2RayConnectionPipeline(context, onRequestVpnPermission)
     }
+  }
+
+  /**
+   * Optional action when the user explicitly chooses to reconnect using the last connected server
+   * instead of running the full discovery pipeline.
+   */
+  fun onConnectWithLastServerClicked(
+    context: Context,
+    onRequestVpnPermission: (Intent) -> Unit,
+  ) {
+    if (_uiState.value.isActiveOrBusy) return
+    val lastPrimary = _uiState.value.lastConnectedConfig ?: cachedLastCandidates.firstOrNull() ?: return
+    val candidatesToUse =
+      if (cachedLastCandidates.isNotEmpty()) cachedLastCandidates else listOf(lastPrimary)
+
+    workflowJob?.cancel()
+    workflowJob =
+      viewModelScope.launch {
+        try {
+          MehTelemetry.logConnectAttempt()
+
+          _uiState.update {
+            it.copy(
+              phase = MehPhase.CONNECTING,
+              liveLogLine = LOG_CONNECTING,
+              terminalLogs = emptyList(),
+              selectedConfig = lastPrimary,
+              activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
+            )
+          }
+
+          appendLogLine(
+            message = "اتصال با آخرین سرور (${lastPrimary.protocol.label}) ...",
+            level = HackerLogLevel.SYSTEM,
+          )
+
+          val resolvedCandidates =
+            withContext(Dispatchers.IO) {
+              candidatesToUse.map { cfg ->
+                if (cfg.resolvedIp.isNotBlank()) {
+                  cfg
+                } else {
+                  val ip = V2RayOutboundClient.resolveEndpointIpv4(cfg.address).orEmpty()
+                  cfg.copy(resolvedIp = ip)
+                }
+              }
+            }
+
+          prepareAndStartVpn(
+            context = context,
+            candidates = resolvedCandidates,
+            onRequestVpnPermission = onRequestVpnPermission,
+          )
+        } catch (ce: CancellationException) {
+          throw ce
+        } catch (e: Exception) {
+          MehTelemetry.logError(
+            stage = "connect_last_server",
+            errorMessage = e.localizedMessage ?: "Failed to connect with last server",
+            throwable = e,
+          )
+          _uiState.update {
+            it.copy(
+              phase = MehPhase.ERROR,
+              liveLogLine = "",
+              terminalLogs = emptyList(),
+            )
+          }
+        }
+      }
   }
 
   /**
@@ -347,6 +497,8 @@ class MehViewModel(
     candidates: List<V2RayConfig>,
   ) {
     val config = candidates.first()
+    saveLastConnectedCandidates(context, candidates)
+
     appendLogLine(
       message = "راه‌اندازی تونل ارتباطی (${config.protocol.label}) ...",
       level = HackerLogLevel.SYSTEM,
@@ -397,6 +549,7 @@ class MehViewModel(
       it.copy(
         phase = MehPhase.CONNECTING,
         selectedConfig = config,
+        lastConnectedConfig = config,
         activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
         liveLogLine = LOG_CONNECTING,
       )

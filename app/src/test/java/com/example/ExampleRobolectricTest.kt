@@ -143,4 +143,38 @@ class ExampleRobolectricTest {
         diagAfterConnect.recentEvents.any { it.name == "vpn_active_heartbeat" },
     )
   }
+
+  @Test
+  fun minimalScreen_displaysConnectLastServerOptionWhenAvailable() {
+    var defaultPowerClicked = false
+    var connectLastClicked = false
+    val sampleLastConfig =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@de1.example.org:443?encryption=none&security=tls&sni=de1.example.org&type=ws&path=%2Fws#Germany%20Fast"
+      )
+
+    composeTestRule.setContent {
+      MyApplicationTheme {
+        MehMinimalScreen(
+          uiState =
+            MehUiState(
+              phase = MehPhase.DISCONNECTED,
+              lastConnectedConfig = sampleLastConfig,
+            ),
+          onPowerToggle = { defaultPowerClicked = true },
+          onConnectLastServer = { connectLastClicked = true },
+        )
+      }
+    }
+
+    composeTestRule.onNodeWithTag("vpn_toggle_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("connect_last_server_button").assertIsDisplayed()
+
+    composeTestRule.onNodeWithTag("connect_last_server_button").performClick()
+    assertTrue(connectLastClicked)
+    org.junit.Assert.assertFalse(defaultPowerClicked)
+
+    composeTestRule.onNodeWithTag("vpn_toggle_button").performClick()
+    assertTrue(defaultPowerClicked)
+  }
 }
