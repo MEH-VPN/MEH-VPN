@@ -44,6 +44,7 @@ data class VpnTunnelSession(
   val currentPingMs: Long = 0L,
   val localProxyPort: Int = 0,
   val errorMessage: String? = null,
+  val diagnostics: String = "",
 )
 
 class MehVpnService : VpnService() {
@@ -54,6 +55,7 @@ class MehVpnService : VpnService() {
   private var tun2SocksStarted: Boolean = false
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
+  private var diagJob: Job? = null
 
   @Volatile private var underlyingPhysicalNetwork: Network? = null
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -291,6 +293,7 @@ class MehVpnService : VpnService() {
         )
 
       startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
+      startDiagnosticsLoop(proxyServer)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -340,7 +343,27 @@ class MehVpnService : VpnService() {
               currentPingMs = lastPing,
               localProxyPort = proxyPort,
               errorMessage = null,
+              diagnostics = proxyServer.diagnosticsShort(),
             )
+        }
+      }
+  }
+
+  /**
+   * Publishes the proxy's live counters every 2s (status line + logcat tag `MehDiag`) so a
+   * "connected but nothing loads" report shows where traffic stops: DNS never arriving, DNS not
+   * answered, TCP not opened, or nodes accepting streams but never replying.
+   */
+  private fun startDiagnosticsLoop(proxyServer: LocalV2RayProxyServer) {
+    diagJob?.cancel()
+    diagJob =
+      serviceScope.launch {
+        while (isActive) {
+          delay(2_000L)
+          val current = _tunnelSession.value
+          if (!current.isRunning) continue
+          android.util.Log.i("MehDiag", proxyServer.diagnosticsFull())
+          _tunnelSession.value = current.copy(diagnostics = proxyServer.diagnosticsShort())
         }
       }
   }
@@ -350,6 +373,8 @@ class MehVpnService : VpnService() {
     connectJob = null
     keepAliveJob?.cancel()
     keepAliveJob = null
+    diagJob?.cancel()
+    diagJob = null
     stopNativeTun2Socks()
     localProxyServer?.stop()
     localProxyServer = null
@@ -381,6 +406,7 @@ class MehVpnService : VpnService() {
   override fun onDestroy() {
     connectJob?.cancel()
     keepAliveJob?.cancel()
+    diagJob?.cancel()
     stopNativeTun2Socks()
     localProxyServer?.stop()
     try {

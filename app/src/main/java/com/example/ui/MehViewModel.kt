@@ -78,7 +78,12 @@ class MehViewModel(
           _uiState.update { current ->
             current.copy(
               phase = MehPhase.CONNECTED,
-              liveLogLine = LOG_CONNECTED,
+              liveLogLine =
+                if (session.diagnostics.isBlank()) {
+                  LOG_CONNECTED
+                } else {
+                  "$LOG_CONNECTED • ${session.diagnostics}"
+                },
             )
           }
         } else if (session.errorMessage != null) {

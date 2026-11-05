@@ -192,6 +192,34 @@ class LocalV2RayProxyServer(
     )
   private val running = AtomicBoolean(false)
 
+  // ---- Live diagnostics: shown in the status line and logged under the "MehDiag" tag ----
+  private val diagUdpAssoc = AtomicInteger(0)
+  private val diagUdpDropped = AtomicInteger(0)
+  private val diagDnsQueries = AtomicInteger(0)
+  private val diagDnsAnswers = AtomicInteger(0)
+  private val diagTcpAccepted = AtomicInteger(0)
+  private val diagTcpFakeIp = AtomicInteger(0)
+  private val diagTcpDot = AtomicInteger(0)
+  private val diagTcpOpened = AtomicInteger(0)
+  private val diagTcpFailed = AtomicInteger(0)
+  private val diagTcpNoReply = AtomicInteger(0)
+  @Volatile private var diagLastError: String = ""
+
+  /** Compact one-line summary for the UI: dns answered/queries, tcp opened/accepted, empty replies. */
+  fun diagnosticsShort(): String =
+    "dns ${diagDnsAnswers.get()}/${diagDnsQueries.get()} " +
+      "tcp ${diagTcpOpened.get()}/${diagTcpAccepted.get()} " +
+      "empty ${diagTcpNoReply.get()}"
+
+  /** Full counter dump for logcat (`adb logcat -s MehDiag`). */
+  fun diagnosticsFull(): String =
+    "udpAssoc=${diagUdpAssoc.get()} udpDroppedNon53=${diagUdpDropped.get()} " +
+      "dnsQ=${diagDnsQueries.get()} dnsA=${diagDnsAnswers.get()} " +
+      "tcpAccepted=${diagTcpAccepted.get()} tcpFakeIp=${diagTcpFakeIp.get()} " +
+      "tcpPort853=${diagTcpDot.get()} tcpOpened=${diagTcpOpened.get()} " +
+      "tcpFailed=${diagTcpFailed.get()} tcpNoReply=${diagTcpNoReply.get()} " +
+      "lastError=$diagLastError"
+
   private val relayExecutor: ExecutorService =
     Executors.newCachedThreadPool { runnable ->
       Thread(runnable, "meh-proxy-worker").apply {
@@ -575,6 +603,10 @@ class LocalV2RayProxyServer(
         val syntheticDomain = lookupSyntheticDomainForIp(rawTargetHost)
         var effectiveHost = syntheticDomain ?: rawTargetHost
 
+        diagTcpAccepted.incrementAndGet()
+        if (syntheticDomain != null) diagTcpFakeIp.incrementAndGet()
+        if (targetPort == 853) diagTcpDot.incrementAndGet()
+
         // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
         // (TLS ClientHello / HTTP request / MTProto preamble / DoT port 853 handshake)
         clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
@@ -622,9 +654,12 @@ class LocalV2RayProxyServer(
               // "fallback IPv4" (Serverless mode would dial it directly and black-hole).
               fallbackIpv4 = if (syntheticDomain != null) null else rawTargetHost,
             )
-          } catch (_: Exception) {
+          } catch (e: Exception) {
+            diagTcpFailed.incrementAndGet()
+            diagLastError = "$effectiveHost:$targetPort ${e.javaClass.simpleName}: ${e.message}".take(160)
             return
           }
+        diagTcpOpened.incrementAndGet()
 
         opened.connection.use { activeTunnel ->
           if (opened.firstReplyBytes != null && opened.firstReplyLen > 0) {
@@ -644,6 +679,7 @@ class LocalV2RayProxyServer(
       0x03 -> {
         // UDP ASSOCIATE: keep control socket open for the entire lifetime of the tun2socks session
         // (soTimeout = 0) so UDP DNS associations never expire while browsing!
+        diagUdpAssoc.incrementAndGet()
         clientSocket.soTimeout = 0
         val pHigh = ((udpListenPort ushr 8) and 0xFF).toByte()
         val pLow = (udpListenPort and 0xFF).toByte()
@@ -738,12 +774,16 @@ class LocalV2RayProxyServer(
 
     // Drop non-DNS UDP packets (such as UDP port 443 QUIC/HTTP3) so apps immediately
     // fall back to TCP port 443 HTTP/2 over the encrypted V2Ray tunnel.
-    if (dstPort != 53) return
+    if (dstPort != 53) {
+      diagUdpDropped.incrementAndGet()
+      return
+    }
 
     val socksUdpHeader = packet.copyOfRange(0, offset)
     val udpPayload = packet.copyOfRange(offset, packet.size)
     if (udpPayload.size < 12) return
 
+    diagDnsQueries.incrementAndGet()
     val responsePayload = resolveDnsOverV2Ray(udpPayload) ?: return
 
     val replyBytes = ByteArray(socksUdpHeader.size + responsePayload.size)
@@ -752,6 +792,7 @@ class LocalV2RayProxyServer(
 
     try {
       udpServer.send(DatagramPacket(replyBytes, replyBytes.size, clientAddr, clientPort))
+      diagDnsAnswers.incrementAndGet()
     } catch (_: Exception) {}
   }
 
@@ -1502,16 +1543,20 @@ class LocalV2RayProxyServer(
       }
     }
 
+    var receivedBytes = 0L
     try {
       val buf = ByteArray(RELAY_BUFFER_SIZE)
       while (running.get()) {
         val n = remoteIn.read(buf)
         if (n <= 0) break
+        receivedBytes += n
         clientOut.write(buf, 0, n)
         clientOut.flush()
       }
     } catch (_: Exception) {
     } finally {
+      // The node accepted the stream but never sent a single byte back (blackholed/throttled).
+      if (receivedBytes == 0L) diagTcpNoReply.incrementAndGet()
       try {
         clientSocket?.shutdownOutput()
       } catch (_: Exception) {}
