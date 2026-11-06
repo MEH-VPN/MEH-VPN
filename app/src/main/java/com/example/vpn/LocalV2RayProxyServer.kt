@@ -192,10 +192,17 @@ class LocalV2RayProxyServer(
     }
   }
 
-  private val serverPool: List<V2RayConfig> =
+  /**
+   * Node pool. Replaced wholesale (never mutated) by [replaceServerPool]; code that works with
+   * indices must snapshot it once (`val pool = serverPool`) so an index always refers to the pool
+   * it was taken from.
+   */
+  @Volatile
+  private var serverPool: List<V2RayConfig> =
     configs.ifEmpty {
       throw IllegalArgumentException("At least one V2RayConfig is required")
     }
+  private val poolLock = Any()
   private val activeConfigIndex = AtomicInteger(0)
   private val consecutiveFailures = ConcurrentHashMap<Int, AtomicInteger>()
   private val penalizedIndices = ConcurrentHashMap.newKeySet<Int>()
@@ -243,7 +250,13 @@ class LocalV2RayProxyServer(
     private set
 
   val activeConfig: V2RayConfig
-    get() = serverPool[activeConfigIndex.get().coerceIn(0, serverPool.lastIndex)]
+    get() {
+      val pool = serverPool
+      return pool[activeConfigIndex.get().coerceIn(0, pool.lastIndex)]
+    }
+
+  /** Snapshot of the current node pool (active node is `activeConfig`). */
+  fun currentPool(): List<V2RayConfig> = serverPool
 
   fun start(): Int {
     val localhost = InetAddress.getByName("127.0.0.1")
@@ -346,24 +359,27 @@ class LocalV2RayProxyServer(
    * consecutive keep-alive probes fail or mid-stream stalls occur.
    */
   fun switchToNextHealthyNode(reason: String = "health_check"): V2RayConfig {
-    if (serverPool.size <= 1) return activeConfig
-    val oldIdx = activeConfigIndex.get().coerceIn(0, serverPool.lastIndex)
-    val oldCfg = serverPool[oldIdx]
+    val pool = serverPool
+    if (pool.size <= 1) return activeConfig
+    val oldIdx = activeConfigIndex.get().coerceIn(0, pool.lastIndex)
+    val oldCfg = pool[oldIdx]
     penalizedIndices.add(oldIdx)
-    if (penalizedIndices.size >= serverPool.size) {
+    if (penalizedIndices.size >= pool.size) {
       penalizedIndices.clear()
     }
     V2RayOutboundClient.evictPrewarmedTransports(oldCfg.endpointKey)
 
-    var nextIdx = (oldIdx + 1) % serverPool.size
-    for (step in 1 until serverPool.size) {
-      val candidateIdx = (oldIdx + step) % serverPool.size
+    var nextIdx = (oldIdx + 1) % pool.size
+    for (step in 1 until pool.size) {
+      val candidateIdx = (oldIdx + step) % pool.size
       if (candidateIdx !in penalizedIndices) {
         nextIdx = candidateIdx
         break
       }
     }
 
+    // The pool may have been replaced while we were choosing; do not apply a stale index.
+    if (pool !== serverPool) return activeConfig
     activeConfigIndex.set(nextIdx)
     consecutiveFailures[nextIdx]?.set(0)
     closeAllPersistentDnsSlots()
@@ -372,7 +388,7 @@ class LocalV2RayProxyServer(
       MehDiag.recordKeepAliveTriggeredFailover()
     }
 
-    val newActive = serverPool[nextIdx]
+    val newActive = pool[nextIdx]
     V2RayOutboundClient.warmUpNodePoolAsync(
       config = newActive,
       protector = protector,
@@ -381,32 +397,69 @@ class LocalV2RayProxyServer(
     return newActive
   }
 
-  private fun recordServerSuccess(idx: Int) {
+  /**
+   * Atomically replaces the node pool (best node first) without touching streams that are already
+   * relaying: they keep their own node connection and finish normally, only *new* streams use the
+   * new pool. Used by the background node refinement. Returns the new active node.
+   */
+  fun replaceServerPool(newConfigs: List<V2RayConfig>): V2RayConfig {
+    if (newConfigs.isEmpty()) return activeConfig
+    val newPool = newConfigs.distinctBy { it.endpointKey }
+    val oldPool =
+      synchronized(poolLock) {
+        val previous = serverPool
+        consecutiveFailures.clear()
+        penalizedIndices.clear()
+        activeConfigIndex.set(0)
+        serverPool = newPool
+        previous
+      }
+    val keptKeys = newPool.map { it.endpointKey }.toSet()
+    for (old in oldPool) {
+      if (old.endpointKey !in keptKeys) {
+        V2RayOutboundClient.evictPrewarmedTransports(old.endpointKey)
+      }
+    }
+    closeAllPersistentDnsSlots()
+    MehDiag.recordNodeSwitch()
+    if (running.get()) {
+      V2RayOutboundClient.warmUpNodePoolAsync(
+        config = newPool[0],
+        protector = protector,
+        targetCount = 4,
+      )
+    }
+    return newPool[0]
+  }
+
+  private fun recordServerSuccess(idx: Int, pool: List<V2RayConfig>) {
+    if (pool !== serverPool) return // pool was replaced mid-stream; idx is meaningless now
     consecutiveFailures[idx]?.set(0)
     penalizedIndices.remove(idx)
     val previous = activeConfigIndex.getAndSet(idx)
     if (previous != idx) {
       MehDiag.recordNodeSwitch()
       V2RayOutboundClient.warmUpNodePoolAsync(
-        config = serverPool[idx],
+        config = pool[idx],
         protector = protector,
         targetCount = 3,
       )
     }
   }
 
-  private fun recordServerTransportFailure(idx: Int) {
-    if (serverPool.size <= 1) return
+  private fun recordServerTransportFailure(idx: Int, pool: List<V2RayConfig>) {
+    if (pool !== serverPool) return
+    if (pool.size <= 1) return
     val count = consecutiveFailures.computeIfAbsent(idx) { AtomicInteger(0) }.incrementAndGet()
     if (count >= CONSECUTIVE_FAILURES_TO_PENALIZE) {
       penalizedIndices.add(idx)
-      V2RayOutboundClient.evictPrewarmedTransports(serverPool[idx].endpointKey)
-      if (penalizedIndices.size >= serverPool.size) {
+      V2RayOutboundClient.evictPrewarmedTransports(pool[idx].endpointKey)
+      if (penalizedIndices.size >= pool.size) {
         penalizedIndices.clear()
       }
       if (activeConfigIndex.get() == idx) {
-        for (step in 1 until serverPool.size) {
-          val candidateIdx = (idx + step) % serverPool.size
+        for (step in 1 until pool.size) {
+          val candidateIdx = (idx + step) % pool.size
           if (candidateIdx !in penalizedIndices) {
             activeConfigIndex.set(candidateIdx)
             MehDiag.recordNodeSwitch()
@@ -439,7 +492,8 @@ class LocalV2RayProxyServer(
     maxNodes: Int = Int.MAX_VALUE,
     penalizeOnFailure: Boolean = true,
   ): OpenedTunnelWithReply {
-    val poolSize = serverPool.size
+    val pool = serverPool
+    val poolSize = pool.size
     val currentPrimary = activeConfigIndex.get().coerceIn(0, poolSize - 1)
 
     val orderedIndices = ArrayList<Int>(poolSize)
@@ -479,7 +533,7 @@ class LocalV2RayProxyServer(
 
     for ((attemptIdx, idx) in orderedIndices.withIndex()) {
       if (attemptIdx >= maxNodes) break
-      val candidate = serverPool[idx]
+      val candidate = pool[idx]
       var hardFailure = false
       for (hostCandidate in targetsToTry) {
         var conn: V2RayOutboundClient.TunnelConnection? = null
@@ -535,7 +589,7 @@ class LocalV2RayProxyServer(
               MehDiag.recordFirstByteReceived()
               MehDiag.recordBytesDownloaded(replyLen.toLong())
               conn.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
-              recordServerSuccess(idx)
+              recordServerSuccess(idx, pool)
               return OpenedTunnelWithReply(
                 connection = conn,
                 firstReplyBytes = replyBuf,
@@ -545,7 +599,7 @@ class LocalV2RayProxyServer(
             }
           }
           conn.setReadTimeout(NO_DATA_STREAM_TIMEOUT_MS)
-          recordServerSuccess(idx)
+          recordServerSuccess(idx, pool)
           return OpenedTunnelWithReply(conn, null, 0, idx)
         } catch (e: Exception) {
           try {
@@ -562,7 +616,7 @@ class LocalV2RayProxyServer(
         }
       }
       if (hardFailure && penalizeOnFailure) {
-        recordServerTransportFailure(idx)
+        recordServerTransportFailure(idx, pool)
       }
     }
     throw lastError ?: IOException("All V2Ray servers in pool failed for $targetHost:$targetPort")
