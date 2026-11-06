@@ -240,7 +240,7 @@ class SoliSpiritRepository(
       val request =
         Request.Builder()
           .url(source.url)
-          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/MohammadBahemmat/V2ray-Collector)")
+          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/MEH-VPN/MEH-VPN)")
           .header("Accept", "text/plain, */*")
           .build()
 

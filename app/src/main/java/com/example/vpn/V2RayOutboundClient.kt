@@ -1347,27 +1347,36 @@ object V2RayOutboundClient {
 
     val vlessIn =
       object : FilterInputStream(input) {
-        private var responseHeaderRead = false
+        // Header parsing is resumable: a read timeout while waiting for the response must not
+        // mark the header as consumed, otherwise the next read would hand the raw VLESS header
+        // bytes (00 00) to the application as payload.
+        private var headerDone = false
+        private var versionChecked = false
+        private var addonRemaining = -1
 
         @Synchronized
         private fun ensureHeader() {
-          if (!responseHeaderRead) {
-            headerSentLatch.await(30_000, TimeUnit.MILLISECONDS)
-            responseHeaderRead = true
+          if (headerDone) return
+          headerSentLatch.await(30_000, TimeUnit.MILLISECONDS)
+          if (!versionChecked) {
             val ver = `in`.read()
             if (ver == -1) throw EOFException("VLESS EOF before response header")
             if (ver != wireVersion && ver != 0) {
               throw IOException("Invalid VLESS response version byte: $ver")
             }
+            versionChecked = true
+          }
+          if (addonRemaining < 0) {
             val addonLen = `in`.read()
             if (addonLen == -1) throw EOFException("VLESS EOF reading addon length")
-            var remaining = addonLen
-            while (remaining > 0) {
-              val b = `in`.read()
-              if (b == -1) throw EOFException("VLESS EOF skipping addons")
-              remaining--
-            }
+            addonRemaining = addonLen
           }
+          while (addonRemaining > 0) {
+            val b = `in`.read()
+            if (b == -1) throw EOFException("VLESS EOF skipping addons")
+            addonRemaining--
+          }
+          headerDone = true
         }
 
         override fun read(): Int {

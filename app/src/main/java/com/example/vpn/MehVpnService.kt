@@ -326,6 +326,15 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         var tickCount = 0
         var consecutiveFailures = 0
+
+        // Counters are only useful if somebody can read them: `adb logcat -s MehDiag`.
+        launch {
+          while (isActive) {
+            delay(DIAG_LOG_INTERVAL_MS)
+            android.util.Log.i("MehDiag", MehDiag.formatCompactSummary())
+          }
+        }
+
         while (isActive) {
           delay(KEEP_ALIVE_INTERVAL_MS)
           tickCount++
@@ -529,6 +538,9 @@ class MehVpnService : VpnService() {
 
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
+
+    /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
+    private const val DIAG_LOG_INTERVAL_MS = 5_000L
 
     /** Keep-alive probe interval (45s instead of 15s for battery/data savings). */
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
