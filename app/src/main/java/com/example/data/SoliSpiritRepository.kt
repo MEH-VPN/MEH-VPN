@@ -413,6 +413,9 @@ class SoliSpiritRepository(
     configs: List<V2RayConfig>,
     maxCount: Int = 6,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+    maxWaves: Int = 3,
+    concurrency: Int = CONCURRENT_TEST_LIMIT,
+    verifyConcurrency: Int = 6,
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
@@ -426,7 +429,7 @@ class SoliSpiritRepository(
       val supported = validSaved + remainingSupported
       if (supported.isEmpty()) return@withContext emptyList()
 
-      val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
+      val semaphore = Semaphore(concurrency.coerceAtLeast(1))
       val completedCount = AtomicInteger(0)
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
@@ -434,9 +437,9 @@ class SoliSpiritRepository(
       val fullSocialPool = mutableListOf<V2RayConfig>()
       val partialSocialPool = mutableListOf<V2RayConfig>()
       val fallbackHttpsPool = mutableListOf<V2RayConfig>()
-      val stage2Semaphore = Semaphore(6)
+      val stage2Semaphore = Semaphore(verifyConcurrency.coerceAtLeast(1))
 
-      val waves = supported.chunked(WAVE_SIZE).take(3)
+      val waves = supported.chunked(WAVE_SIZE).take(maxWaves.coerceAtLeast(1))
       for (wave in waves) {
         coroutineContext.ensureActive()
         val stage1Passed =
