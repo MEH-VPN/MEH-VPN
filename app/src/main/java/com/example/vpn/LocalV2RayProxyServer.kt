@@ -15,6 +15,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.RejectedExecutionHandler
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -25,7 +26,7 @@ import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Local multi-protocol proxy server supporting:
- * 1. Bounded `ThreadPoolExecutor` (`relayExecutor`, max 192 threads) with graceful backpressure.
+ * 1. Bounded `ThreadPoolExecutor` (`relayExecutor`) with graceful backpressure.
  * 2. Pre-warmed TLS+WebSocket V2Ray node connection pooling (`V2RayOutboundClient.warmUpNodePoolAsync`).
  * 3. Mid-stream Dead Server Detection & Automatic Failover:
  *    - If a stream sends a `ClientHello` / HTTP request and receives 0 bytes within
@@ -50,18 +51,30 @@ class LocalV2RayProxyServer(
   ) : this(listOf(config), protector, udpProtector)
 
   companion object {
-    /** Stream read timeout once downstream data has begun flowing (reduced from 180s to 45s). */
-    private const val IDLE_STREAM_TIMEOUT_MS = 45_000
+    /**
+     * Stream read timeout once downstream data has begun flowing. Must stay long: push channels,
+     * messenger sockets and websockets without pings legitimately sit idle for minutes.
+     */
+    private const val IDLE_STREAM_TIMEOUT_MS = 300_000
 
     /** Shorter stream timeout when waiting on a stream that has not yet transferred bulk data. */
-    private const val NO_DATA_STREAM_TIMEOUT_MS = 14_000
+    private const val NO_DATA_STREAM_TIMEOUT_MS = 20_000
 
     /** Max wait for the very first response byte after sending TLS ClientHello / HTTP request. */
-    private const val FIRST_BYTE_STALL_TIMEOUT_MS = 3800
+    private const val FIRST_BYTE_STALL_TIMEOUT_MS = 5500
+
+    /** Wait applied to the retry on a second node after the first one stalled. */
+    private const val FIRST_BYTE_RETRY_TIMEOUT_MS = 4000
+
+    /**
+     * How many different nodes one stalled stream may be tried on. A silent stream is ambiguous
+     * (dead node *or* dead/slow destination), so more than two attempts only burns time.
+     */
+    private const val MAX_STALL_FAILOVER_NODES = 2
 
     private const val RELAY_BUFFER_SIZE = 32768
     private const val CONSECUTIVE_FAILURES_TO_PENALIZE = 2
-    private const val MAX_RELAY_THREADS = 192
+    private const val MAX_RELAY_THREADS = 320
 
     /** Hard wall-clock budget for one whole DNS lookup. */
     private const val DNS_BUDGET_MS = 2500L
@@ -153,6 +166,13 @@ class LocalV2RayProxyServer(
     }
   }
 
+  /**
+   * The node accepted the stream but it produced no/closed reply. That is ambiguous (dead node vs.
+   * dead destination, refused connection, stale pre-warmed transport) so it must NOT be counted as a
+   * node transport failure.
+   */
+  private class SoftStreamFailure(message: String, val stalled: Boolean) : IOException(message)
+
   private data class OpenedTunnelWithReply(
     val connection: V2RayOutboundClient.TunnelConnection,
     val firstReplyBytes: ByteArray?,
@@ -190,7 +210,7 @@ class LocalV2RayProxyServer(
   private val running = AtomicBoolean(false)
 
   /**
-   * Bounded thread pool (`MAX_RELAY_THREADS = 192`) to prevent OOM / unbounded blocking thread
+   * Bounded thread pool (`MAX_RELAY_THREADS`) to prevent OOM / unbounded blocking thread
    * explosion while still handling concurrent multi-stream apps.
    */
   private val relayExecutor: ExecutorService =
@@ -205,8 +225,11 @@ class LocalV2RayProxyServer(
           isDaemon = true
         }
       },
+      // Must throw: callers rely on the exception to close the client socket. Swallowing the
+      // rejection would leave the connection open and silently hung.
       RejectedExecutionHandler { _, _ ->
         MehDiag.recordStreamRejected()
+        throw RejectedExecutionException("meh-proxy worker pool saturated")
       },
     )
 
@@ -399,9 +422,10 @@ class LocalV2RayProxyServer(
    * - When `awaitFirstResponse == true` and `initialPayloadLen > 0` (e.g., TLS `ClientHello` or
    *   HTTP request), sends the initial payload and waits up to [firstReplyTimeoutMs] for the first
    *   response byte from the node.
-   * - If the node closes the stream or returns 0 bytes within [firstReplyTimeoutMs], records
-   *   `MehDiag.recordFirstByteTimeoutFailover()`, penalizes the dead node, and automatically fails
-   *   over to the next node in `serverPool`!
+   * - If the stream stays silent for [firstReplyTimeoutMs] or is closed before any reply, the
+   *   next node is tried (at most [MAX_STALL_FAILOVER_NODES] nodes for silence). This is a *soft*
+   *   failure: it does not penalize the node or change the active node, because a silent/closed
+   *   stream may equally mean a dead destination. Only connect/handshake/write errors penalize.
    */
   private fun openTunnelWithVerifiedFailover(
     targetHost: String,
@@ -451,11 +475,12 @@ class LocalV2RayProxyServer(
       }
 
     var lastError: Exception? = null
+    var stalledNodes = 0
 
     for ((attemptIdx, idx) in orderedIndices.withIndex()) {
       if (attemptIdx >= maxNodes) break
       val candidate = serverPool[idx]
-      var nodeSucceeded = false
+      var hardFailure = false
       for (hostCandidate in targetsToTry) {
         var conn: V2RayOutboundClient.TunnelConnection? = null
         try {
@@ -477,50 +502,66 @@ class LocalV2RayProxyServer(
             MehDiag.recordBytesUploaded(initialPayloadLen.toLong())
 
             if (awaitFirstResponse) {
-              conn.setReadTimeout(firstReplyTimeoutMs)
+              val replyTimeout =
+                if (stalledNodes == 0) firstReplyTimeoutMs else minOf(firstReplyTimeoutMs, FIRST_BYTE_RETRY_TIMEOUT_MS)
+              conn.setReadTimeout(replyTimeout)
               val replyBuf = ByteArray(16384)
+              var timedOut = false
               val replyLen =
                 try {
                   conn.inputStream.read(replyBuf)
-                } catch (ste: SocketTimeoutException) {
-                  // If there are backup nodes in the pool, fail over to the next node!
-                  if (poolSize > 1 && attemptIdx + 1 < minOf(poolSize, maxNodes)) {
-                    MehDiag.recordFirstByteTimeoutFailover()
-                    throw ste
-                  }
-                  // Single-node pool: keep stream open and let relayStreams continue waiting
+                } catch (_: SocketTimeoutException) {
+                  timedOut = true
                   0
                 }
+              if (timedOut) {
+                stalledNodes++
+                val canTryAnotherNode =
+                  stalledNodes < MAX_STALL_FAILOVER_NODES &&
+                    attemptIdx + 1 < minOf(poolSize, maxNodes)
+                if (canTryAnotherNode) {
+                  MehDiag.recordFirstByteTimeoutFailover()
+                  throw SoftStreamFailure("no reply from ${candidate.address} for $hostCandidate:$targetPort", stalled = true)
+                }
+                // Out of attempts: keep this stream open and let the relay keep waiting. The node
+                // is NOT marked healthy or unhealthy: silence alone proves nothing.
+                conn.setReadTimeout(NO_DATA_STREAM_TIMEOUT_MS)
+                return OpenedTunnelWithReply(conn, null, 0, idx)
+              }
               if (replyLen < 0) {
                 MehDiag.recordFirstByteTimeoutFailover()
-                throw IOException("V2Ray server ${candidate.address} closed stream before replying for $hostCandidate:$targetPort")
+                throw SoftStreamFailure("V2Ray server ${candidate.address} closed stream before replying for $hostCandidate:$targetPort", stalled = false)
               }
-              if (replyLen > 0) {
-                MehDiag.recordFirstByteReceived()
-                MehDiag.recordBytesDownloaded(replyLen.toLong())
-              }
-              conn.setReadTimeout(if (replyLen > 0) IDLE_STREAM_TIMEOUT_MS else NO_DATA_STREAM_TIMEOUT_MS)
+              MehDiag.recordFirstByteReceived()
+              MehDiag.recordBytesDownloaded(replyLen.toLong())
+              conn.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
               recordServerSuccess(idx)
               return OpenedTunnelWithReply(
                 connection = conn,
-                firstReplyBytes = if (replyLen > 0) replyBuf else null,
-                firstReplyLen = replyLen.coerceAtLeast(0),
+                firstReplyBytes = replyBuf,
+                firstReplyLen = replyLen,
                 nodeIndex = idx,
               )
             }
           }
           conn.setReadTimeout(NO_DATA_STREAM_TIMEOUT_MS)
           recordServerSuccess(idx)
-          nodeSucceeded = true
           return OpenedTunnelWithReply(conn, null, 0, idx)
         } catch (e: Exception) {
           try {
             conn?.close()
           } catch (_: Exception) {}
           lastError = e
+          if (e !is SoftStreamFailure) {
+            hardFailure = true
+          } else if (e.stalled) {
+            // A timeout already cost a full wait; retrying the same node with the IP-form of the
+            // target would only double it. Move on to the next node.
+            break
+          }
         }
       }
-      if (!nodeSucceeded && penalizeOnFailure) {
+      if (hardFailure && penalizeOnFailure) {
         recordServerTransportFailure(idx)
       }
     }
@@ -717,30 +758,35 @@ class LocalV2RayProxyServer(
                 fallbackIpv4 = if (syntheticDomain != null) null else rawTargetHost,
               )
             } catch (_: Exception) {
-              return
+              // Direct path failed (filtered/blocked site, DNS issue): fall back to the tunnel.
+              null
             }
 
-          directConn.use { activeDirect ->
-            if (firstLen > 0) {
-              activeDirect.outputStream.write(firstBuffer, 0, firstLen)
-              activeDirect.outputStream.flush()
-              MehDiag.recordBytesUploaded(firstLen.toLong())
+          if (directConn != null) {
+            directConn.use { activeDirect ->
+              if (firstLen > 0) {
+                activeDirect.outputStream.write(firstBuffer, 0, firstLen)
+                activeDirect.outputStream.flush()
+                MehDiag.recordBytesUploaded(firstLen.toLong())
+              }
+              relayStreams(
+                clientIn = clientIn,
+                clientOut = clientOut,
+                remoteIn = activeDirect.inputStream,
+                remoteOut = activeDirect.outputStream,
+                clientSocket = clientSocket,
+                tunnelConnection = activeDirect,
+              )
             }
-            relayStreams(
-              clientIn = clientIn,
-              clientOut = clientOut,
-              remoteIn = activeDirect.inputStream,
-              remoteOut = activeDirect.outputStream,
-              clientSocket = clientSocket,
-              tunnelConnection = activeDirect,
-            )
+            return
           }
-          return
         }
 
         // For TLS ClientHello / HTTP requests when multiple nodes exist in serverPool, verify first
         // response byte within FIRST_BYTE_STALL_TIMEOUT_MS so dead/frozen servers trigger instant failover.
-        val verifyFirstByte = isTlsOrHttpPayload && firstLen > 0 && serverPool.size > 1
+        val verifyFirstByte =
+          isTlsOrHttpPayload && firstLen > 0 && serverPool.size > 1 &&
+            isReplaySafeInitialPayload(firstBuffer, firstLen)
 
         val opened =
           try {
@@ -790,6 +836,17 @@ class LocalV2RayProxyServer(
         clientOut.flush()
       }
     }
+  }
+
+  /**
+   * True when re-sending [buf] to another node after a stall cannot duplicate a side effect:
+   * a TLS record (ClientHello) or a plain-HTTP GET/HEAD.
+   */
+  private fun isReplaySafeInitialPayload(buf: ByteArray, len: Int): Boolean {
+    if (len < 4) return false
+    if ((buf[0].toInt() and 0xFF) == 0x16 && (buf[1].toInt() and 0xFF) == 0x03) return true
+    val head = String(buf, 0, minOf(len, 5), Charsets.ISO_8859_1)
+    return head.startsWith("GET ") || head.startsWith("HEAD ")
   }
 
   private fun extractHttpHostHeader(buf: ByteArray, len: Int): String? {
@@ -936,7 +993,7 @@ class LocalV2RayProxyServer(
         val targetAddr =
           V2RayOutboundClient.parseIpv4Bytes(rawHost)?.let { InetAddress.getByAddress(it) }
             ?: IranRoutingRules.resolveIranianDomainDirectIpv4(effectiveHost)?.let { InetAddress.getByAddress(it) }
-            ?: InetAddress.getByName(effectiveHost)
+            ?: return null
         val outPkt = DatagramPacket(payload, payload.size, targetAddr, dstPort)
         sock.send(outPkt)
         MehDiag.recordBytesUploaded(payload.size.toLong())
@@ -1542,27 +1599,31 @@ class LocalV2RayProxyServer(
               fallbackIpv4 = rawHost,
             )
           } catch (_: Exception) {
-            return
+            // Direct path failed (filtered/blocked site, DNS issue): fall back to the tunnel.
+            null
           }
-        directConn.use { activeDirect ->
-          if (firstLen > 0) {
-            activeDirect.outputStream.write(firstBuffer, 0, firstLen)
-            activeDirect.outputStream.flush()
-            MehDiag.recordBytesUploaded(firstLen.toLong())
+        if (directConn != null) {
+          directConn.use { activeDirect ->
+            if (firstLen > 0) {
+              activeDirect.outputStream.write(firstBuffer, 0, firstLen)
+              activeDirect.outputStream.flush()
+              MehDiag.recordBytesUploaded(firstLen.toLong())
+            }
+            relayStreams(
+              clientIn = clientIn,
+              clientOut = clientOut,
+              remoteIn = activeDirect.inputStream,
+              remoteOut = activeDirect.outputStream,
+              clientSocket = clientSocket,
+              tunnelConnection = activeDirect,
+            )
           }
-          relayStreams(
-            clientIn = clientIn,
-            clientOut = clientOut,
-            remoteIn = activeDirect.inputStream,
-            remoteOut = activeDirect.outputStream,
-            clientSocket = clientSocket,
-            tunnelConnection = activeDirect,
-          )
+          return
         }
-        return
       }
 
-      val verifyFirstByte = firstLen > 0 && serverPool.size > 1
+      val verifyFirstByte =
+        firstLen > 0 && serverPool.size > 1 && isReplaySafeInitialPayload(firstBuffer, firstLen)
       val opened =
         openTunnelWithVerifiedFailover(
           targetHost = effectiveHost,
@@ -1618,22 +1679,25 @@ class LocalV2RayProxyServer(
               fallbackIpv4 = rawHost,
             )
           } catch (_: Exception) {
-            return
+            // Direct path failed (filtered/blocked site, DNS issue): fall back to the tunnel.
+            null
           }
-        directConn.use { activeDirect ->
-          activeDirect.outputStream.write(rewrittenBytes)
-          activeDirect.outputStream.flush()
-          MehDiag.recordBytesUploaded(rewrittenBytes.size.toLong())
-          relayStreams(
-            clientIn = clientIn,
-            clientOut = clientOut,
-            remoteIn = activeDirect.inputStream,
-            remoteOut = activeDirect.outputStream,
-            clientSocket = clientSocket,
-            tunnelConnection = activeDirect,
-          )
+        if (directConn != null) {
+          directConn.use { activeDirect ->
+            activeDirect.outputStream.write(rewrittenBytes)
+            activeDirect.outputStream.flush()
+            MehDiag.recordBytesUploaded(rewrittenBytes.size.toLong())
+            relayStreams(
+              clientIn = clientIn,
+              clientOut = clientOut,
+              remoteIn = activeDirect.inputStream,
+              remoteOut = activeDirect.outputStream,
+              clientSocket = clientSocket,
+              tunnelConnection = activeDirect,
+            )
+          }
+          return
         }
-        return
       }
 
       val opened =
@@ -1642,7 +1706,8 @@ class LocalV2RayProxyServer(
           targetPort = port,
           initialPayload = rewrittenBytes,
           initialPayloadLen = rewrittenBytes.size,
-          awaitFirstResponse = serverPool.size > 1,
+          awaitFirstResponse =
+            serverPool.size > 1 && (method == "GET" || method == "HEAD"),
           firstReplyTimeoutMs = FIRST_BYTE_STALL_TIMEOUT_MS,
           fallbackIpv4 = rawHost,
         )
@@ -1753,7 +1818,15 @@ class LocalV2RayProxyServer(
         }
       }
     } catch (_: Exception) {
+      // No worker for the upload direction: a half-working stream would hang, so drop it.
       MehDiag.recordStreamRejected()
+      try {
+        clientSocket?.close()
+      } catch (_: Exception) {}
+      try {
+        tunnelConnection?.close()
+      } catch (_: Exception) {}
+      return
     }
 
     try {

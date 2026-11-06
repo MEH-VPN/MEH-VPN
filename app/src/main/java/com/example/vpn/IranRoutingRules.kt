@@ -1,9 +1,13 @@
 package com.example.vpn
 
+import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Direct Routing (Split-Tunneling) Engine for Iranian IPs and Domestic Domains:
@@ -226,25 +230,43 @@ object IranRoutingRules {
     return false
   }
 
+  /** System DNS has no timeout of its own; lookups run here so we can bound the wait. */
+  private val dnsExecutor: ExecutorService =
+    Executors.newCachedThreadPool { runnable ->
+      Thread(runnable, "meh-iran-dns").apply { isDaemon = true }
+    }
+
+  private const val DIRECT_DNS_TIMEOUT_MS = 2000L
+
   /**
    * Resolves an Iranian domain directly via local/system DNS to a real routable IPv4 address.
+   * Bounded to [DIRECT_DNS_TIMEOUT_MS]; returns null on timeout, failure, or when the answer is not
+   * a public address (e.g. an ISP sinkhole such as 10.10.34.x).
    */
   fun resolveIranianDomainDirectIpv4(domain: String): ByteArray? {
     val clean = domain.trim().trimEnd('.')
     if (clean.isEmpty()) return null
     V2RayOutboundClient.parseIpv4Bytes(clean)?.let { return it }
-    return try {
-      val addresses = InetAddress.getAllByName(clean)
-      for (addr in addresses) {
-        if (addr is Inet4Address) {
-          val bytes = addr.address
-          if (bytes != null && bytes.size == 4 && V2RayOutboundClient.isPublicRoutableIpv4(bytes)) {
-            return bytes
+    val future =
+      try {
+        dnsExecutor.submit<ByteArray?> {
+          for (addr in InetAddress.getAllByName(clean)) {
+            if (addr is Inet4Address) {
+              val bytes = addr.address
+              if (bytes != null && bytes.size == 4 && V2RayOutboundClient.isPublicRoutableIpv4(bytes)) {
+                return@submit bytes
+              }
+            }
           }
+          null
         }
+      } catch (_: Exception) {
+        return null
       }
-      null
+    return try {
+      future.get(DIRECT_DNS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
     } catch (_: Exception) {
+      future.cancel(true)
       null
     }
   }
@@ -277,7 +299,7 @@ object IranRoutingRules {
             ?.let { V2RayOutboundClient.parseIpv4Bytes(it) }
             ?.let { InetAddress.getByAddress(it) }
           ?: resolveIranianDomainDirectIpv4(targetHost)?.let { InetAddress.getByAddress(it) }
-          ?: InetAddress.getByName(targetHost)
+          ?: throw IOException("No public IPv4 for $targetHost")
 
       rawSocket.connect(InetSocketAddress(connectAddress, targetPort), timeoutMs)
       MehDiag.recordIranDirectBypass()

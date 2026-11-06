@@ -91,6 +91,9 @@ class MehViewModel(
   private var workflowJob: Job? = null
   private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
   private var cachedLastCandidates: List<V2RayConfig> = emptyList()
+
+  /** Candidates of the attempt in flight; persisted as "last server" only once actually connected. */
+  private var pendingSave: Pair<Context, List<V2RayConfig>>? = null
   private val logIdGenerator = AtomicLong(1L)
 
   init {
@@ -99,6 +102,8 @@ class MehViewModel(
         if (session.isRunning) {
           val wasAlreadyConnected = _uiState.value.phase == MehPhase.CONNECTED
           if (!wasAlreadyConnected) {
+            pendingSave?.let { (ctx, list) -> saveLastConnectedCandidates(ctx, list) }
+            pendingSave = null
             val cfg = _uiState.value.selectedConfig
             val srvName = cfg?.cleanTitle ?: session.serverName
             MehTelemetry.logServerConnected(
@@ -498,7 +503,7 @@ class MehViewModel(
     candidates: List<V2RayConfig>,
   ) {
     val config = candidates.first()
-    saveLastConnectedCandidates(context, candidates)
+    pendingSave = context.applicationContext to candidates
 
     appendLogLine(
       message = "راه‌اندازی تونل ارتباطی (${config.protocol.label}) ...",
