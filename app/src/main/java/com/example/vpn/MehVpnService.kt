@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
+import com.example.data.SoliSpiritRepository
 import com.example.R
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
@@ -23,6 +24,7 @@ import engine.Key
 import java.io.File
 import java.net.DatagramSocket
 import java.net.Socket
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,6 +56,11 @@ class MehVpnService : VpnService() {
   private var tun2SocksStarted: Boolean = false
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
+  private var refineJob: Job? = null
+
+  private val nodeRepository by lazy { SoliSpiritRepository() }
+  @Volatile private var cachedSubscriptionConfigs: List<V2RayConfig> = emptyList()
+  @Volatile private var cachedSubscriptionAtMs: Long = 0L
 
   @Volatile private var underlyingPhysicalNetwork: Network? = null
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -285,6 +292,7 @@ class MehVpnService : VpnService() {
         )
 
       startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
+      startBackgroundNodeRefinement(proxyServer, proxyPort)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -412,11 +420,162 @@ class MehVpnService : VpnService() {
       }
   }
 
+  /**
+   * Background node refinement. While the tunnel is up, periodically (and cheaply) re-tests the
+   * current node and a fresh sample of subscription nodes. If a clearly better node exists
+   * (`REFINE_SCORE_FACTOR` x score without a worse ping) or the current node fails the full test,
+   * the proxy pool is replaced with the better nodes first. Only *new* streams use the new pool;
+   * streams already relaying finish on the node they started on, so nothing is cut.
+   *
+   * Cost control: one wave (<= 80 nodes) at low concurrency per cycle, subscription lists cached
+   * for 30 minutes, twice the interval on metered networks, minimum gap between switches.
+   */
+  private fun startBackgroundNodeRefinement(proxyServer: LocalV2RayProxyServer, proxyPort: Int) {
+    refineJob?.cancel()
+    refineJob =
+      serviceScope.launch {
+        delay(REFINE_FIRST_DELAY_MS)
+        var lastSwitchAtMs = 0L
+        while (isActive) {
+          try {
+            if (System.currentTimeMillis() - lastSwitchAtMs >= REFINE_MIN_SWITCH_GAP_MS) {
+              if (refineNodesOnce(proxyServer, proxyPort)) {
+                lastSwitchAtMs = System.currentTimeMillis()
+              }
+            }
+          } catch (ce: CancellationException) {
+            throw ce
+          } catch (t: Throwable) {
+            android.util.Log.w("MehRefine", "refinement cycle failed: ${t.javaClass.simpleName}")
+          }
+          delay(if (isPhysicalNetworkMetered()) REFINE_INTERVAL_METERED_MS else REFINE_INTERVAL_MS)
+        }
+      }
+  }
+
+  /** Returns true when the proxy pool was replaced with a better node. */
+  private suspend fun refineNodesOnce(
+    proxyServer: LocalV2RayProxyServer,
+    proxyPort: Int,
+  ): Boolean {
+    val active = proxyServer.activeConfig
+    val others = proxyServer.currentPool().filter { it.endpointKey != active.endpointKey }
+
+    val subscription = loadSubscriptionConfigsCached()
+    val challengers = subscription.filter { it.endpointKey != active.endpointKey }
+    if (challengers.isEmpty() && others.isEmpty()) return false
+
+    // Score the node in use with exactly the same pipeline as the challengers (null = it failed).
+    val currentScored =
+      nodeRepository
+        .testAndSelectFastestCandidates(
+          configs = listOf(active),
+          maxCount = 1,
+          maxWaves = 1,
+          concurrency = 1,
+          verifyConcurrency = 1,
+        ) { _ -> }
+        .firstOrNull()
+
+    val fresh =
+      nodeRepository.testAndSelectFastestCandidates(
+        configs = challengers,
+        maxCount = REFINE_POOL_SIZE,
+        prioritizedSavedNodes = others,
+        maxWaves = 1,
+        concurrency = REFINE_CONCURRENCY,
+        verifyConcurrency = 2,
+      ) { _ -> }
+    val best = fresh.firstOrNull() ?: return false
+    if (best.endpointKey == active.endpointKey) return false
+
+    val isBetter =
+      if (currentScored == null) {
+        // Failed the full test: only abandon it if the keep-alive style probe fails as well.
+        V2RayOutboundClient.verifyHttpsAndDnsCapability(
+          config = active,
+          timeoutMs = 3500,
+          protector = { socket -> protectOutboundSocket(socket) },
+        ) == null
+      } else {
+        best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
+          best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE
+      }
+    if (!isBetter) return false
+
+    val newPool =
+      (fresh.take(REFINE_POOL_SIZE - 1) +
+          listOfNotNull(currentScored?.let { active }) +
+          others)
+        .distinctBy { it.endpointKey }
+        .take(REFINE_POOL_SIZE)
+    val newActive = proxyServer.replaceServerPool(newPool)
+    android.util.Log.i(
+      "MehRefine",
+      "switched ${active.address} (score=${currentScored?.speedScore ?: -1.0}) -> " +
+        "${newActive.address} (score=${best.speedScore}, ping=${best.latencyMs}ms)",
+    )
+
+    val name = newActive.cleanTitle.ifBlank { newActive.address }
+    _tunnelSession.value =
+      VpnTunnelSession(
+        isRunning = true,
+        serverName = name,
+        serverAddress = newActive.address,
+        serverPort = newActive.port,
+        protocolLabel = newActive.protocol.label,
+        currentPingMs = best.latencyMs,
+        localProxyPort = proxyPort,
+        errorMessage = null,
+      )
+    try {
+      val nm = getSystemService(NotificationManager::class.java)
+      nm?.notify(NOTIFICATION_ID, buildForegroundNotification(name, best.latencyMs))
+    } catch (_: Exception) {}
+    return true
+  }
+
+  private suspend fun loadSubscriptionConfigsCached(): List<V2RayConfig> {
+    val now = System.currentTimeMillis()
+    val cached = cachedSubscriptionConfigs
+    if (cached.isNotEmpty() && now - cachedSubscriptionAtMs < REFINE_CONFIG_CACHE_TTL_MS) {
+      return cached
+    }
+    val fetched =
+      try {
+        nodeRepository.fetchConfigsFromSoliSpirit { _ -> }
+      } catch (ce: CancellationException) {
+        throw ce
+      } catch (_: Exception) {
+        emptyList()
+      }
+    if (fetched.isNotEmpty()) {
+      cachedSubscriptionConfigs = fetched
+      cachedSubscriptionAtMs = now
+      return fetched
+    }
+    return cached
+  }
+
+  /** `isActiveNetworkMetered` would report the (non-metered) VPN, so ask the physical network. */
+  private fun isPhysicalNetworkMetered(): Boolean {
+    return try {
+      val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+      val network = underlyingPhysicalNetwork ?: return false
+      cm.getNetworkCapabilities(network)
+        ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+    } catch (_: Exception) {
+      false
+    }
+  }
+
   private fun stopTunnel(errorMsg: String? = null) {
     connectJob?.cancel()
     connectJob = null
     keepAliveJob?.cancel()
     keepAliveJob = null
+    refineJob?.cancel()
+    refineJob = null
     stopNativeTun2Socks()
     localProxyServer?.stop()
     localProxyServer = null
@@ -448,6 +607,7 @@ class MehVpnService : VpnService() {
   override fun onDestroy() {
     connectJob?.cancel()
     keepAliveJob?.cancel()
+    refineJob?.cancel()
     stopNativeTun2Socks()
     localProxyServer?.stop()
     try {
@@ -538,6 +698,23 @@ class MehVpnService : VpnService() {
 
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
+
+    /** Background node refinement: first check after 3 min, then every 10 min (20 on metered). */
+    private const val REFINE_FIRST_DELAY_MS = 3 * 60_000L
+    private const val REFINE_INTERVAL_MS = 10 * 60_000L
+    private const val REFINE_INTERVAL_METERED_MS = 20 * 60_000L
+
+    /** Never switch more often than this, so a noisy measurement cannot make the node flap. */
+    private const val REFINE_MIN_SWITCH_GAP_MS = 8 * 60_000L
+
+    /** A challenger must score at least this much higher... */
+    private const val REFINE_SCORE_FACTOR = 1.35
+
+    /** ...without having a ping more than 25% worse than the node in use. */
+    private const val REFINE_LATENCY_TOLERANCE = 1.25
+    private const val REFINE_POOL_SIZE = 6
+    private const val REFINE_CONCURRENCY = 6
+    private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
 
     /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
     private const val DIAG_LOG_INTERVAL_MS = 5_000L

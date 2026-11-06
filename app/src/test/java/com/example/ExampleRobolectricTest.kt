@@ -235,4 +235,27 @@ class ExampleRobolectricTest {
     val smartSsl = com.example.vpn.V2RayOutboundClient.createSmartSslContext("www.google.com", allowInsecureFallback = true)
     org.junit.Assert.assertNotNull(smartSsl)
   }
+
+  @Test
+  fun replaceServerPool_swapsActiveNodeAndKeepsOrder() {
+    fun cfg(n: Int) =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@node$n.example.org:443?encryption=none&security=tls&sni=node$n.example.org&type=ws&path=%2Fws#Node$n"
+      )!!
+    val server = com.example.vpn.LocalV2RayProxyServer(listOf(cfg(1), cfg(2)), protector = { true })
+    org.junit.Assert.assertEquals("node1.example.org", server.activeConfig.address)
+
+    val newActive = server.replaceServerPool(listOf(cfg(3), cfg(1), cfg(3)))
+
+    org.junit.Assert.assertEquals("node3.example.org", newActive.address)
+    org.junit.Assert.assertEquals("node3.example.org", server.activeConfig.address)
+    // duplicates removed, order kept (best first)
+    org.junit.Assert.assertEquals(
+      listOf("node3.example.org", "node1.example.org"),
+      server.currentPool().map { it.address },
+    )
+    // an empty replacement is ignored
+    org.junit.Assert.assertEquals("node3.example.org", server.replaceServerPool(emptyList()).address)
+    server.stop()
+  }
 }

@@ -664,9 +664,9 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Measures actual download throughput (in KB/s) over the V2Ray tunnel using a lightweight
-   * ~16 KB payload download from `www.google.com:443` so node scoring accounts for bandwidth
-   * in addition to ping latency.
+   * Measures actual download throughput (in KB/s) over the V2Ray tunnel by downloading up to
+   * [targetBytes] from `www.google.com:443`. Only the body transfer (first byte to last byte, capped
+   * at ~1.5 s) is timed, so node scoring reflects bandwidth rather than handshake latency.
    */
   fun measureSmallDownloadThroughputKbps(
     config: V2RayConfig,
@@ -681,6 +681,8 @@ object V2RayOutboundClient {
 
     return try {
       var totalBytesRead = 0
+      var bodyBytes = 0
+      var bodyNs = 0L
       val startNs = System.nanoTime()
       openTunnel(
         config = resolvedConfig,
@@ -707,15 +709,38 @@ object V2RayOutboundClient {
         tlsOut.write(req.toByteArray(Charsets.US_ASCII))
         tlsOut.flush()
 
-        val buf = ByteArray(4096)
-        while (totalBytesRead < targetBytes) {
-          val n = tlsIn.read(buf)
-          if (n <= 0) break
-          totalBytesRead += n
+        // Time only the body transfer (first byte -> last byte): connect + TLS handshake + request
+        // latency would otherwise dominate a small download and make this a second ping test.
+        val buf = ByteArray(8192)
+        var firstByteNs = 0L
+        var lastByteNs = 0L
+        var bytesAfterFirst = 0
+        try {
+          while (totalBytesRead < targetBytes) {
+            val n = tlsIn.read(buf)
+            if (n <= 0) break
+            val now = System.nanoTime()
+            if (firstByteNs == 0L) {
+              firstByteNs = now
+              tunnel.setReadTimeout(1200)
+            } else {
+              bytesAfterFirst += n
+            }
+            lastByteNs = now
+            totalBytesRead += n
+            if (now - firstByteNs > 1_500_000_000L) break
+          }
+        } catch (_: Exception) {
+          // Keep whatever arrived before the stall/timeout; it still says something about speed.
         }
+        bodyBytes = bytesAfterFirst
+        bodyNs = lastByteNs - firstByteNs
+      }
+      if (totalBytesRead < 512) return null
+      if (bodyBytes >= 8192 && bodyNs > 0L) {
+        return (bodyBytes / 1024.0) / (bodyNs / 1_000_000_000.0)
       }
       val elapsedSec = ((System.nanoTime() - startNs) / 1_000_000_000.0).coerceAtLeast(0.02)
-      if (totalBytesRead < 512) return null
       (totalBytesRead / 1024.0) / elapsedSec
     } catch (_: Exception) {
       null
