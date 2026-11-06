@@ -48,9 +48,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.History
-import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -74,6 +71,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -311,7 +309,7 @@ private fun ConnectLastServerPill(
       horizontalArrangement = Arrangement.Center,
     ) {
       Icon(
-        imageVector = Icons.Rounded.History,
+        painter = painterResource(R.drawable.ic_history_rounded),
         contentDescription = null,
         tint = NeonEmeraldGlow.copy(alpha = 0.85f),
         modifier = Modifier.size(18.dp),
@@ -488,7 +486,7 @@ private fun CircularPowerButton(
       contentAlignment = Alignment.Center,
     ) {
       Icon(
-        imageVector = Icons.Rounded.PowerSettingsNew,
+        painter = painterResource(R.drawable.ic_power_rounded),
         contentDescription = null,
         tint =
           when {

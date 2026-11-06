@@ -53,13 +53,6 @@ class SoliSpiritRepository(
 ) {
 
   companion object {
-    /**
-     * Multi-repository V2Ray subscription sources combining:
-     * 1. https://github.com/SoliSpirit/v2ray-configs
-     * 2. https://github.com/MohammadBahemmat/V2ray-Collector
-     * Equipped with jsDelivr, Fastly, GCore CDN mirrors + GitHub Raw endpoints so both sources
-     * are reachable even under strict network filtering.
-     */
     val SOLISPIRIT_SOURCES =
       listOf(
         // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
@@ -180,8 +173,7 @@ class SoliSpiritRepository(
 
   /**
    * Fetches V2Ray configs from both `SoliSpirit/v2ray-configs` and
-   * `MohammadBahemmat/V2ray-Collector` on GitHub (and CDN mirrors in parallel)
-   * and filters to clean protocols supported by the built-in V2Ray tunneling engine.
+   * `MohammadBahemmat/V2ray-Collector` on GitHub (and CDN mirrors in parallel).
    */
   suspend fun fetchConfigsFromSoliSpirit(
     onLogUpdate: (String) -> Unit,
@@ -212,7 +204,6 @@ class SoliSpiritRepository(
             }
           }
         }
-        // Ensure we run at least the first 2 batches (covering both Bahemmat & SoliSpirit VLESS/Trojan/Tested)
         if (batchIdx >= 1 && collected.size >= 380) {
           break
         }
@@ -225,20 +216,23 @@ class SoliSpiritRepository(
       collected.values.toList()
     }
 
-  /**
-   * Executes the primary [MehConnectionMethod.V2RAY_SOLISPIRIT] and returns verified candidate configs.
-   */
   suspend fun executeMethodAndSelectCandidates(
     method: MehConnectionMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
     maxCount: Int = 6,
+    prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
       onLogUpdate("دریافت لیست سرور ها")
       val configs = fetchConfigsFromSoliSpirit(onLogUpdate)
-      if (configs.isEmpty()) return@withContext emptyList()
+      if (configs.isEmpty() && prioritizedSavedNodes.isEmpty()) return@withContext emptyList()
       onLogUpdate("تست سرور ها")
-      testAndSelectFastestCandidates(configs, maxCount = maxCount, onLogUpdate = onLogUpdate)
+      testAndSelectFastestCandidates(
+        configs = configs,
+        maxCount = maxCount,
+        prioritizedSavedNodes = prioritizedSavedNodes,
+        onLogUpdate = onLogUpdate,
+      )
     }
 
   private fun fetchSingleSource(source: SubscriptionSource): List<V2RayConfig> {
@@ -268,18 +262,29 @@ class SoliSpiritRepository(
   }
 
   /**
-   * Two-stage benchmark:
+   * Two-stage benchmark with Prioritized Saved Healthy Nodes + Small Download Bandwidth Scoring:
+   * 0. If [prioritizedSavedNodes] are provided, tests them first (Wave 0) and prepends them to the
+   *    candidate list so known-good nodes are always evaluated first.
    * 1. Screens candidate V2Ray nodes concurrently with a fast HTTP 204 probe (`measureNodeSpeed`).
-   * 2. Verifies the fastest candidates with a 2nd independent connection over TLS/HTTPS port 443
-   *    (`V2RayOutboundClient.verifyHttpsAndDnsCapability`) + Instagram + X/Twitter + Telegram DC2.
+   * 2. Verifies the fastest candidates over TLS/HTTPS port 443 + Instagram + X/Twitter + Telegram DC2
+   *    + a small (~16 KB) download bandwidth test (`measureSmallDownloadThroughputKbps`) so nodes
+   *    are ranked by both latency AND real bandwidth.
    */
   suspend fun testAndSelectFastestCandidates(
     configs: List<V2RayConfig>,
     maxCount: Int = 6,
+    prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
-      val supported = configs.filter { V2RayOutboundClient.isSupportedByEngine(it) }.shuffled()
+      val validSaved = prioritizedSavedNodes.filter { V2RayOutboundClient.isSupportedByEngine(it) }
+      val savedKeys = validSaved.map { it.endpointKey }.toSet()
+      val remainingSupported =
+        configs
+          .filter { V2RayOutboundClient.isSupportedByEngine(it) && it.endpointKey !in savedKeys }
+          .shuffled()
+
+      val supported = validSaved + remainingSupported
       if (supported.isEmpty()) return@withContext emptyList()
 
       val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
@@ -321,7 +326,7 @@ class SoliSpiritRepository(
         if (stage1Passed.isEmpty()) continue
 
         val topToVerify = stage1Passed.take(12)
-        onLogUpdate("بررسی کیفیت اتصال سرورهای منتخب ...")
+        onLogUpdate("بررسی کیفیت و پهنای باند سرورهای منتخب ...")
 
         val stage2Results =
           coroutineScope {
@@ -330,11 +335,18 @@ class SoliSpiritRepository(
                 async {
                   stage2Semaphore.withPermit {
                     coroutineContext.ensureActive()
-                    kotlinx.coroutines.withTimeoutOrNull(4800L) {
+                    kotlinx.coroutines.withTimeoutOrNull(5200L) {
                       val httpsJob = async {
                         V2RayOutboundClient.verifyHttpsAndDnsCapability(
                           config = candidate,
                           timeoutMs = 3000,
+                        )
+                      }
+                      val bandwidthJob = async {
+                        V2RayOutboundClient.measureSmallDownloadThroughputKbps(
+                          config = candidate,
+                          timeoutMs = 2600,
+                          targetBytes = 16_384,
                         )
                       }
                       val twitterJob = async {
@@ -357,6 +369,7 @@ class SoliSpiritRepository(
                       }
 
                       val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
+                      val throughputKbps = bandwidthJob.await() ?: 45.0
                       val twitterLatency = twitterJob.await()
                       val instagramLatency = instagramJob.await()
                       val tgLatency = tgJob.await()
@@ -364,7 +377,7 @@ class SoliSpiritRepository(
                       val passedBothSocial = twitterLatency != null && instagramLatency != null
                       val passedAtLeastOneSocial = twitterLatency != null || instagramLatency != null
 
-                      val effectiveLatency =
+                      val rawEffectiveLatency =
                         when {
                           passedBothSocial && tgLatency != null ->
                             (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!! + tgLatency) / 5L
@@ -380,6 +393,13 @@ class SoliSpiritRepository(
                             ((candidate.latencyMs + httpsLatency) / 2L) + 1000L
                         }
 
+                      // Penalize choked/throttled nodes (< 15 KB/s) and reward high-throughput nodes
+                      val bandwidthPenaltyMs = if (throughputKbps < 15.0) 350L else 0L
+                      val effectiveLatency = (rawEffectiveLatency + bandwidthPenaltyMs).coerceAtLeast(1L)
+                      val compositeScore =
+                        (10_000.0 / effectiveLatency.toDouble()) +
+                          (throughputKbps.coerceAtMost(2500.0) * 0.85)
+
                       val tier =
                         when {
                           passedBothSocial -> 1
@@ -390,8 +410,8 @@ class SoliSpiritRepository(
                       Pair(
                         tier,
                         candidate.copy(
-                          latencyMs = effectiveLatency.coerceAtLeast(1L),
-                          speedScore = 10_000.0 / effectiveLatency.coerceAtLeast(1L).toDouble(),
+                          latencyMs = effectiveLatency,
+                          speedScore = compositeScore,
                         ),
                       )
                     }
@@ -433,7 +453,13 @@ class SoliSpiritRepository(
     pool: List<V2RayConfig>,
     maxCount: Int,
   ): List<V2RayConfig> {
-    val unique = pool.distinctBy { it.endpointKey }.sortedBy { it.latencyMs }
+    val unique =
+      pool
+        .distinctBy { it.endpointKey }
+        .sortedWith(
+          compareByDescending<V2RayConfig> { it.speedScore }
+            .thenBy { it.latencyMs }
+        )
     if (unique.size <= maxCount) return unique
 
     val selected = mutableListOf<V2RayConfig>()

@@ -16,32 +16,69 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManager
+import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 import kotlin.system.measureNanoTime
 
 /**
  * Real V2Ray Outbound Protocol Client supporting:
- * - Protocols: VLESS (v0), MVLESS (0x96), JVLESS (0x78), Trojan, and Direct Serverless
+ * - Protocols: VLESS (v0 TCP `0x01` & UDP `0x02`), MVLESS (0x96), JVLESS (0x78), Trojan, and Direct Serverless
  * - Transports: Raw TCP, RFC 6455 WebSocket (ws), and HTTPUpgrade (httpupgrade)
- * - Security:
- *   1. Direct native Android `SSLSocket` over real connected `Socket` (`direct_tls`)
- *   2. Fragmented TLS over `SSLEngine` + `FragmentWriterOutputStream` (`gfw_knocker`, `aether_sni_split`,
- *      `whitedns_byedpi`, `patterniha_frag_a`, `patterniha_frag_b`, `patterniha_sni_spoof`)
- *      — 100% compatible with Android 5–16 including Samsung S8 Android 9 Conscrypt.
+ * - Pre-Warmed Transport Pool: Maintains ready TLS + WebSocket connections per active V2Ray node
+ *   (before the VLESS/Trojan target header is written) so multi-connection bursts (Instagram, X)
+ *   skip the 2-RTT TLS+WS handshake completely.
+ * - Smart Strict-First TLS Validation: Validates X.509 certificate chains and SNI hostnames against
+ *   the Android system trust store first, falling back to permissive mode only for community nodes
+ *   with self-signed/mismatched origin certs.
  */
 object V2RayOutboundClient {
 
+  const val VLESS_CMD_TCP: Int = 0x01
+  const val VLESS_CMD_UDP: Int = 0x02
+
+  private const val MAX_PREWARMED_PER_NODE = 5
+  private const val PREWARMED_MAX_AGE_MS = 22_000L
+
   private val secureRandom = SecureRandom()
+
+  private val systemTrustManager: X509TrustManager? by lazy {
+    try {
+      val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+      tmf.init(null as KeyStore?)
+      tmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  val strictSslContext: SSLContext by lazy {
+    SSLContext.getInstance("TLS").apply {
+      val tm = systemTrustManager
+      if (tm != null) {
+        init(null, arrayOf<TrustManager>(tm), secureRandom)
+      } else {
+        init(null, null, secureRandom)
+      }
+    }
+  }
 
   val permissiveSslContext: SSLContext by lazy {
     val trustAll =
@@ -55,6 +92,112 @@ object V2RayOutboundClient {
     SSLContext.getInstance("TLS").apply {
       init(null, trustAll, secureRandom)
     }
+  }
+
+  /**
+   * Builds an `SSLContext` that performs full system X.509 certificate chain validation and
+   * hostname verification when the certificate and [sniHost] are valid, and only falls back to
+   * permissive acceptance when [allowInsecureFallback] is true and strict verification fails.
+   */
+  fun createSmartSslContext(
+    sniHost: String,
+    allowInsecureFallback: Boolean = true,
+  ): SSLContext {
+    val cleanSni = sniHost.trim().trimEnd('.').lowercase()
+    val defaultTm = systemTrustManager
+    if (defaultTm == null) {
+      return if (allowInsecureFallback) permissiveSslContext else strictSslContext
+    }
+
+    val smartTrustManager =
+      object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+          defaultTm.checkClientTrusted(chain, authType)
+        }
+
+        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+          if (chain.isNullOrEmpty()) {
+            if (allowInsecureFallback) {
+              MehDiag.recordTlsPermissiveFallback()
+              return
+            }
+            throw CertificateException("Empty server certificate chain")
+          }
+          try {
+            defaultTm.checkServerTrusted(chain, authType)
+            if (cleanSni.isNotEmpty() && parseIpv4Bytes(cleanSni) == null && !cleanSni.contains(':')) {
+              val leaf = chain[0]
+              if (!verifyCertificateHostname(cleanSni, leaf)) {
+                throw CertificateException("Hostname $cleanSni does not match certificate SAN/CN")
+              }
+            }
+            MehDiag.recordTlsStrictVerified()
+          } catch (ce: CertificateException) {
+            if (allowInsecureFallback) {
+              MehDiag.recordTlsPermissiveFallback()
+            } else {
+              throw ce
+            }
+          } catch (e: Exception) {
+            if (allowInsecureFallback) {
+              MehDiag.recordTlsPermissiveFallback()
+            } else {
+              throw CertificateException("TLS trust check failed: ${e.message}", e)
+            }
+          }
+        }
+
+        override fun getAcceptedIssuers(): Array<X509Certificate> = defaultTm.acceptedIssuers
+      }
+
+    return SSLContext.getInstance("TLS").apply {
+      init(null, arrayOf<TrustManager>(smartTrustManager), secureRandom)
+    }
+  }
+
+  internal fun verifyCertificateHostname(hostname: String, certificate: X509Certificate): Boolean {
+    val cleanHost = hostname.trim().trimEnd('.').lowercase()
+    if (cleanHost.isEmpty()) return false
+    return try {
+      val altNames = certificate.subjectAlternativeNames
+      if (altNames != null) {
+        for (entry in altNames) {
+          if (entry != null && entry.size >= 2) {
+            val type = entry[0] as? Int ?: continue
+            val value = (entry[1] as? String)?.lowercase()?.trimEnd('.') ?: continue
+            if (type == 2 || type == 7) { // dNSName (2) or iPAddress (7)
+              if (matchesWildcardPattern(cleanHost, value)) return true
+            }
+          }
+        }
+      }
+      val subjectPrincipal = certificate.subjectX500Principal?.name.orEmpty()
+      val cnMatch =
+        Regex("CN=([^,]+)", RegexOption.IGNORE_CASE)
+          .find(subjectPrincipal)
+          ?.groupValues
+          ?.getOrNull(1)
+          ?.trim()
+          ?.lowercase()
+      if (!cnMatch.isNullOrEmpty() && matchesWildcardPattern(cleanHost, cnMatch)) {
+        return true
+      }
+      HttpsURLConnection.getDefaultHostnameVerifier().verify(cleanHost, null)
+    } catch (_: Exception) {
+      false
+    }
+  }
+
+  private fun matchesWildcardPattern(hostname: String, pattern: String): Boolean {
+    if (hostname == pattern) return true
+    if (pattern.startsWith("*.")) {
+      val suffix = pattern.removePrefix("*.")
+      if (hostname.endsWith(".$suffix")) {
+        val prefix = hostname.removeSuffix(".$suffix")
+        return !prefix.contains('.') && prefix.isNotEmpty()
+      }
+    }
+    return false
   }
 
   class TunnelConnection(
@@ -72,6 +215,23 @@ object V2RayOutboundClient {
       } catch (_: Exception) {}
     }
 
+    /**
+     * Propagates client write-side closure (`EOF`) to the remote V2Ray node stream so the node
+     * closes the upstream target connection promptly instead of keeping it open for 180 seconds.
+     */
+    fun closeOutbound() {
+      try {
+        outputStream.flush()
+      } catch (_: Exception) {}
+      try {
+        if (tlsSocket != null) {
+          tlsSocket.close()
+        } else {
+          underlyingSocket.shutdownOutput()
+        }
+      } catch (_: Exception) {}
+    }
+
     override fun close() {
       try {
         outputStream.close()
@@ -85,6 +245,141 @@ object V2RayOutboundClient {
       try {
         underlyingSocket.close()
       } catch (_: Exception) {}
+    }
+  }
+
+  /**
+   * Represents an already-handshaked TCP + TLS + WebSocket/HTTPUpgrade transport connection to a
+   * V2Ray node BEFORE the VLESS/Trojan header is written.
+   */
+  private data class PrewarmedNodeTransport(
+    val rawSocket: Socket,
+    val tlsSocket: SSLSocket?,
+    val transportIn: InputStream,
+    val transportOut: OutputStream,
+    val createdAtMs: Long = System.currentTimeMillis(),
+  ) {
+    fun isHealthy(): Boolean {
+      val age = System.currentTimeMillis() - createdAtMs
+      if (age > PREWARMED_MAX_AGE_MS) return false
+      if (rawSocket.isClosed || !rawSocket.isConnected || rawSocket.isInputShutdown || rawSocket.isOutputShutdown) {
+        return false
+      }
+      if (tlsSocket != null && (tlsSocket.isClosed || !tlsSocket.isConnected)) {
+        return false
+      }
+      return true
+    }
+
+    fun closeQuietly() {
+      try {
+        transportOut.close()
+      } catch (_: Exception) {}
+      try {
+        transportIn.close()
+      } catch (_: Exception) {}
+      try {
+        tlsSocket?.close()
+      } catch (_: Exception) {}
+      try {
+        rawSocket.close()
+      } catch (_: Exception) {}
+    }
+  }
+
+  private val prewarmedPools = ConcurrentHashMap<String, ConcurrentLinkedQueue<PrewarmedNodeTransport>>()
+  private val inFlightWarmups = ConcurrentHashMap<String, AtomicInteger>()
+
+  private val warmupExecutor: ExecutorService =
+    ThreadPoolExecutor(
+      2,
+      8,
+      30L,
+      TimeUnit.SECONDS,
+      LinkedBlockingQueue(32),
+      { runnable ->
+        Thread(runnable, "meh-transport-prewarmer").apply {
+          isDaemon = true
+        }
+      },
+      ThreadPoolExecutor.DiscardPolicy(),
+    )
+
+  /**
+   * Asynchronously pre-warms up to [targetCount] ready TLS+WS connections for [config] so
+   * subsequent TCP streams (e.g., Instagram feed images/videos) open in 0 RTT.
+   */
+  fun warmUpNodePoolAsync(
+    config: V2RayConfig,
+    protector: ((Socket) -> Boolean)?,
+    targetCount: Int = 3,
+  ) {
+    if (!canUsePrewarmedPool(config)) return
+    val key = config.endpointKey
+    val queue = prewarmedPools.computeIfAbsent(key) { ConcurrentLinkedQueue() }
+    pruneExpiredFromQueue(queue)
+
+    val inFlight = inFlightWarmups.computeIfAbsent(key) { AtomicInteger(0) }
+    val currentTotal = queue.size + inFlight.get()
+    val needed = (targetCount.coerceAtMost(MAX_PREWARMED_PER_NODE) - currentTotal).coerceAtLeast(0)
+    repeat(needed) {
+      inFlight.incrementAndGet()
+      warmupExecutor.execute {
+        try {
+          if (queue.size < MAX_PREWARMED_PER_NODE) {
+            val transport = dialNodeTransport(config, timeoutMs = 4500, protector = protector)
+            queue.offer(transport)
+            MehDiag.recordPrewarmedPoolCreated()
+          }
+        } catch (_: Exception) {
+        } finally {
+          inFlight.decrementAndGet()
+        }
+      }
+    }
+  }
+
+  fun evictPrewarmedTransports(endpointKey: String) {
+    prewarmedPools.remove(endpointKey)?.let { queue ->
+      while (true) {
+        val item = queue.poll() ?: break
+        item.closeQuietly()
+      }
+    }
+  }
+
+  fun clearAllPrewarmedTransports() {
+    val keys = prewarmedPools.keys.toList()
+    for (k in keys) {
+      evictPrewarmedTransports(k)
+    }
+  }
+
+  private fun canUsePrewarmedPool(config: V2RayConfig): Boolean {
+    if (config.protocol == V2RayProtocol.SERVERLESS) return false
+    return isSupportedByEngine(config)
+  }
+
+  private fun pruneExpiredFromQueue(queue: ConcurrentLinkedQueue<PrewarmedNodeTransport>) {
+    val iter = queue.iterator()
+    while (iter.hasNext()) {
+      val item = iter.next()
+      if (!item.isHealthy()) {
+        iter.remove()
+        item.closeQuietly()
+      }
+    }
+  }
+
+  private fun pollPrewarmedTransport(config: V2RayConfig): PrewarmedNodeTransport? {
+    val queue = prewarmedPools[config.endpointKey] ?: return null
+    while (true) {
+      val candidate = queue.poll() ?: return null
+      if (candidate.isHealthy()) {
+        return candidate
+      } else {
+        candidate.closeQuietly()
+      }
     }
   }
 
@@ -116,8 +411,6 @@ object V2RayOutboundClient {
     if (config.pbk.isNotEmpty()) {
       return false
     }
-    // The VLESS header below always carries an empty addons block. A server whose user has
-    // `flow=xtls-rprx-vision` rejects such requests, so the stream "connects" but never carries data.
     if (isVlessFamily && config.flow.isNotBlank()) {
       return false
     }
@@ -228,7 +521,7 @@ object V2RayOutboundClient {
             )
           val (tlsIn, tlsOut) =
             GfwKnockerXrayCore.openSslEngineOverStreams(
-              sslContext = permissiveSslContext,
+              sslContext = createSmartSslContext(hostStr, allowInsecureFallback = true),
               rawIn = raw.getInputStream(),
               rawOut = fragOut,
               sniHost = hostStr,
@@ -279,6 +572,7 @@ object V2RayOutboundClient {
             targetPort = 80,
             timeoutMs = timeoutMs,
             protector = protector,
+            usePrewarmedPool = false,
           ).use { conn ->
             val probeRequest =
               "GET /generate_204 HTTP/1.1\r\n" +
@@ -315,7 +609,7 @@ object V2RayOutboundClient {
   /**
    * Stage 2 Strict Verification: Opens a SECOND independent V2Ray tunnel to `www.google.com:443`,
    * performs a real end-to-end TLS handshake with `www.google.com` INSIDE the V2Ray tunnel using
-   * `SSLEngine` (Android 9 safe!), and verifies `GET /generate_204 -> HTTP/1.1 204`.
+   * `SSLEngine` with strict-first certificate validation, and verifies `GET /generate_204 -> HTTP/1.1 204`.
    */
   fun verifyHttpsAndDnsCapability(
     config: V2RayConfig,
@@ -336,10 +630,11 @@ object V2RayOutboundClient {
             targetPort = 443,
             timeoutMs = timeoutMs,
             protector = protector,
+            usePrewarmedPool = false,
           ).use { tunnel ->
             val (tlsIn, tlsOut) =
               GfwKnockerXrayCore.openSslEngineOverStreams(
-                sslContext = permissiveSslContext,
+                sslContext = createSmartSslContext("www.google.com", allowInsecureFallback = true),
                 rawIn = tunnel.inputStream,
                 rawOut = tunnel.outputStream,
                 sniHost = "www.google.com",
@@ -369,6 +664,65 @@ object V2RayOutboundClient {
   }
 
   /**
+   * Measures actual download throughput (in KB/s) over the V2Ray tunnel using a lightweight
+   * ~16 KB payload download from `www.google.com:443` so node scoring accounts for bandwidth
+   * in addition to ping latency.
+   */
+  fun measureSmallDownloadThroughputKbps(
+    config: V2RayConfig,
+    timeoutMs: Int = 2600,
+    targetBytes: Int = 16_384,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Double? {
+    if (!isSupportedByEngine(config)) return null
+    val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
+    if (resolvedIp.isEmpty()) return null
+    val resolvedConfig = config.copy(resolvedIp = resolvedIp)
+
+    return try {
+      var totalBytesRead = 0
+      val startNs = System.nanoTime()
+      openTunnel(
+        config = resolvedConfig,
+        targetHost = "www.google.com",
+        targetPort = 443,
+        timeoutMs = timeoutMs,
+        protector = protector,
+        usePrewarmedPool = false,
+      ).use { tunnel ->
+        val (tlsIn, tlsOut) =
+          GfwKnockerXrayCore.openSslEngineOverStreams(
+            sslContext = createSmartSslContext("www.google.com", allowInsecureFallback = true),
+            rawIn = tunnel.inputStream,
+            rawOut = tunnel.outputStream,
+            sniHost = "www.google.com",
+            port = 443,
+          )
+        val req =
+          "GET / HTTP/1.1\r\n" +
+            "Host: www.google.com\r\n" +
+            "User-Agent: Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36\r\n" +
+            "Accept-Encoding: identity\r\n" +
+            "Connection: close\r\n\r\n"
+        tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+        tlsOut.flush()
+
+        val buf = ByteArray(4096)
+        while (totalBytesRead < targetBytes) {
+          val n = tlsIn.read(buf)
+          if (n <= 0) break
+          totalBytesRead += n
+        }
+      }
+      val elapsedSec = ((System.nanoTime() - startNs) / 1_000_000_000.0).coerceAtLeast(0.02)
+      if (totalBytesRead < 512) return null
+      (totalBytesRead / 1024.0) / elapsedSec
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  /**
    * Verifies direct connection capability to Telegram Data Centers (e.g. 149.154.167.50:443).
    */
   fun verifyTelegramCapability(
@@ -390,6 +744,7 @@ object V2RayOutboundClient {
             targetPort = 443,
             timeoutMs = timeoutMs,
             protector = protector,
+            usePrewarmedPool = false,
           ).use { conn ->
             conn.outputStream.write(
               byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte())
@@ -405,8 +760,7 @@ object V2RayOutboundClient {
 
   /**
    * Verifies that this V2Ray server can establish a real end-to-end TLS 443 session to Twitter/X
-   * (`api.x.com:443`) and receive an HTTP response. This filters out restricted Cloudflare Workers
-   * that pass `www.google.com` but reject/drop connections to Twitter/X!
+   * (`api.x.com:443`) and receive an HTTP response.
    */
   fun verifySocialMediaCapability(
     config: V2RayConfig,
@@ -461,10 +815,11 @@ object V2RayOutboundClient {
             targetPort = 443,
             timeoutMs = timeoutMs,
             protector = protector,
+            usePrewarmedPool = false,
           ).use { tunnel ->
             val (tlsIn, tlsOut) =
               GfwKnockerXrayCore.openSslEngineOverStreams(
-                sslContext = permissiveSslContext,
+                sslContext = createSmartSslContext(targetHost, allowInsecureFallback = true),
                 rawIn = tunnel.inputStream,
                 rawOut = tunnel.outputStream,
                 sniHost = targetHost,
@@ -494,31 +849,16 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Establishes an outbound V2Ray tunnel to [targetHost]:[targetPort] through [config].
+   * Dials the underlying TCP + TLS + WebSocket/HTTPUpgrade transport to [config] WITHOUT sending
+   * the VLESS/Trojan header yet. This allows pre-warming a pool of ready connections per node.
    */
-  fun openTunnel(
+  private fun dialNodeTransport(
     config: V2RayConfig,
-    targetHost: String,
-    targetPort: Int,
-    timeoutMs: Int = 7000,
-    protector: ((Socket) -> Boolean)? = null,
-    fallbackIpv4: String? = null,
-  ): TunnelConnection {
-    if (config.protocol == V2RayProtocol.SERVERLESS) {
-      return openDirectServerlessFragmentTunnel(
-        config = config,
-        targetHost = targetHost,
-        targetPort = targetPort,
-        timeoutMs = timeoutMs,
-        protector = protector,
-        fallbackIpv4 = fallbackIpv4,
-      )
-    }
-
+    timeoutMs: Int,
+    protector: ((Socket) -> Boolean)?,
+  ): PrewarmedNodeTransport {
     val rawSocket = Socket()
     try {
-      // Touching reuseAddress forces Android's SocketImpl to allocate its underlying OS file descriptor
-      // immediately WITHOUT calling bind(), so VpnService.protect(rawSocket) succeeds prior to connect().
       try {
         rawSocket.reuseAddress
       } catch (_: Exception) {}
@@ -578,34 +918,12 @@ object V2RayOutboundClient {
         GfwKnockerXrayCore.performHttpUpgrade(config, transportIn, transportOut)
       }
 
-      // IMPORTANT: Keep rawSocket.soTimeout = timeoutMs and activeSslSocket.soTimeout = timeoutMs
-      // active so probe checks (measureRealProxyDelay, verifyHttpsAndDnsCapability, verifySocialMediaCapability)
-      // and first-response failover checks never hang on blackholed V2Ray nodes!
-      return when (config.protocol) {
-        V2RayProtocol.VLESS,
-        V2RayProtocol.MVLESS,
-        V2RayProtocol.JVLESS ->
-          setupVlessStream(
-            rawSocket,
-            activeSslSocket,
-            transportIn,
-            transportOut,
-            config,
-            targetHost,
-            targetPort,
-          )
-        V2RayProtocol.TROJAN ->
-          setupTrojanStream(
-            rawSocket,
-            activeSslSocket,
-            transportIn,
-            transportOut,
-            config,
-            targetHost,
-            targetPort,
-          )
-        else -> throw IOException("Unsupported protocol: ${config.protocol}")
-      }
+      return PrewarmedNodeTransport(
+        rawSocket = rawSocket,
+        tlsSocket = activeSslSocket,
+        transportIn = transportIn,
+        transportOut = transportOut,
+      )
     } catch (e: Exception) {
       try {
         rawSocket.close()
@@ -615,9 +933,164 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Direct Serverless Fragmented Tunnel (`patterniha/Serverless-for-Iran`, `CluvexStudio/Aether`, `WhiteDNS`):
-   * Connects directly to [targetHost]:[targetPort] using unpoisoned DNS (tunnel cache / [fallbackIpv4] / DoH)
-   * and wraps the outbound TCP stream in `GfwKnockerXrayCore.FragmentWriterOutputStream`.
+   * Establishes an outbound V2Ray tunnel to [targetHost]:[targetPort] through [config].
+   * When [usePrewarmedPool] is true, consumes a pre-warmed TLS+WS transport if available (0-RTT)
+   * and schedules background replenishment.
+   */
+  fun openTunnel(
+    config: V2RayConfig,
+    targetHost: String,
+    targetPort: Int,
+    timeoutMs: Int = 7000,
+    protector: ((Socket) -> Boolean)? = null,
+    fallbackIpv4: String? = null,
+    usePrewarmedPool: Boolean = true,
+    vlessCommand: Int = VLESS_CMD_TCP,
+  ): TunnelConnection {
+    MehDiag.recordTcpConnectAttempt()
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      return try {
+        openDirectServerlessFragmentTunnel(
+          config = config,
+          targetHost = targetHost,
+          targetPort = targetPort,
+          timeoutMs = timeoutMs,
+          protector = protector,
+          fallbackIpv4 = fallbackIpv4,
+        ).also { MehDiag.recordTcpConnectSuccess() }
+      } catch (e: Exception) {
+        MehDiag.recordTcpConnectFailure()
+        throw e
+      }
+    }
+
+    val prewarmed =
+      if (usePrewarmedPool && canUsePrewarmedPool(config)) {
+        pollPrewarmedTransport(config)
+      } else {
+        null
+      }
+
+    val transport =
+      if (prewarmed != null) {
+        MehDiag.recordPrewarmedPoolHit()
+        warmUpNodePoolAsync(config, protector)
+        prewarmed
+      } else {
+        if (usePrewarmedPool && canUsePrewarmedPool(config)) {
+          MehDiag.recordPrewarmedPoolMiss()
+        }
+        try {
+          dialNodeTransport(config, timeoutMs, protector).also {
+            if (usePrewarmedPool && canUsePrewarmedPool(config)) {
+              warmUpNodePoolAsync(config, protector)
+            }
+          }
+        } catch (e: Exception) {
+          MehDiag.recordTcpConnectFailure()
+          throw e
+        }
+      }
+
+    try {
+      try {
+        transport.rawSocket.soTimeout = timeoutMs
+      } catch (_: Exception) {}
+      try {
+        transport.tlsSocket?.soTimeout = timeoutMs
+      } catch (_: Exception) {}
+
+      val conn =
+        when (config.protocol) {
+          V2RayProtocol.VLESS,
+          V2RayProtocol.MVLESS,
+          V2RayProtocol.JVLESS ->
+            setupVlessStream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+              command = vlessCommand,
+            )
+          V2RayProtocol.TROJAN ->
+            setupTrojanStream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+            )
+          else -> throw IOException("Unsupported protocol: ${config.protocol}")
+        }
+      MehDiag.recordTcpConnectSuccess()
+      return conn
+    } catch (e: Exception) {
+      transport.closeQuietly()
+      MehDiag.recordTcpConnectFailure()
+      throw e
+    }
+  }
+
+  /**
+   * Opens a VLESS UDP (`Command = 0x02`) tunnel to [targetHost]:[targetPort] and exchanges a
+   * length-framed UDP datagram (`[2-byte length][payload]`).
+   */
+  fun exchangeVlessUdpDatagram(
+    config: V2RayConfig,
+    targetHost: String,
+    targetPort: Int,
+    udpPayload: ByteArray,
+    timeoutMs: Int = 3500,
+    protector: ((Socket) -> Boolean)? = null,
+  ): ByteArray? {
+    val isVlessFamily =
+      config.protocol == V2RayProtocol.VLESS ||
+        config.protocol == V2RayProtocol.MVLESS ||
+        config.protocol == V2RayProtocol.JVLESS
+    if (!isVlessFamily || udpPayload.isEmpty() || udpPayload.size > 65507) return null
+
+    return try {
+      openTunnel(
+        config = config,
+        targetHost = targetHost,
+        targetPort = targetPort,
+        timeoutMs = timeoutMs,
+        protector = protector,
+        usePrewarmedPool = true,
+        vlessCommand = VLESS_CMD_UDP,
+      ).use { tunnel ->
+        tunnel.setReadTimeout(timeoutMs)
+        val framedOut = ByteArray(2 + udpPayload.size)
+        framedOut[0] = ((udpPayload.size ushr 8) and 0xFF).toByte()
+        framedOut[1] = (udpPayload.size and 0xFF).toByte()
+        System.arraycopy(udpPayload, 0, framedOut, 2, udpPayload.size)
+        tunnel.outputStream.write(framedOut)
+        tunnel.outputStream.flush()
+        MehDiag.recordBytesUploaded(framedOut.size.toLong())
+
+        val lenHeader = ByteArray(2)
+        val dataIn = DataInputStream(tunnel.inputStream)
+        dataIn.readFully(lenHeader)
+        val respLen = ((lenHeader[0].toInt() and 0xFF) shl 8) or (lenHeader[1].toInt() and 0xFF)
+        if (respLen !in 1..65507) return null
+        val respPayload = ByteArray(respLen)
+        dataIn.readFully(respPayload)
+        MehDiag.recordBytesDownloaded(respLen.toLong())
+        MehDiag.recordUdpVlessRelayedPacket()
+        respPayload
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  /**
+   * Direct Serverless Fragmented Tunnel (`patterniha/Serverless-for-Iran`, `CluvexStudio/Aether`, `WhiteDNS`).
    */
   private fun openDirectServerlessFragmentTunnel(
     config: V2RayConfig,
@@ -680,12 +1153,8 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Establishes TLS over [rawSocket]:
-   * - For standard V2Ray (`direct_tls`), uses Android's native `SSLSocketFactory.createSocket(rawSocket, ...)`
-   *   directly on the real OS socket (`rawSocket`), which has a valid `FileDescriptor` on Android 5–16!
-   * - For fragmented profiles (`gfw_knocker`, `aether_sni_split`, `whitedns_byedpi`, `patterniha_*`),
-   *   uses `GfwKnockerXrayCore.openSslEngineOverStreams` over `FragmentWriterOutputStream(rawSocket.getOutputStream())`
-   *   so Conscrypt never touches `FileDescriptor` on a wrapper socket!
+   * Establishes TLS over [rawSocket] using [createSmartSslContext] so valid SNI/certificates are
+   * strictly verified first before falling back to permissive mode on self-signed community nodes.
    */
   private fun establishTlsStreams(
     rawSocket: Socket,
@@ -713,12 +1182,14 @@ object V2RayOutboundClient {
         emptyList()
       }
 
+    val smartSsl = createSmartSslContext(sniHost, allowInsecureFallback = true)
+
     // 1. Standard direct TLS mode: uses real connected rawSocket directly with Android Conscrypt SSLSocket
     if (config.fragmentProfile.equals("direct_tls", ignoreCase = true) ||
       config.fragmentProfile.isBlank()
     ) {
       val sslSocket =
-        permissiveSslContext.socketFactory.createSocket(
+        smartSsl.socketFactory.createSocket(
           rawSocket,
           sniHost,
           config.port,
@@ -756,7 +1227,7 @@ object V2RayOutboundClient {
       )
     val (tlsIn, tlsOut) =
       GfwKnockerXrayCore.openSslEngineOverStreams(
-        sslContext = permissiveSslContext,
+        sslContext = smartSsl,
         rawIn = BufferedInputStream(rawSocket.getInputStream(), 16384),
         rawOut = fragmentedOut,
         sniHost = sniHost,
@@ -827,6 +1298,7 @@ object V2RayOutboundClient {
     config: V2RayConfig,
     targetHost: String,
     targetPort: Int,
+    command: Int = VLESS_CMD_TCP,
   ): TunnelConnection {
     val uuidBytes =
       parseUuidBytes(config.authId) ?: throw IOException("Invalid VLESS UUID: ${config.authId}")
@@ -837,7 +1309,7 @@ object V2RayOutboundClient {
     header.write(wireVersion) // 0x00 (VLESS), 150/0x96 (MVLESS), or 0x78 (JVLESS)
     header.write(uuidBytes) // 16-byte UUID
     header.write(0x00) // Addons length = 0
-    header.write(0x01) // Command = 0x01 (TCP)
+    header.write(command and 0xFF) // Command = 0x01 (TCP) or 0x02 (UDP)
     header.write((targetPort ushr 8) and 0xFF) // Port high byte
     header.write(targetPort and 0xFF) // Port low byte
 

@@ -170,7 +170,6 @@ class MehVpnService : VpnService() {
           }
         }
 
-        // Must call startForeground synchronously on main thread before launching IO work
         createNotificationChannel()
         val notification = buildForegroundNotification(serverName, initialPing)
         startForeground(NOTIFICATION_ID, notification)
@@ -200,7 +199,6 @@ class MehVpnService : VpnService() {
     try {
       File(filesDir, "active_v2ray_config.json").writeText(coreJson)
 
-      // Stop any previous tunnel session cleanly
       stopNativeTun2Socks()
       localProxyServer?.stop()
       try {
@@ -229,9 +227,6 @@ class MehVpnService : VpnService() {
       localProxyServer = proxyServer
 
       // 2. Establish full-device Android IPv4 TUN interface (0.0.0.0/0) excluding our own app.
-      // Keeping the TUN interface strictly IPv4-only ensures Android's Bionic `getaddrinfo`
-      // (`AI_ADDRCONFIG` / `have_ipv6 == false`) only queries `A` (IPv4) records even when
-      // Android 9 Private DNS (DoT) is active, and prevents apps from attempting IPv6 connections.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
@@ -271,8 +266,6 @@ class MehVpnService : VpnService() {
           errorMessage = t.localizedMessage ?: "Failed to start native tun2socks",
           throwable = t,
         )
-        // Without tun2socks nothing reads the TUN fd, so every packet is black-holed while the
-        // UI would still report "connected". Abort so the outer catch calls stopTunnel(error).
         throw IllegalStateException(
           "tun2socks start failed: ${t.localizedMessage ?: t.javaClass.simpleName}",
           t,
@@ -311,6 +304,15 @@ class MehVpnService : VpnService() {
     }
   }
 
+  /**
+   * Smart Keep-Alive & Automatic Node Failover Loop:
+   * - Runs every 45 seconds (instead of 15s) to conserve battery and data.
+   * - Skips the TLS probe completely when real download traffic has flowed in the last 30 seconds
+   *   (`MehDiag.hasRecentDownloadTraffic(30_000L)`).
+   * - If 2 consecutive keep-alive probes fail on an idle connection, automatically rotates to the
+   *   next healthy node in `serverPool` via `proxyServer.switchToNextHealthyNode("keep_alive_timeout")`.
+   * - Sends Firebase active session heartbeat only once every ~10 minutes (13 ticks x 45s = 585s).
+   */
   private fun startProtectedKeepAliveProbe(
     proxyServer: LocalV2RayProxyServer,
     serverName: String,
@@ -325,27 +327,50 @@ class MehVpnService : VpnService() {
         var tickCount = 0
         var consecutiveFailures = 0
         while (isActive) {
-          delay(15_000L)
+          delay(KEEP_ALIVE_INTERVAL_MS)
           tickCount++
-          val activeCfg = proxyServer.activeConfig
-          val probedPing =
-            V2RayOutboundClient.verifyHttpsAndDnsCapability(
-              config = activeCfg,
-              timeoutMs = 3500,
-              protector = { socket -> protectOutboundSocket(socket) },
-            )
-          if (probedPing != null) {
-            lastPing = probedPing
+          var activeCfg = proxyServer.activeConfig
+
+          if (MehDiag.hasRecentDownloadTraffic(ACTIVE_TRAFFIC_SKIP_WINDOW_MS)) {
+            MehDiag.recordKeepAliveSkippedActiveTraffic()
             consecutiveFailures = 0
           } else {
-            consecutiveFailures++
-            if (consecutiveFailures == 3) {
-              MehTelemetry.logError(
-                stage = "keep_alive_probe",
-                errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+            MehDiag.recordKeepAliveProbeRun()
+            val probedPing =
+              V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                config = activeCfg,
+                timeoutMs = 3500,
+                protector = { socket -> protectOutboundSocket(socket) },
               )
+            if (probedPing != null) {
+              lastPing = probedPing
+              consecutiveFailures = 0
+            } else {
+              consecutiveFailures++
+              if (consecutiveFailures >= CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER) {
+                val switchedCfg = proxyServer.switchToNextHealthyNode("keep_alive_timeout")
+                if (switchedCfg.endpointKey != activeCfg.endpointKey) {
+                  activeCfg = switchedCfg
+                  consecutiveFailures = 0
+                  val verifySwitched =
+                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                      config = activeCfg,
+                      timeoutMs = 3500,
+                      protector = { socket -> protectOutboundSocket(socket) },
+                    )
+                  if (verifySwitched != null) {
+                    lastPing = verifySwitched
+                  }
+                } else if (consecutiveFailures == 3) {
+                  MehTelemetry.logError(
+                    stage = "keep_alive_probe",
+                    errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+                  )
+                }
+              }
             }
           }
+
           val effectiveServerName = activeCfg.cleanTitle.ifBlank { serverName }
           _tunnelSession.value =
             VpnTunnelSession(
@@ -359,8 +384,13 @@ class MehVpnService : VpnService() {
               errorMessage = null,
             )
 
-          // Report active VPN session heartbeat every 60 seconds (4 x 15s) to Firebase Analytics
-          if (tickCount % 4 == 0) {
+          try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(NOTIFICATION_ID, buildForegroundNotification(effectiveServerName, lastPing))
+          } catch (_: Exception) {}
+
+          // Report active VPN session heartbeat every ~10 minutes (13 x 45s = 585s) to save battery/data
+          if (tickCount % HEARTBEAT_EVERY_N_TICKS == 0) {
             val uptimeSeconds = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(1L)
             MehTelemetry.logActiveSessionHeartbeat(
               serverName = effectiveServerName,
@@ -499,6 +529,18 @@ class MehVpnService : VpnService() {
 
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
+
+    /** Keep-alive probe interval (45s instead of 15s for battery/data savings). */
+    private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
+
+    /** Skip keep-alive probe if real download traffic flowed within the last 30s. */
+    private const val ACTIVE_TRAFFIC_SKIP_WINDOW_MS = 30_000L
+
+    /** Switch to next healthy node in pool after 2 consecutive failed keep-alive probes. */
+    private const val CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER = 2
+
+    /** Send telemetry heartbeat once every 13 ticks (13 * 45s = ~9.75 minutes). */
+    private const val HEARTBEAT_EVERY_N_TICKS = 13
 
     private val _tunnelSession = MutableStateFlow(VpnTunnelSession())
     val tunnelSession: StateFlow<VpnTunnelSession> = _tunnelSession.asStateFlow()

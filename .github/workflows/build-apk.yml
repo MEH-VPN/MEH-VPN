@@ -1,25 +1,19 @@
-name: Build Android APK
+name: Build & Verify Android APK
 
-# Tag-only trigger: this workflow runs ONLY when a version tag like
-# v1.2.0 is pushed. Plain pushes to main (and pull requests) do NOT
-# run it at all — no build, no artifact, no release.
 on:
+  pull_request:
+    branches: ["main"]
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 
-# contents: write is needed for the tag-triggered release step below
-# (softprops/action-gh-release creates/updates the release).
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build debug APK
-    # Pinned to 24.04: ubuntu-latest is migrating to Ubuntu 26 and its
-    # preinstalled sdkmanager broke the setup-android step in run #1.
-    # 24.04 already ships the Android SDK, so no setup-android step
-    # is needed at all.
+    name: Test & Build APK
     runs-on: ubuntu-24.04
 
     steps:
@@ -32,25 +26,23 @@ jobs:
           java-version: "17"
           distribution: temurin
 
-      # No android-actions/setup-android step: on ubuntu-24.04 the
-      # Android SDK is preinstalled at $ANDROID_HOME, and v3 of that
-      # action fails here trying to install the obsolete "tools"
-      # package (sdkmanager exit code 1, run #1).
-
-      # The repo has gradle/wrapper/gradle-wrapper.properties but no
-      # gradlew script, so use the matching Gradle version directly
-      # instead of ./gradlew.
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "9.3.1"
 
-      # app/build.gradle.kts points the debug signing config at
-      # ${rootDir}/debug.keystore (android / androiddebugkey), and that
-      # file is gitignored, so create it if it is not in the repo.
-      - name: Generate debug keystore if missing
+      # Restore persistent keystore from GitHub Secrets (DEBUG_KEYSTORE_BASE64)
+      # or committed debug.keystore.base64 so APK upgrades across versions keep
+      # the exact same signing certificate and never fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+      - name: Restore persistent signing keystore
+        env:
+          SECRET_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
         run: |
-          if [ ! -f debug.keystore ]; then
+          if [ -n "$SECRET_KEYSTORE_B64" ]; then
+            echo "$SECRET_KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > debug.keystore
+          elif [ -f debug.keystore.base64 ]; then
+            tr -d '\n\r ' < debug.keystore.base64 | base64 -d > debug.keystore
+          elif [ ! -f debug.keystore ]; then
             keytool -genkey -v \
               -keystore debug.keystore \
               -storepass android \
@@ -60,7 +52,10 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Build debug APK
+      - name: Run Unit & Robolectric Tests
+        run: gradle testDebugUnitTest --stacktrace
+
+      - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
 
       - name: Package named release artifacts
@@ -74,19 +69,13 @@ jobs:
           echo "Packaged artifacts:"
           ls -l dist/
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MEH-VPN-apk
           path: dist/*.apk
           if-no-files-found: error
 
-      # Automatic release, tag-triggered only: pushing a tag like
-      # v1.3.0 builds the APK above and then publishes/updates a
-      # release for that tag with the APK attached, e.g.
-      # https://github.com/MEH-VPN/MEH-VPN/releases/download/v1.3.0/MEH-VPN-v1.3.0.apk
-      # Release notes are auto-generated from the commits since the
-      # previous tag (generate_release_notes), not a fixed sentence.
       - name: Publish release on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2

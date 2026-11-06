@@ -15,31 +15,28 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionHandler
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Local multi-protocol proxy server supporting:
- * 1. Unbounded cached thread pool (`relayExecutor`) so `tun2socks` concurrent TCP/UDP sockets
- *    never hit Kotlin's 64-thread `Dispatchers.IO` starvation deadlock on Android.
- * 2. Real Tunnel DNS Resolution (`Android DNS -> TUN -> SOCKS5/V2Ray -> Remote DNS -> Real IP`):
- *    - Never fabricates counter-based or synthetic Fake IPs for X, Instagram/Meta, or any site.
- *    - Resolves `A` (`QTYPE=1`), `HTTPS/SVCB` (`QTYPE=65/64`), `CNAME`, etc. genuinely inside the
- *      encrypted V2Ray tunnel (`8.8.8.8:53` / `1.1.1.1:53` over persistent reusable TCP tunnels,
- *      with DoH fallback).
- *    - Passively records real `A` record IPv4s (`realIpToDomain` & `domainToRealIp`) from
- *      authentic DNS answers.
- *    - Suppresses only `AAAA` (`QTYPE=28`) while IPv6 is disabled on the TUN interface.
- * 3. Full TLS `ClientHello` Record Reassembly + Domain-First Outbound Routing (`destOverride: ["http", "tls"]`):
- *    - Reassembles multi-segment TLS 1.3 Post-Quantum `ClientHello` packets (`> 1240` bytes)
- *      before extracting the `SNI` hostname so VLESS/Trojan outbounds receive the real domain name
- *      while keeping the real DNS IPv4 as `fallbackIpv4`.
- * 4. Transparent Non-Blocking TCP Relay for Multi-Connection Apps (Instagram, X/Twitter, YouTube):
- *    - Establishes the outbound tunnel, sends the initial `ClientHello` / HTTP request, and
- *      immediately hands the socket to full-duplex `relayStreams()` without blocking on a 4-second
- *      first-response timer or shrinking `soTimeout` to 12 seconds on HTTP/2 client frames.
+ * 1. Bounded `ThreadPoolExecutor` (`relayExecutor`, max 192 threads) with graceful backpressure.
+ * 2. Pre-warmed TLS+WebSocket V2Ray node connection pooling (`V2RayOutboundClient.warmUpNodePoolAsync`).
+ * 3. Mid-stream Dead Server Detection & Automatic Failover:
+ *    - If a stream sends a `ClientHello` / HTTP request and receives 0 bytes within
+ *      `FIRST_BYTE_STALL_TIMEOUT_MS`, penalizes the stalled node and transparently fails over to
+ *      the next verified node in `serverPool`.
+ *    - Exposes `switchToNextHealthyNode()` for keep-alive probe failover.
+ * 4. Iranian Direct Split-Tunneling (`IranRoutingRules`):
+ *    - Resolves `.ir` and domestic domains directly to real Iranian IPv4s and routes Iranian
+ *      banking/domestic TCP & UDP traffic directly via `VpnService.protect()`ed sockets.
+ * 5. VLESS UDP (`Command = 0x02`) relay for non-QUIC UDP traffic (voice calls, STUN/WebRTC, NTP).
+ * 6. Full `MehDiag` diagnostic & performance instrumentation.
  */
 class LocalV2RayProxyServer(
   configs: List<V2RayConfig>,
@@ -53,11 +50,20 @@ class LocalV2RayProxyServer(
   ) : this(listOf(config), protector, udpProtector)
 
   companion object {
-    private const val IDLE_STREAM_TIMEOUT_MS = 180_000
-    private const val RELAY_BUFFER_SIZE = 32768
-    private const val CONSECUTIVE_FAILURES_TO_PENALIZE = 3
+    /** Stream read timeout once downstream data has begun flowing (reduced from 180s to 45s). */
+    private const val IDLE_STREAM_TIMEOUT_MS = 45_000
 
-    /** Hard wall-clock budget for one whole DNS lookup (Android's resolver gives up at ~5s). */
+    /** Shorter stream timeout when waiting on a stream that has not yet transferred bulk data. */
+    private const val NO_DATA_STREAM_TIMEOUT_MS = 14_000
+
+    /** Max wait for the very first response byte after sending TLS ClientHello / HTTP request. */
+    private const val FIRST_BYTE_STALL_TIMEOUT_MS = 3800
+
+    private const val RELAY_BUFFER_SIZE = 32768
+    private const val CONSECUTIVE_FAILURES_TO_PENALIZE = 2
+    private const val MAX_RELAY_THREADS = 192
+
+    /** Hard wall-clock budget for one whole DNS lookup. */
     private const val DNS_BUDGET_MS = 2500L
     private const val DNS_SLOT_TIMEOUT_MS = 1500
     private const val DNS_DOH_TIMEOUT_MS = 1500
@@ -66,8 +72,7 @@ class LocalV2RayProxyServer(
     private val domainToRealIp = ConcurrentHashMap<String, String>()
 
     /**
-     * Passively records real IPv4 `A` records from an authentic DNS response so non-SNI connections
-     * and Serverless direct connections can look up the verified mapping in 0ms.
+     * Passively records real IPv4 `A` records from an authentic DNS response.
      */
     fun recordRealDnsARecords(domain: String, dnsBytes: ByteArray) {
       val cleanDomain = domain.trim().trimEnd('.').lowercase()
@@ -114,15 +119,6 @@ class LocalV2RayProxyServer(
       return domainToRealIp[domain.trim().trimEnd('.').lowercase()]
     }
 
-    /**
-     * Stable synthetic public IPv4s handed out only when genuine in-tunnel DNS could not answer
-     * within [DNS_BUDGET_MS]. `198.54.0.0/16` is publicly routable (Chromium's
-     * `IsPubliclyRoutable()` accepts it), so Cronet/Proxygen never reject it as a bogon, and
-     * `handleSocks5Client` maps every such IP back to its hostname so the outbound still dials the
-     * real domain (`destOverride: ["http", "tls"]`). Without this an unresolvable name means the
-     * client never even opens a TCP connection, which is exactly what makes every app except
-     * Telegram (hardcoded DC IPs, no DNS) appear dead.
-     */
     private val syntheticIpCounter = AtomicInteger(1)
     private val syntheticDomainToIp = ConcurrentHashMap<String, String>()
     private val syntheticIpToDomain = ConcurrentHashMap<String, String>()
@@ -161,6 +157,7 @@ class LocalV2RayProxyServer(
     val connection: V2RayOutboundClient.TunnelConnection,
     val firstReplyBytes: ByteArray?,
     val firstReplyLen: Int,
+    val nodeIndex: Int = 0,
   )
 
   private class PersistentDnsTunnelSlot(val dnsServerIp: String) {
@@ -192,12 +189,26 @@ class LocalV2RayProxyServer(
     )
   private val running = AtomicBoolean(false)
 
+  /**
+   * Bounded thread pool (`MAX_RELAY_THREADS = 192`) to prevent OOM / unbounded blocking thread
+   * explosion while still handling concurrent multi-stream apps.
+   */
   private val relayExecutor: ExecutorService =
-    Executors.newCachedThreadPool { runnable ->
-      Thread(runnable, "meh-proxy-worker").apply {
-        isDaemon = true
-      }
-    }
+    ThreadPoolExecutor(
+      16,
+      MAX_RELAY_THREADS,
+      30L,
+      TimeUnit.SECONDS,
+      SynchronousQueue(),
+      { runnable ->
+        Thread(runnable, "meh-proxy-worker").apply {
+          isDaemon = true
+        }
+      },
+      RejectedExecutionHandler { _, _ ->
+        MehDiag.recordStreamRejected()
+      },
+    )
 
   private var serverSocket: ServerSocket? = null
   private var udpRelaySocket: DatagramSocket? = null
@@ -222,14 +233,28 @@ class LocalV2RayProxyServer(
     udpListenPort = udpServer.localPort
     running.set(true)
 
+    // Pre-warm ready TLS + WebSocket connections to the primary V2Ray node immediately
+    V2RayOutboundClient.warmUpNodePoolAsync(
+      config = activeConfig,
+      protector = protector,
+      targetCount = 4,
+    )
+
     relayExecutor.execute {
       while (running.get() && !server.isClosed) {
         try {
           val client = server.accept()
           client.tcpNoDelay = true
           client.keepAlive = true
-          client.soTimeout = 20_000
-          relayExecutor.execute { handleClient(client) }
+          client.soTimeout = 15_000
+          try {
+            relayExecutor.execute { handleClient(client) }
+          } catch (_: Exception) {
+            MehDiag.recordStreamRejected()
+            try {
+              client.close()
+            } catch (_: Exception) {}
+          }
         } catch (_: Exception) {
           if (server.isClosed || !running.get()) break
         }
@@ -245,8 +270,12 @@ class LocalV2RayProxyServer(
           val dataCopy = buf.copyOfRange(0, pkt.length)
           val clientAddr = pkt.address
           val clientPort = pkt.port
-          relayExecutor.execute {
-            handleSocks5UdpDatagram(udpServer, dataCopy, clientAddr, clientPort)
+          try {
+            relayExecutor.execute {
+              handleSocks5UdpDatagram(udpServer, dataCopy, clientAddr, clientPort)
+            }
+          } catch (_: Exception) {
+            MehDiag.recordStreamRejected()
           }
         } catch (_: Exception) {
           if (udpServer.isClosed || !running.get()) break
@@ -265,14 +294,8 @@ class LocalV2RayProxyServer(
     try {
       udpRelaySocket?.close()
     } catch (_: Exception) {}
-    for (slot in dnsTunnelSlots) {
-      slot.lock.lock()
-      try {
-        slot.closeLocked()
-      } finally {
-        slot.lock.unlock()
-      }
-    }
+    closeAllPersistentDnsSlots()
+    V2RayOutboundClient.clearAllPrewarmedTransports()
     serverSocket = null
     udpRelaySocket = null
     dnsCache.clear()
@@ -284,10 +307,69 @@ class LocalV2RayProxyServer(
     } catch (_: Exception) {}
   }
 
+  private fun closeAllPersistentDnsSlots() {
+    for (slot in dnsTunnelSlots) {
+      slot.lock.lock()
+      try {
+        slot.closeLocked()
+      } finally {
+        slot.lock.unlock()
+      }
+    }
+  }
+
+  /**
+   * Explicitly switches the active server to the next healthy node in `serverPool` when
+   * consecutive keep-alive probes fail or mid-stream stalls occur.
+   */
+  fun switchToNextHealthyNode(reason: String = "health_check"): V2RayConfig {
+    if (serverPool.size <= 1) return activeConfig
+    val oldIdx = activeConfigIndex.get().coerceIn(0, serverPool.lastIndex)
+    val oldCfg = serverPool[oldIdx]
+    penalizedIndices.add(oldIdx)
+    if (penalizedIndices.size >= serverPool.size) {
+      penalizedIndices.clear()
+    }
+    V2RayOutboundClient.evictPrewarmedTransports(oldCfg.endpointKey)
+
+    var nextIdx = (oldIdx + 1) % serverPool.size
+    for (step in 1 until serverPool.size) {
+      val candidateIdx = (oldIdx + step) % serverPool.size
+      if (candidateIdx !in penalizedIndices) {
+        nextIdx = candidateIdx
+        break
+      }
+    }
+
+    activeConfigIndex.set(nextIdx)
+    consecutiveFailures[nextIdx]?.set(0)
+    closeAllPersistentDnsSlots()
+    MehDiag.recordNodeSwitch()
+    if (reason == "keep_alive_timeout") {
+      MehDiag.recordKeepAliveTriggeredFailover()
+    }
+
+    val newActive = serverPool[nextIdx]
+    V2RayOutboundClient.warmUpNodePoolAsync(
+      config = newActive,
+      protector = protector,
+      targetCount = 3,
+    )
+    return newActive
+  }
+
   private fun recordServerSuccess(idx: Int) {
     consecutiveFailures[idx]?.set(0)
     penalizedIndices.remove(idx)
-    activeConfigIndex.set(idx)
+    val previous = activeConfigIndex.getAndSet(idx)
+    if (previous != idx) {
+      MehDiag.recordNodeSwitch()
+      V2RayOutboundClient.warmUpNodePoolAsync(
+        config = serverPool[idx],
+        protector = protector,
+        targetCount = 3,
+      )
+    }
   }
 
   private fun recordServerTransportFailure(idx: Int) {
@@ -295,22 +377,31 @@ class LocalV2RayProxyServer(
     val count = consecutiveFailures.computeIfAbsent(idx) { AtomicInteger(0) }.incrementAndGet()
     if (count >= CONSECUTIVE_FAILURES_TO_PENALIZE) {
       penalizedIndices.add(idx)
-      // Never allow all servers in the pool to remain penalized simultaneously
+      V2RayOutboundClient.evictPrewarmedTransports(serverPool[idx].endpointKey)
       if (penalizedIndices.size >= serverPool.size) {
         penalizedIndices.clear()
+      }
+      if (activeConfigIndex.get() == idx) {
+        for (step in 1 until serverPool.size) {
+          val candidateIdx = (idx + step) % serverPool.size
+          if (candidateIdx !in penalizedIndices) {
+            activeConfigIndex.set(candidateIdx)
+            MehDiag.recordNodeSwitch()
+            break
+          }
+        }
       }
     }
   }
 
   /**
-   * Opens a V2Ray tunnel across `serverPool`:
-   * 1. Prioritizes the primary verified server (`activeConfigIndex`) first, followed by other
-   *    healthy verified candidates in `serverPool`, so Instagram/X multi-connection bursts all use
-   *    the verified Tier-1 tunnel unless a transport handshake error occurs.
-   * 2. For normal client TCP/TLS streams (`awaitFirstResponse = false`):
-   *    `CONNECT tunnel -> send ClientHello -> return tunnel immediately -> normal bidirectional relay`.
-   *    Does NOT block for 4 seconds waiting for the remote backend's first byte, preventing
-   *    Instagram CDN/Graph API pre-warmed or multiplexed streams from timing out and poisoning the pool.
+   * Opens a V2Ray tunnel across `serverPool` with Mid-Stream First-Byte Verification:
+   * - When `awaitFirstResponse == true` and `initialPayloadLen > 0` (e.g., TLS `ClientHello` or
+   *   HTTP request), sends the initial payload and waits up to [firstReplyTimeoutMs] for the first
+   *   response byte from the node.
+   * - If the node closes the stream or returns 0 bytes within [firstReplyTimeoutMs], records
+   *   `MehDiag.recordFirstByteTimeoutFailover()`, penalizes the dead node, and automatically fails
+   *   over to the next node in `serverPool`!
    */
   private fun openTunnelWithVerifiedFailover(
     targetHost: String,
@@ -320,7 +411,7 @@ class LocalV2RayProxyServer(
     initialPayloadLen: Int = 0,
     awaitFirstResponse: Boolean = false,
     fallbackIpv4: String? = null,
-    firstReplyTimeoutMs: Int = 3500,
+    firstReplyTimeoutMs: Int = FIRST_BYTE_STALL_TIMEOUT_MS,
     maxNodes: Int = Int.MAX_VALUE,
     penalizeOnFailure: Boolean = true,
   ): OpenedTunnelWithReply {
@@ -352,8 +443,6 @@ class LocalV2RayProxyServer(
         lookupRealIpForDomain(targetHost)
       }
 
-    // Only retry a second target on the same V2Ray node when awaitFirstResponse == true
-    // (because when awaitFirstResponse == false, VLESS/Trojan sends the target address inside the stream header).
     val targetsToTry =
       if (awaitFirstResponse && !cleanFallbackIp.isNullOrBlank() && cleanFallbackIp != targetHost) {
         listOf(targetHost, cleanFallbackIp)
@@ -364,8 +453,6 @@ class LocalV2RayProxyServer(
     var lastError: Exception? = null
 
     for ((attemptIdx, idx) in orderedIndices.withIndex()) {
-      // DNS probes must never walk the whole pool: every extra node costs another full
-      // connect + first-reply timeout while the DNS slot lock is held.
       if (attemptIdx >= maxNodes) break
       val candidate = serverPool[idx]
       var nodeSucceeded = false
@@ -381,27 +468,51 @@ class LocalV2RayProxyServer(
               timeoutMs = connectTimeout,
               protector = protector,
               fallbackIpv4 = cleanFallbackIp,
+              usePrewarmedPool = true,
             )
           if (initialPayload != null && initialPayloadLen > 0) {
+            MehDiag.recordClientHelloSent()
             conn.outputStream.write(initialPayload, 0, initialPayloadLen)
             conn.outputStream.flush()
+            MehDiag.recordBytesUploaded(initialPayloadLen.toLong())
 
             if (awaitFirstResponse) {
               conn.setReadTimeout(firstReplyTimeoutMs)
               val replyBuf = ByteArray(16384)
-              val replyLen = conn.inputStream.read(replyBuf)
-              if (replyLen <= 0) {
+              val replyLen =
+                try {
+                  conn.inputStream.read(replyBuf)
+                } catch (ste: SocketTimeoutException) {
+                  // If there are backup nodes in the pool, fail over to the next node!
+                  if (poolSize > 1 && attemptIdx + 1 < minOf(poolSize, maxNodes)) {
+                    MehDiag.recordFirstByteTimeoutFailover()
+                    throw ste
+                  }
+                  // Single-node pool: keep stream open and let relayStreams continue waiting
+                  0
+                }
+              if (replyLen < 0) {
+                MehDiag.recordFirstByteTimeoutFailover()
                 throw IOException("V2Ray server ${candidate.address} closed stream before replying for $hostCandidate:$targetPort")
               }
-              conn.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
+              if (replyLen > 0) {
+                MehDiag.recordFirstByteReceived()
+                MehDiag.recordBytesDownloaded(replyLen.toLong())
+              }
+              conn.setReadTimeout(if (replyLen > 0) IDLE_STREAM_TIMEOUT_MS else NO_DATA_STREAM_TIMEOUT_MS)
               recordServerSuccess(idx)
-              return OpenedTunnelWithReply(conn, replyBuf, replyLen)
+              return OpenedTunnelWithReply(
+                connection = conn,
+                firstReplyBytes = if (replyLen > 0) replyBuf else null,
+                firstReplyLen = replyLen.coerceAtLeast(0),
+                nodeIndex = idx,
+              )
             }
           }
-          conn.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
+          conn.setReadTimeout(NO_DATA_STREAM_TIMEOUT_MS)
           recordServerSuccess(idx)
           nodeSucceeded = true
-          return OpenedTunnelWithReply(conn, null, 0)
+          return OpenedTunnelWithReply(conn, null, 0, idx)
         } catch (e: Exception) {
           try {
             conn?.close()
@@ -409,8 +520,6 @@ class LocalV2RayProxyServer(
           lastError = e
         }
       }
-      // A node that merely refuses/blackholes port 53 is still a perfectly good 443 node, so DNS
-      // probes (penalizeOnFailure = false) must not count towards penalizing it.
       if (!nodeSucceeded && penalizeOnFailure) {
         recordServerTransportFailure(idx)
       }
@@ -419,6 +528,7 @@ class LocalV2RayProxyServer(
   }
 
   private fun handleClient(clientSocket: Socket) {
+    MehDiag.onStreamOpened()
     try {
       clientSocket.use { client ->
         val clientIn = client.getInputStream()
@@ -433,15 +543,12 @@ class LocalV2RayProxyServer(
           handleHttpProxyClient(client, firstByte.toByte(), clientIn, clientOut)
         }
       }
-    } catch (_: Exception) {}
+    } catch (_: Exception) {
+    } finally {
+      MehDiag.onStreamClosed()
+    }
   }
 
-  /**
-   * Reads the initial client payload from [clientIn]. If the payload starts with a valid TLS
-   * Handshake record (`0x16, 0x03, 0x01..0x04`), reassembles the complete TLS record (`5 + recordLen`
-   * bytes) across TCP segments so large Post-Quantum TLS 1.3 `ClientHello` packets (used by Twitter/X
-   * and Instagram) always include their `SNI` extension even when split by the 1400-byte TUN MTU.
-   */
   private fun readCompleteFirstClientPacket(
     clientSocket: Socket,
     clientIn: InputStream,
@@ -449,7 +556,7 @@ class LocalV2RayProxyServer(
   ): Int {
     var totalRead =
       try {
-        clientSocket.soTimeout = 1200
+        clientSocket.soTimeout = 1000
         val n = clientIn.read(buffer)
         if (n <= 0) return n
         n
@@ -463,7 +570,7 @@ class LocalV2RayProxyServer(
       (buffer[2].toInt() and 0xFF) in 1..4
     ) {
       try {
-        clientSocket.soTimeout = 200
+        clientSocket.soTimeout = 180
         while (totalRead < 5) {
           val r = clientIn.read(buffer, totalRead, 5 - totalRead)
           if (r <= 0) break
@@ -488,9 +595,6 @@ class LocalV2RayProxyServer(
     return totalRead
   }
 
-  /**
-   * Handles RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) locally via `resolveDnsOverV2Ray`.
-   */
   private fun handleLocalTcpDnsSession(
     clientSocket: Socket,
     clientIn: InputStream,
@@ -524,7 +628,6 @@ class LocalV2RayProxyServer(
     val methods = ByteArray(nMethods)
     if (!readExact(clientIn, methods)) return
 
-    // Reply: SOCKS5, NO AUTH (0x00)
     clientOut.write(byteArrayOf(0x05, 0x00))
     clientOut.flush()
 
@@ -561,7 +664,6 @@ class LocalV2RayProxyServer(
 
     when (cmd) {
       0x01 -> {
-        // Intercept TCP port 53 (DNS-over-TCP) and answer locally via `resolveDnsOverV2Ray`
         if (targetPort == 53) {
           clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
           clientOut.flush()
@@ -569,14 +671,10 @@ class LocalV2RayProxyServer(
           return
         }
 
-        // Synthetic DNS answers (`198.54.x.y` handed out when in-tunnel DNS timed out) must be
-        // mapped back to the hostname they were allocated for, otherwise a client that connects
-        // without TLS SNI or an HTTP Host header would dial a meaningless IP.
         val syntheticDomain = lookupSyntheticDomainForIp(rawTargetHost)
-        var effectiveHost = syntheticDomain ?: rawTargetHost
+        val realMappedDomain = lookupDomainForRealIp(rawTargetHost)
+        var effectiveHost = syntheticDomain ?: realMappedDomain ?: rawTargetHost
 
-        // Acknowledge SOCKS5 CONNECT so the client immediately sends its first packet
-        // (TLS ClientHello / HTTP request / MTProto preamble / DoT port 853 handshake)
         clientOut.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0))
         clientOut.flush()
 
@@ -584,20 +682,19 @@ class LocalV2RayProxyServer(
         val firstLen = readCompleteFirstClientPacket(clientSocket, clientIn, firstBuffer)
         if (firstLen == -1) return
 
-        // Domain-first routing (`destOverride: ["http", "tls"]`):
-        // Whenever the packet is a TLS ClientHello with an SNI hostname or an HTTP request with a
-        // Host header, pass the exact sniffed domain name to the VLESS/Trojan outbound so the remote
-        // V2Ray server resolves it directly, while keeping the real DNS IPv4 `rawTargetHost` as fallback!
+        var isTlsOrHttpPayload = false
         if (firstLen > 0) {
           val tlsSni = GfwKnockerXrayCore.extractTlsSniHostname(firstBuffer, firstLen)
           val httpHost = if (tlsSni == null) extractHttpHostHeader(firstBuffer, firstLen) else null
           val sniffedDomain = tlsSni ?: httpHost
           if (!sniffedDomain.isNullOrBlank()) {
             effectiveHost = sniffedDomain
+            isTlsOrHttpPayload = true
+          } else if (firstLen >= 3 && (firstBuffer[0].toInt() and 0xFF) == 0x16) {
+            isTlsOrHttpPayload = true
           }
         }
 
-        // Reject un-sniffed ISP-poisoned 10.x.x.x IPs or un-sniffed raw IPv6 addresses immediately
         val ipv4Target = V2RayOutboundClient.parseIpv4Bytes(effectiveHost)
         if (ipv4Target != null && (ipv4Target[0].toInt() and 0xFF) == 10) {
           return
@@ -608,8 +705,43 @@ class LocalV2RayProxyServer(
 
         clientSocket.soTimeout = 0
 
-        // Transparent TCP tunnel: open V2Ray stream, write initial ClientHello/HTTP request,
-        // and immediately enter full-duplex relay without blocking on a 4-second first-response timer.
+        // Direct Split-Tunneling for Iranian Domains (.ir, Shaparak, Banks, Domestic apps) & Iranian IPs
+        if (IranRoutingRules.isIranianDestination(effectiveHost, rawTargetHost)) {
+          val directConn =
+            try {
+              IranRoutingRules.openDirectProtectedTunnel(
+                targetHost = effectiveHost,
+                targetPort = targetPort,
+                timeoutMs = 5000,
+                protector = protector,
+                fallbackIpv4 = if (syntheticDomain != null) null else rawTargetHost,
+              )
+            } catch (_: Exception) {
+              return
+            }
+
+          directConn.use { activeDirect ->
+            if (firstLen > 0) {
+              activeDirect.outputStream.write(firstBuffer, 0, firstLen)
+              activeDirect.outputStream.flush()
+              MehDiag.recordBytesUploaded(firstLen.toLong())
+            }
+            relayStreams(
+              clientIn = clientIn,
+              clientOut = clientOut,
+              remoteIn = activeDirect.inputStream,
+              remoteOut = activeDirect.outputStream,
+              clientSocket = clientSocket,
+              tunnelConnection = activeDirect,
+            )
+          }
+          return
+        }
+
+        // For TLS ClientHello / HTTP requests when multiple nodes exist in serverPool, verify first
+        // response byte within FIRST_BYTE_STALL_TIMEOUT_MS so dead/frozen servers trigger instant failover.
+        val verifyFirstByte = isTlsOrHttpPayload && firstLen > 0 && serverPool.size > 1
+
         val opened =
           try {
             openTunnelWithVerifiedFailover(
@@ -617,9 +749,8 @@ class LocalV2RayProxyServer(
               targetPort = targetPort,
               initialPayload = firstBuffer,
               initialPayloadLen = firstLen,
-              awaitFirstResponse = false,
-              // A synthetic 198.54.x.y address is not a real server: never offer it as the
-              // "fallback IPv4" (Serverless mode would dial it directly and black-hole).
+              awaitFirstResponse = verifyFirstByte,
+              firstReplyTimeoutMs = FIRST_BYTE_STALL_TIMEOUT_MS,
               fallbackIpv4 = if (syntheticDomain != null) null else rawTargetHost,
             )
           } catch (_: Exception) {
@@ -638,12 +769,11 @@ class LocalV2RayProxyServer(
             remoteOut = activeTunnel.outputStream,
             clientSocket = clientSocket,
             tunnelConnection = activeTunnel,
+            receivedInitialDownstreamByte = (opened.firstReplyLen > 0),
           )
         }
       }
       0x03 -> {
-        // UDP ASSOCIATE: keep control socket open for the entire lifetime of the tun2socks session
-        // (soTimeout = 0) so UDP DNS associations never expire while browsing!
         clientSocket.soTimeout = 0
         val pHigh = ((udpListenPort ushr 8) and 0xFF).toByte()
         val pLow = (udpListenPort and 0xFF).toByte()
@@ -651,7 +781,7 @@ class LocalV2RayProxyServer(
         clientOut.flush()
         try {
           while (running.get() && clientIn.read() != -1) {
-            // Wait until client closes TCP control connection
+            // Keep UDP control association open until client closes TCP control connection
           }
         } catch (_: Exception) {}
       }
@@ -662,9 +792,6 @@ class LocalV2RayProxyServer(
     }
   }
 
-  /**
-   * Extracts the `Host:` domain name from an HTTP/1.1 request if `buf` starts with an HTTP verb.
-   */
   private fun extractHttpHostHeader(buf: ByteArray, len: Int): String? {
     if (len < 16) return null
     val b0 = buf[0].toInt().toChar()
@@ -701,7 +828,10 @@ class LocalV2RayProxyServer(
 
   /**
    * Handles a SOCKS5 UDP datagram from tun2socks:
-   * Header: [RSV(2), FRAG(1), ATYP(1), DST.ADDR(var), DST.PORT(2), DATA...]
+   * - Port 53: Resolved via `resolveDnsOverV2Ray`.
+   * - Iranian IPs/Domains: Relayed directly via a `udpProtector`-protected `DatagramSocket`.
+   * - Port 443 (QUIC): Dropped so browsers/Instagram immediately use the 0-RTT pre-warmed TCP HTTP/2 pool.
+   * - Other UDP ports (Voice calls, WebRTC, STUN, NTP, gaming): Relayed via VLESS UDP (`Command = 0x02`).
    */
   private fun handleSocks5UdpDatagram(
     udpServer: DatagramSocket,
@@ -715,41 +845,122 @@ class LocalV2RayProxyServer(
     val atyp = packet[3].toInt() and 0xFF
 
     var offset = 4
-    when (atyp) {
-      0x01 -> {
-        if (packet.size < offset + 6) return
-        offset += 4
+    val rawDstHost: String =
+      when (atyp) {
+        0x01 -> {
+          if (packet.size < offset + 6) return
+          val ip =
+            "${packet[offset].toInt() and 0xFF}.${packet[offset + 1].toInt() and 0xFF}.${packet[offset + 2].toInt() and 0xFF}.${packet[offset + 3].toInt() and 0xFF}"
+          offset += 4
+          ip
+        }
+        0x03 -> {
+          val len = packet[offset].toInt() and 0xFF
+          offset += 1
+          if (packet.size < offset + len + 2) return
+          val dom = String(packet, offset, len, Charsets.UTF_8)
+          offset += len
+          dom
+        }
+        0x04 -> {
+          if (packet.size < offset + 18) return
+          val ipv6Bytes = packet.copyOfRange(offset, offset + 16)
+          offset += 16
+          InetAddress.getByAddress(ipv6Bytes).hostAddress ?: return
+        }
+        else -> return
       }
-      0x03 -> {
-        val len = packet[offset].toInt() and 0xFF
-        offset += 1
-        if (packet.size < offset + len + 2) return
-        offset += len
-      }
-      0x04 -> {
-        if (packet.size < offset + 18) return
-        offset += 16
-      }
-      else -> return
-    }
 
     val dstPort = ((packet[offset].toInt() and 0xFF) shl 8) or (packet[offset + 1].toInt() and 0xFF)
     offset += 2
 
-    // Drop non-DNS UDP packets (such as UDP port 443 QUIC/HTTP3) so apps immediately
-    // fall back to TCP port 443 HTTP/2 over the encrypted V2Ray tunnel.
-    if (dstPort != 53) return
-
     val socksUdpHeader = packet.copyOfRange(0, offset)
     val udpPayload = packet.copyOfRange(offset, packet.size)
-    if (udpPayload.size < 12) return
+    if (udpPayload.isEmpty()) return
 
-    val responsePayload = resolveDnsOverV2Ray(udpPayload) ?: return
+    // 1. DNS (UDP port 53)
+    if (dstPort == 53) {
+      if (udpPayload.size < 12) return
+      MehDiag.recordUdpDnsPacket()
+      val responsePayload = resolveDnsOverV2Ray(udpPayload) ?: return
+      sendSocks5UdpReply(udpServer, socksUdpHeader, responsePayload, clientAddr, clientPort)
+      return
+    }
 
+    val effectiveDstHost =
+      lookupSyntheticDomainForIp(rawDstHost)
+        ?: lookupDomainForRealIp(rawDstHost)
+        ?: rawDstHost
+
+    // 2. Direct UDP bypass for Iranian IPs & Domains
+    if (IranRoutingRules.isIranianDestination(effectiveDstHost, rawDstHost)) {
+      val directReply = relayDirectProtectedUdp(effectiveDstHost, rawDstHost, dstPort, udpPayload) ?: return
+      MehDiag.recordUdpIranDirectPacket()
+      sendSocks5UdpReply(udpServer, socksUdpHeader, directReply, clientAddr, clientPort)
+      return
+    }
+
+    // 3. Drop UDP 443/8443 QUIC so HTTP/3 immediately falls back to our pre-warmed TCP HTTP/2 pool
+    if (dstPort == 443 || dstPort == 8443) {
+      MehDiag.recordUdpDroppedPacket()
+      return
+    }
+
+    // 4. VLESS UDP (Command = 0x02) for voice calls, STUN/WebRTC, NTP, and custom UDP ports
+    val vlessReply =
+      V2RayOutboundClient.exchangeVlessUdpDatagram(
+        config = activeConfig,
+        targetHost = effectiveDstHost,
+        targetPort = dstPort,
+        udpPayload = udpPayload,
+        timeoutMs = 3000,
+        protector = protector,
+      )
+    if (vlessReply != null) {
+      sendSocks5UdpReply(udpServer, socksUdpHeader, vlessReply, clientAddr, clientPort)
+    } else {
+      MehDiag.recordUdpDroppedPacket()
+    }
+  }
+
+  private fun relayDirectProtectedUdp(
+    effectiveHost: String,
+    rawHost: String,
+    dstPort: Int,
+    payload: ByteArray,
+  ): ByteArray? {
+    return try {
+      DatagramSocket().use { sock ->
+        udpProtector(sock)
+        sock.soTimeout = 2500
+        val targetAddr =
+          V2RayOutboundClient.parseIpv4Bytes(rawHost)?.let { InetAddress.getByAddress(it) }
+            ?: IranRoutingRules.resolveIranianDomainDirectIpv4(effectiveHost)?.let { InetAddress.getByAddress(it) }
+            ?: InetAddress.getByName(effectiveHost)
+        val outPkt = DatagramPacket(payload, payload.size, targetAddr, dstPort)
+        sock.send(outPkt)
+        MehDiag.recordBytesUploaded(payload.size.toLong())
+        val inBuf = ByteArray(4096)
+        val inPkt = DatagramPacket(inBuf, inBuf.size)
+        sock.receive(inPkt)
+        MehDiag.recordBytesDownloaded(inPkt.length.toLong())
+        inBuf.copyOfRange(0, inPkt.length)
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun sendSocks5UdpReply(
+    udpServer: DatagramSocket,
+    socksUdpHeader: ByteArray,
+    responsePayload: ByteArray,
+    clientAddr: InetAddress,
+    clientPort: Int,
+  ) {
     val replyBytes = ByteArray(socksUdpHeader.size + responsePayload.size)
     System.arraycopy(socksUdpHeader, 0, replyBytes, 0, socksUdpHeader.size)
     System.arraycopy(responsePayload, 0, replyBytes, socksUdpHeader.size, responsePayload.size)
-
     try {
       udpServer.send(DatagramPacket(replyBytes, replyBytes.size, clientAddr, clientPort))
     } catch (_: Exception) {}
@@ -786,40 +997,32 @@ class LocalV2RayProxyServer(
     )
   }
 
-  /**
-   * Resolves DNS queries genuinely over the V2Ray tunnel (`Android DNS -> TUN -> SOCKS5/V2Ray -> Remote DNS`):
-   * 1. Suppresses `AAAA` (`QTYPE=28`) while IPv6 is disabled on the TUN interface, and also
-   *    suppresses `HTTPS/SVCB` (`QTYPE=65/64`): every UDP packet that is not port 53 is dropped
-   *    downstream, so an `alpn=h3` hint only makes clients stall on QUIC/UDP 443 before falling
-   *    back to TCP. Every lookup runs against a hard [DNS_BUDGET_MS] deadline; when the in-tunnel
-   *    resolvers cannot answer in time a stable synthetic public IPv4 is returned instead of
-   *    SERVFAIL (see [allocateSyntheticIpForDomain]).
-   * 2. Uses `dnsCache` + in-flight deduplication (`inFlightDnsLocks`) and records real `A` records
-   *    into `realIpToDomain` and `domainToRealIp` without ever fabricating Fake IPs.
-   * 3. Resolves via persistent reusable 1-RTT RFC 1035 DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`)
-   *    inside the V2Ray tunnel so a burst of 20+ Instagram CDN DNS queries reuses open streams
-   *    instead of opening 20 new V2Ray TLS+WebSocket connections.
-   */
   private fun resolveDnsOverV2Ray(dnsQuery: ByteArray): ByteArray? {
     if (dnsQuery.size < 12) return null
+    val startMs = System.currentTimeMillis()
+    MehDiag.recordDnsQueryStart()
+
     val question = parseDnsQuestion(dnsQuery)
     if (question != null) {
-      // Suppress IPv6 AAAA (QTYPE=28) because the TUN interface is IPv4-only, and HTTPS/SVCB
-      // (QTYPE=65/64) because `handleSocks5UdpDatagram` drops every non-port-53 UDP packet: an
-      // `alpn=h3`/`ipv6hint` record only makes Chromium/Instagram/YouTube chase QUIC over a
-      // black-holed UDP 443 and stall before falling back to TCP.
       if (question.qtype == 28 || question.qtype == 65 || question.qtype == 64) {
+        MehDiag.recordDnsSyntheticHit(System.currentTimeMillis() - startMs)
         return buildEmptyDnsNoerrorResponse(dnsQuery, question.questionEndOffset)
+      }
+
+      // Direct DNS Resolution for Iranian Domains (.ir, Shaparak, Banks, Domestic platforms)
+      if (question.qtype == 1 && question.qclass == 1 && IranRoutingRules.isIranianDomain(question.domain)) {
+        val iranIpv4 = IranRoutingRules.resolveIranianDomainDirectIpv4(question.domain)
+        if (iranIpv4 != null) {
+          val ipStr =
+            "${iranIpv4[0].toInt() and 0xFF}.${iranIpv4[1].toInt() and 0xFF}.${iranIpv4[2].toInt() and 0xFF}.${iranIpv4[3].toInt() and 0xFF}"
+          realIpToDomain[ipStr] = question.domain
+          domainToRealIp[question.domain] = ipStr
+          MehDiag.recordDnsIranDirectHit(System.currentTimeMillis() - startMs)
+          return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, iranIpv4)
+        }
       }
     }
 
-    // Fake-IP first (the same approach v2rayNG / sing-box / Clash use): answer every plain `A`
-    // query instantly with a stable synthetic IPv4 and let `handleSocks5Client` map it back to the
-    // hostname, so the V2Ray node resolves the name itself (VLESS/Trojan carry the domain).
-    // Previously a *real* lookup was attempted first through the tunnel (8.8.8.8:53), which needs
-    // a fresh node connection per name and stalls for seconds whenever the node refuses port 53 —
-    // apps never got an IP, never opened a socket, and only Telegram (hard-coded IPs) worked.
-    // Serverless mode dials the target directly and therefore still needs genuine IPs.
     if (question != null &&
       question.qtype == 1 &&
       question.qclass == 1 &&
@@ -828,6 +1031,7 @@ class LocalV2RayProxyServer(
     ) {
       val fakeIpBytes = V2RayOutboundClient.parseIpv4Bytes(allocateSyntheticIpForDomain(question.domain))
       if (fakeIpBytes != null) {
+        MehDiag.recordDnsSyntheticHit(System.currentTimeMillis() - startMs)
         return buildSyntheticDnsAResponse(dnsQuery, question.questionEndOffset, fakeIpBytes)
       }
     }
@@ -845,6 +1049,7 @@ class LocalV2RayProxyServer(
           val copy = cached.copyOf()
           copy[0] = dnsQuery[0]
           copy[1] = dnsQuery[1]
+          MehDiag.recordDnsCacheHit(System.currentTimeMillis() - startMs)
           return copy
         }
       }
@@ -860,12 +1065,12 @@ class LocalV2RayProxyServer(
               val copy = cached.copyOf()
               copy[0] = dnsQuery[0]
               copy[1] = dnsQuery[1]
+              MehDiag.recordDnsCacheHit(System.currentTimeMillis() - startMs)
               return copy
             }
           }
         }
 
-        // 1. When running in Serverless mode, resolve real IPs via fragmented DoH (port 443)
         if (activeConfig.protocol == V2RayProtocol.SERVERLESS) {
           val directDoh = resolveDnsOverHttpsProtectedDirect(dnsQuery)
           if (directDoh != null && isValidUnpoisonedDnsResponse(directDoh)) {
@@ -875,10 +1080,10 @@ class LocalV2RayProxyServer(
             if (cacheKey != null && dnsCache.size < 2048) {
               dnsCache[cacheKey] = directDoh.copyOf()
             }
+            MehDiag.recordDnsDirectDohSuccess(System.currentTimeMillis() - startMs)
             return directDoh
           }
         } else {
-          // 2. Primary: Persistent reusable 1-RTT DNS-over-TCP (`8.8.8.8:53` / `1.1.1.1:53`) inside V2Ray tunnel
           val tcpDnsResp = resolveDnsOverTcpViaTunnel(dnsQuery, deadlineNanos)
           if (tcpDnsResp != null && isValidUnpoisonedDnsResponse(tcpDnsResp)) {
             if (question != null) {
@@ -887,10 +1092,10 @@ class LocalV2RayProxyServer(
             if (cacheKey != null && dnsCache.size < 2048) {
               dnsCache[cacheKey] = tcpDnsResp.copyOf()
             }
+            MehDiag.recordDnsTunnelTcpSuccess(System.currentTimeMillis() - startMs)
             return tcpDnsResp
           }
 
-          // 3. Secondary: DNS-over-HTTPS (`8.8.8.8:443` / `1.1.1.1:443`) inside the V2Ray tunnel
           val dohTunnelResp = resolveDnsOverHttpsViaTunnel(dnsQuery, deadlineNanos)
           if (dohTunnelResp != null && isValidUnpoisonedDnsResponse(dohTunnelResp)) {
             if (question != null) {
@@ -899,13 +1104,11 @@ class LocalV2RayProxyServer(
             if (cacheKey != null && dnsCache.size < 2048) {
               dnsCache[cacheKey] = dohTunnelResp.copyOf()
             }
+            MehDiag.recordDnsTunnelDohSuccess(System.currentTimeMillis() - startMs)
             return dohTunnelResp
           }
         }
 
-        // 4. Last-resort fallback: Protected direct fragmented DoH (`8.8.8.8:443` / `1.1.1.1:443`).
-        // Only worth trying while the resolver budget is still alive: direct DoH is usually
-        // throttled/blocked inside Iran, so it must never be what the client waits on.
         if (remainingDnsMillis(deadlineNanos) >= 2000) {
           val directDohResp = resolveDnsOverHttpsProtectedDirect(dnsQuery)
           if (directDohResp != null && isValidUnpoisonedDnsResponse(directDohResp)) {
@@ -915,6 +1118,7 @@ class LocalV2RayProxyServer(
             if (cacheKey != null && dnsCache.size < 2048) {
               dnsCache[cacheKey] = directDohResp.copyOf()
             }
+            MehDiag.recordDnsDirectDohSuccess(System.currentTimeMillis() - startMs)
             return directDohResp
           }
         }
@@ -925,11 +1129,6 @@ class LocalV2RayProxyServer(
       }
     }
 
-    // Genuine DNS did not answer in time. Most nodes in this catalog are CDN/Worker fronted and can
-    // only open outbound connections to 80/443, so `8.8.8.8:53` inside the tunnel is frequently
-    // unreachable. Answering SERVFAIL here is what breaks every hostname-based app, so instead we
-    // hand out a stable synthetic public IPv4 and let the SNI/Host based domain-first routing dial
-    // the real hostname.
     if (question != null && question.qtype == 1 && question.domain.isNotEmpty()) {
       val syntheticIp = allocateSyntheticIpForDomain(question.domain)
       val ipBytes = V2RayOutboundClient.parseIpv4Bytes(syntheticIp)
@@ -939,10 +1138,12 @@ class LocalV2RayProxyServer(
         if (cacheKey != null && dnsCache.size < 2048) {
           dnsCache[cacheKey] = syntheticResponse.copyOf()
         }
+        MehDiag.recordDnsSyntheticHit(System.currentTimeMillis() - startMs)
         return syntheticResponse
       }
     }
 
+    MehDiag.recordDnsServfail(System.currentTimeMillis() - startMs)
     return buildDnsServfailResponse(dnsQuery, question?.questionEndOffset ?: dnsQuery.size)
   }
 
@@ -951,10 +1152,6 @@ class LocalV2RayProxyServer(
     return remaining.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
   }
 
-  /**
-   * Builds an RFC 1035 DNS `A` response for [dnsQuery] returning [ipv4Bytes] with a 120s TTL,
-   * properly truncated to `questionEndOffset` so no trailing EDNS0 bytes remain when `ARCOUNT = 0`.
-   */
   private fun buildSyntheticDnsAResponse(
     dnsQuery: ByteArray,
     questionEndOffset: Int,
@@ -963,16 +1160,12 @@ class LocalV2RayProxyServer(
     val safeEnd = questionEndOffset.coerceIn(12, dnsQuery.size)
     val respHeader = dnsQuery.copyOfRange(0, safeEnd)
 
-    // Flags: preserve Opcode and RD from query, set QR=1, RA=1, RCODE=0
     respHeader[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
     respHeader[3] = 0x80.toByte()
-    // QDCOUNT = 1
     respHeader[4] = 0x00
     respHeader[5] = 0x01
-    // ANCOUNT = 1
     respHeader[6] = 0x00
     respHeader[7] = 0x01
-    // NSCOUNT = 0, ARCOUNT = 0
     respHeader[8] = 0x00
     respHeader[9] = 0x00
     respHeader[10] = 0x00
@@ -980,25 +1173,14 @@ class LocalV2RayProxyServer(
 
     val finalOut = ByteArrayOutputStream(respHeader.size + 16)
     finalOut.write(respHeader)
-    // Answer RR: Name pointer to offset 12 (0xC00C)
     finalOut.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
-    // TYPE = A (0x0001), CLASS = IN (0x0001)
     finalOut.write(byteArrayOf(0x00, 0x01, 0x00, 0x01))
-    // TTL = 120 seconds (0x00000078)
     finalOut.write(byteArrayOf(0x00, 0x00, 0x00, 0x78))
-    // RDLENGTH = 4
     finalOut.write(byteArrayOf(0x00, 0x04))
-    // RDATA = 4-byte IPv4 address
     finalOut.write(ipv4Bytes)
     return finalOut.toByteArray()
   }
 
-  /**
-   * Resolves [dnsQuery] using RFC 1035 DNS-over-TCP (`[2-byte length][dnsQuery]`) over persistent
-   * reusable V2Ray tunnels (`8.8.8.8:53` and `1.1.1.1:53`).
-   * Reusing an open TCP-over-V2Ray stream avoids creating 20+ concurrent TLS+WebSocket handshakes
-   * when Instagram/X resolves multiple CDN subdomains (`scontent-*.cdninstagram.com`, `video-*.cdninstagram.com`).
-   */
   private fun resolveDnsOverTcpViaTunnel(dnsQuery: ByteArray, deadlineNanos: Long): ByteArray? {
     val tcpFrame = ByteArray(2 + dnsQuery.size)
     tcpFrame[0] = ((dnsQuery.size ushr 8) and 0xFF).toByte()
@@ -1007,7 +1189,6 @@ class LocalV2RayProxyServer(
 
     val startSlotIdx = (dnsSlotCounter.getAndIncrement() and 0x7FFFFFFF) % dnsTunnelSlots.size
 
-    // Try persistent reusable DNS tunnel slots first
     for (offset in dnsTunnelSlots.indices) {
       if (remainingDnsMillis(deadlineNanos) < 500) return null
       val slot = dnsTunnelSlots[(startSlotIdx + offset) % dnsTunnelSlots.size]
@@ -1020,13 +1201,11 @@ class LocalV2RayProxyServer(
       }
     }
 
-    // If both persistent slots were busy with concurrent queries, wait on the assigned slot
     if (remainingDnsMillis(deadlineNanos) < 500) return null
     val assignedSlot = dnsTunnelSlots[startSlotIdx]
-    // Bounded wait: an unbounded lock() here let one stuck slot stall every other DNS query.
     val lockWaitMs = remainingDnsMillis(deadlineNanos) - 500
     if (lockWaitMs <= 0 ||
-      !assignedSlot.lock.tryLock(lockWaitMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+      !assignedSlot.lock.tryLock(lockWaitMs.toLong(), TimeUnit.MILLISECONDS)
     ) {
       return null
     }
@@ -1151,7 +1330,7 @@ class LocalV2RayProxyServer(
         opened.connection.use { tunnel ->
           val (tlsIn, tlsOut) =
             GfwKnockerXrayCore.openSslEngineOverStreams(
-              sslContext = V2RayOutboundClient.permissiveSslContext,
+              sslContext = V2RayOutboundClient.createSmartSslContext(sniHost, allowInsecureFallback = true),
               rawIn = tunnel.inputStream,
               rawOut = tunnel.outputStream,
               sniHost = sniHost,
@@ -1195,7 +1374,7 @@ class LocalV2RayProxyServer(
             )
           val (tlsIn, tlsOut) =
             GfwKnockerXrayCore.openSslEngineOverStreams(
-              sslContext = V2RayOutboundClient.permissiveSslContext,
+              sslContext = V2RayOutboundClient.createSmartSslContext(sniHost, allowInsecureFallback = true),
               rawIn = raw.getInputStream(),
               rawOut = fragOut,
               sniHost = sniHost,
@@ -1352,13 +1531,46 @@ class LocalV2RayProxyServer(
       }
       clientSocket.soTimeout = 0
 
+      if (IranRoutingRules.isIranianDestination(effectiveHost, rawHost)) {
+        val directConn =
+          try {
+            IranRoutingRules.openDirectProtectedTunnel(
+              targetHost = effectiveHost,
+              targetPort = port,
+              timeoutMs = 5000,
+              protector = protector,
+              fallbackIpv4 = rawHost,
+            )
+          } catch (_: Exception) {
+            return
+          }
+        directConn.use { activeDirect ->
+          if (firstLen > 0) {
+            activeDirect.outputStream.write(firstBuffer, 0, firstLen)
+            activeDirect.outputStream.flush()
+            MehDiag.recordBytesUploaded(firstLen.toLong())
+          }
+          relayStreams(
+            clientIn = clientIn,
+            clientOut = clientOut,
+            remoteIn = activeDirect.inputStream,
+            remoteOut = activeDirect.outputStream,
+            clientSocket = clientSocket,
+            tunnelConnection = activeDirect,
+          )
+        }
+        return
+      }
+
+      val verifyFirstByte = firstLen > 0 && serverPool.size > 1
       val opened =
         openTunnelWithVerifiedFailover(
           targetHost = effectiveHost,
           targetPort = port,
           initialPayload = firstBuffer,
           initialPayloadLen = firstLen,
-          awaitFirstResponse = false,
+          awaitFirstResponse = verifyFirstByte,
+          firstReplyTimeoutMs = FIRST_BYTE_STALL_TIMEOUT_MS,
           fallbackIpv4 = rawHost,
         )
       opened.connection.use { tunnel ->
@@ -1373,6 +1585,7 @@ class LocalV2RayProxyServer(
           remoteOut = tunnel.outputStream,
           clientSocket = clientSocket,
           tunnelConnection = tunnel,
+          receivedInitialDownstreamByte = (opened.firstReplyLen > 0),
         )
       }
     } else {
@@ -1394,13 +1607,43 @@ class LocalV2RayProxyServer(
       val rewrittenBytes = rewrittenHeader.toByteArray(Charsets.ISO_8859_1)
       clientSocket.soTimeout = 0
 
+      if (IranRoutingRules.isIranianDestination(host, rawHost)) {
+        val directConn =
+          try {
+            IranRoutingRules.openDirectProtectedTunnel(
+              targetHost = host,
+              targetPort = port,
+              timeoutMs = 5000,
+              protector = protector,
+              fallbackIpv4 = rawHost,
+            )
+          } catch (_: Exception) {
+            return
+          }
+        directConn.use { activeDirect ->
+          activeDirect.outputStream.write(rewrittenBytes)
+          activeDirect.outputStream.flush()
+          MehDiag.recordBytesUploaded(rewrittenBytes.size.toLong())
+          relayStreams(
+            clientIn = clientIn,
+            clientOut = clientOut,
+            remoteIn = activeDirect.inputStream,
+            remoteOut = activeDirect.outputStream,
+            clientSocket = clientSocket,
+            tunnelConnection = activeDirect,
+          )
+        }
+        return
+      }
+
       val opened =
         openTunnelWithVerifiedFailover(
           targetHost = host,
           targetPort = port,
           initialPayload = rewrittenBytes,
           initialPayloadLen = rewrittenBytes.size,
-          awaitFirstResponse = false,
+          awaitFirstResponse = serverPool.size > 1,
+          firstReplyTimeoutMs = FIRST_BYTE_STALL_TIMEOUT_MS,
           fallbackIpv4 = rawHost,
         )
       opened.connection.use { tunnel ->
@@ -1415,16 +1658,12 @@ class LocalV2RayProxyServer(
           remoteOut = tunnel.outputStream,
           clientSocket = clientSocket,
           tunnelConnection = tunnel,
+          receivedInitialDownstreamByte = (opened.firstReplyLen > 0),
         )
       }
     }
   }
 
-  /**
-   * Builds an RFC 1035 empty `NOERROR` response truncated to [questionEndOffset] (`QDCOUNT=1`,
-   * `ANCOUNT=0`, `NSCOUNT=0`, `ARCOUNT=0`) so no trailing EDNS0 `OPT` bytes remain and Android's
-   * `ns_initparse` (`cp == eom`) always accepts it.
-   */
   private fun buildEmptyDnsNoerrorResponse(
     dnsQuery: ByteArray,
     questionEndOffset: Int = parseDnsQuestion(dnsQuery)?.questionEndOffset ?: dnsQuery.size,
@@ -1451,7 +1690,6 @@ class LocalV2RayProxyServer(
     val safeLen = questionEndOffset.coerceIn(12, dnsQuery.size)
     val resp = dnsQuery.copyOfRange(0, safeLen)
     resp[2] = ((dnsQuery[2].toInt() and 0x79) or 0x80).toByte()
-    // RA=1, RCODE=2 (SERVFAIL)
     resp[3] = 0x82.toByte()
     resp[4] = 0x00
     resp[5] = 0x01
@@ -1465,12 +1703,11 @@ class LocalV2RayProxyServer(
   }
 
   /**
-   * Full-duplex stream relay engineered for HTTP/2 multiplexed connections and long-lived media
-   * streams (Instagram feed, Reels video CDN, Graph API, X/Twitter):
-   * - Maintains a stable, generous idle timeout (`IDLE_STREAM_TIMEOUT_MS = 180_000` ms) without
-   *   shrinking `soTimeout` to 12 seconds when the client sends HTTP/2 `WINDOW_UPDATE`, `PING`, or
-   *   `SETTINGS` frames.
-   * - Uses 32KB buffers in both directions and performs clean half-close when a stream finishes.
+   * Full-duplex stream relay with:
+   * - Shorter initial timeout (`NO_DATA_STREAM_TIMEOUT_MS = 14s`) before downstream data flows,
+   *   upgrading to `IDLE_STREAM_TIMEOUT_MS = 45s` once bytes arrive.
+   * - Immediate propagation of client socket closure (`closeOutbound()` / `close()`) to the remote
+   *   node so closed streams never linger for 180 seconds.
    */
   private fun relayStreams(
     clientIn: InputStream,
@@ -1479,27 +1716,44 @@ class LocalV2RayProxyServer(
     remoteOut: OutputStream,
     clientSocket: Socket? = null,
     tunnelConnection: V2RayOutboundClient.TunnelConnection? = null,
+    receivedInitialDownstreamByte: Boolean = false,
   ) {
     try {
       clientSocket?.tcpNoDelay = true
       clientSocket?.keepAlive = true
-      clientSocket?.soTimeout = 0
+      clientSocket?.soTimeout = IDLE_STREAM_TIMEOUT_MS
     } catch (_: Exception) {}
-    tunnelConnection?.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
 
-    relayExecutor.execute {
-      try {
-        val buf = ByteArray(RELAY_BUFFER_SIZE)
-        while (running.get()) {
-          val n = clientIn.read(buf)
-          if (n <= 0) break
-          remoteOut.write(buf, 0, n)
-          remoteOut.flush()
+    var sawDownstreamData = receivedInitialDownstreamByte
+    tunnelConnection?.setReadTimeout(
+      if (sawDownstreamData) IDLE_STREAM_TIMEOUT_MS else NO_DATA_STREAM_TIMEOUT_MS
+    )
+
+    try {
+      relayExecutor.execute {
+        try {
+          val buf = ByteArray(RELAY_BUFFER_SIZE)
+          while (running.get()) {
+            val n = clientIn.read(buf)
+            if (n <= 0) break
+            remoteOut.write(buf, 0, n)
+            remoteOut.flush()
+            MehDiag.recordBytesUploaded(n.toLong())
+          }
+          // Client finished sending (EOF): propagate half-close to the V2Ray node stream
+          tunnelConnection?.closeOutbound()
+        } catch (_: Exception) {
+          if (clientSocket?.isClosed == true) {
+            try {
+              tunnelConnection?.close()
+            } catch (_: Exception) {}
+          } else {
+            tunnelConnection?.closeOutbound()
+          }
         }
-      } catch (_: Exception) {
-        // Do NOT close tunnelConnection here when clientIn reaches EOF/half-close,
-        // because the downstream loop (remoteIn -> clientOut) may still be downloading response data!
       }
+    } catch (_: Exception) {
+      MehDiag.recordStreamRejected()
     }
 
     try {
@@ -1507,8 +1761,14 @@ class LocalV2RayProxyServer(
       while (running.get()) {
         val n = remoteIn.read(buf)
         if (n <= 0) break
+        if (!sawDownstreamData) {
+          sawDownstreamData = true
+          MehDiag.recordFirstByteReceived()
+          tunnelConnection?.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
+        }
         clientOut.write(buf, 0, n)
         clientOut.flush()
+        MehDiag.recordBytesDownloaded(n.toLong())
       }
     } catch (_: Exception) {
     } finally {

@@ -400,6 +400,7 @@ class MehViewModel(
             repository.testAndSelectFastestCandidates(
               configs = configs,
               maxCount = 6,
+              prioritizedSavedNodes = cachedLastCandidates,
             ) { logLine ->
               appendLogLine(
                 message = logLine,

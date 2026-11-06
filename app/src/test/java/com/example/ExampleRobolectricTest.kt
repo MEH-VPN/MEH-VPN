@@ -177,4 +177,62 @@ class ExampleRobolectricTest {
     composeTestRule.onNodeWithTag("vpn_toggle_button").performClick()
     assertTrue(defaultPowerClicked)
   }
+
+  @Test
+  fun mehDiagAndIranRoutingAndFailover_workCorrectly() {
+    // 1. Verify MehDiag counters and active traffic tracking
+    com.example.vpn.MehDiag.reset()
+    com.example.vpn.MehDiag.recordDnsQueryStart()
+    com.example.vpn.MehDiag.recordDnsIranDirectHit(4L)
+    com.example.vpn.MehDiag.recordPrewarmedPoolHit()
+    com.example.vpn.MehDiag.recordFirstByteTimeoutFailover()
+    com.example.vpn.MehDiag.recordIranDirectBypass()
+    com.example.vpn.MehDiag.recordUdpVlessRelayedPacket()
+    com.example.vpn.MehDiag.recordTlsStrictVerified()
+    com.example.vpn.MehDiag.recordBytesDownloaded(8192L)
+
+    val snap = com.example.vpn.MehDiag.snapshot()
+    org.junit.Assert.assertEquals(1L, snap.dnsQueriesTotal)
+    org.junit.Assert.assertEquals(1L, snap.dnsIranDirectHits)
+    org.junit.Assert.assertEquals(1L, snap.prewarmedPoolHits)
+    org.junit.Assert.assertEquals(1L, snap.firstByteTimeoutFailovers)
+    org.junit.Assert.assertEquals(1L, snap.iranDirectBypassCount)
+    org.junit.Assert.assertEquals(1L, snap.udpVlessRelayedPackets)
+    org.junit.Assert.assertEquals(1L, snap.tlsStrictVerifiedCount)
+    assertTrue(com.example.vpn.MehDiag.hasRecentDownloadTraffic(5_000L))
+
+    // 2. Verify Iranian Direct Split-Tunneling rules (.ir, banking, domestic services, and Iranian CIDRs)
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianDestination("shaparak.ir"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianDestination("ebank.bmi.ir"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianDestination("api.digikala.com"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianDestination("torob.com"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianIpv4("2.144.12.34"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianIpv4("5.200.40.10"))
+    assertTrue(com.example.vpn.IranRoutingRules.isIranianIpv4("185.143.233.5"))
+
+    org.junit.Assert.assertFalse(com.example.vpn.IranRoutingRules.isIranianDestination("i.instagram.com"))
+    org.junit.Assert.assertFalse(com.example.vpn.IranRoutingRules.isIranianDestination("api.x.com"))
+    org.junit.Assert.assertFalse(com.example.vpn.IranRoutingRules.isIranianIpv4("8.8.8.8"))
+    org.junit.Assert.assertFalse(com.example.vpn.IranRoutingRules.isIranianIpv4("104.16.132.229"))
+
+    // 3. Verify mid-stream / keep-alive node failover rotation on LocalV2RayProxyServer
+    val cfg1 =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@node1.example.org:443?encryption=none&security=tls&sni=node1.example.org&type=ws&path=%2Fws#Node1"
+      )!!
+    val cfg2 =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@node2.example.org:443?encryption=none&security=tls&sni=node2.example.org&type=ws&path=%2Fws#Node2"
+      )!!
+    val server = com.example.vpn.LocalV2RayProxyServer(listOf(cfg1, cfg2), protector = { true })
+    org.junit.Assert.assertEquals("node1.example.org", server.activeConfig.address)
+    val switched = server.switchToNextHealthyNode("keep_alive_timeout")
+    org.junit.Assert.assertEquals("node2.example.org", switched.address)
+    org.junit.Assert.assertEquals("node2.example.org", server.activeConfig.address)
+    server.stop()
+
+    // 4. Verify Smart Strict-First SSLContext creation
+    val smartSsl = com.example.vpn.V2RayOutboundClient.createSmartSslContext("www.google.com", allowInsecureFallback = true)
+    org.junit.Assert.assertNotNull(smartSsl)
+  }
 }
