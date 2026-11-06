@@ -53,7 +53,84 @@ class SoliSpiritRepository(
 ) {
 
   companion object {
-    val SOLISPIRIT_SOURCES =
+    val PRIMARY_RZASHAKERI_SOURCES =
+      listOf(
+        // Batch 1: Primary CDN & Raw endpoints from rzashakeri/v2ray-configs (Priority #1)
+        SubscriptionSource(
+          name = "RzaShakeri/VLESS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Trojan-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Sub1-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Subscriptions/Sub1.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/AllSub-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/All_Configs_Sub.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        // Batch 2: Fastly & GCore mirrors for rzashakeri/v2ray-configs
+        SubscriptionSource(
+          name = "RzaShakeri/VLESS-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Trojan-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Sub1-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Subscriptions/Sub1.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/VLESS-GCore",
+          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        // Batch 3: Raw GitHub & root file endpoints for rzashakeri/v2ray-configs
+        SubscriptionSource(
+          name = "RzaShakeri/Trojan-GCore",
+          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/VLESS-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/vless.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Trojan-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Sub1-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Subscriptions/Sub1.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/AllSub-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/All_Configs_Sub.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/Tested-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Tested.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+      )
+
+    val FALLBACK_SOURCES =
       listOf(
         // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
         SubscriptionSource(
@@ -167,55 +244,101 @@ class SoliSpiritRepository(
         ),
       )
 
+    /**
+     * Combined list of all registered sources with `rzashakeri/v2ray-configs` as Priority #1,
+     * followed by `SoliSpirit/v2ray-configs` and `MohammadBahemmat/V2ray-Collector`.
+     */
+    val SOLISPIRIT_SOURCES = PRIMARY_RZASHAKERI_SOURCES + FALLBACK_SOURCES
+
     private const val WAVE_SIZE = 80
     private const val CONCURRENT_TEST_LIMIT = 32
   }
 
   /**
-   * Fetches V2Ray configs from both `SoliSpirit/v2ray-configs` and
-   * `MohammadBahemmat/V2ray-Collector` on GitHub (and CDN mirrors in parallel).
+   * Fetches configs exclusively from the Priority #1 repository (`rzashakeri/v2ray-configs`).
+   */
+  suspend fun fetchPrimaryConfigs(
+    onLogUpdate: (String) -> Unit,
+  ): List<V2RayConfig> =
+    withContext(ioDispatcher) {
+      onLogUpdate("اتصال به مخزن اولویت اول (rzashakeri/v2ray-configs) ...")
+      val configs = fetchFromSourceList(PRIMARY_RZASHAKERI_SOURCES)
+      if (configs.isNotEmpty()) {
+        onLogUpdate("${configs.size} سرور از مخزن اولویت اول دریافت شد")
+      }
+      configs
+    }
+
+  /**
+   * Fetches configs from the fallback repositories (`SoliSpirit/v2ray-configs` and
+   * `MohammadBahemmat/V2ray-Collector`) when Priority #1 is unavailable or fails verification.
+   */
+  suspend fun fetchFallbackConfigs(
+    onLogUpdate: (String) -> Unit,
+  ): List<V2RayConfig> =
+    withContext(ioDispatcher) {
+      onLogUpdate("اتصال به مخازن پشتیبان (SoliSpirit و V2ray-Collector) ...")
+      val configs = fetchFromSourceList(FALLBACK_SOURCES)
+      if (configs.isNotEmpty()) {
+        onLogUpdate("${configs.size} سرور از مخازن پشتیبان دریافت شد")
+      }
+      configs
+    }
+
+  private suspend fun fetchFromSourceList(
+    sources: List<SubscriptionSource>,
+  ): List<V2RayConfig> {
+    val collected = LinkedHashMap<String, V2RayConfig>()
+    val batches = sources.chunked(4)
+    for ((batchIdx, batch) in batches.withIndex()) {
+      coroutineContext.ensureActive()
+      val batchResults =
+        coroutineScope {
+          batch
+            .map { source ->
+              async {
+                val parsed = fetchSingleSource(source)
+                Pair(source, parsed)
+              }
+            }
+            .awaitAll()
+        }
+      for ((_, list) in batchResults) {
+        for (cfg in list) {
+          if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
+            collected[cfg.endpointKey] = cfg
+          }
+        }
+      }
+      if (batchIdx >= 1 && collected.size >= 380) {
+        break
+      }
+    }
+    return collected.values.toList()
+  }
+
+  /**
+   * Fetches V2Ray configs starting with Priority #1 (`rzashakeri/v2ray-configs`), and automatically
+   * falling back to `SoliSpirit/v2ray-configs` and `MohammadBahemmat/V2ray-Collector` if Priority #1
+   * yields no configs.
    */
   suspend fun fetchConfigsFromSoliSpirit(
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
-      val collected = LinkedHashMap<String, V2RayConfig>()
-
-      onLogUpdate("اتصال به مخازن SoliSpirit و V2ray-Collector ...")
-
-      val batches = SOLISPIRIT_SOURCES.chunked(4)
-      for ((batchIdx, batch) in batches.withIndex()) {
-        coroutineContext.ensureActive()
-        val batchResults =
-          coroutineScope {
-            batch
-              .map { source ->
-                async {
-                  val parsed = fetchSingleSource(source)
-                  Pair(source, parsed)
-                }
-              }
-              .awaitAll()
-          }
-        for ((_, list) in batchResults) {
-          for (cfg in list) {
-            if (V2RayOutboundClient.isSupportedByEngine(cfg) && !collected.containsKey(cfg.endpointKey)) {
-              collected[cfg.endpointKey] = cfg
-            }
-          }
-        }
-        if (batchIdx >= 1 && collected.size >= 380) {
-          break
-        }
+      val primary = fetchPrimaryConfigs(onLogUpdate)
+      if (primary.isNotEmpty()) {
+        return@withContext primary
       }
-
-      if (collected.isNotEmpty()) {
-        onLogUpdate("${collected.size} سرور دریافت شد")
-      }
-
-      collected.values.toList()
+      fetchFallbackConfigs(onLogUpdate)
     }
 
+  /**
+   * Priority-aware discovery and verification:
+   * 1. First fetches and tests configs from `rzashakeri/v2ray-configs` (Priority #1).
+   * 2. Only if Priority #1 returns no configs or none of its servers pass connection verification,
+   *    fetches and tests configs from the fallback repositories (`SoliSpirit` & `V2ray-Collector`).
+   */
   suspend fun executeMethodAndSelectCandidates(
     method: MehConnectionMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
     maxCount: Int = 6,
@@ -224,11 +347,27 @@ class SoliSpiritRepository(
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
       onLogUpdate("دریافت لیست سرور ها")
-      val configs = fetchConfigsFromSoliSpirit(onLogUpdate)
-      if (configs.isEmpty() && prioritizedSavedNodes.isEmpty()) return@withContext emptyList()
+      val primaryConfigs = fetchPrimaryConfigs(onLogUpdate)
+      if (primaryConfigs.isNotEmpty()) {
+        onLogUpdate("تست سرور ها")
+        val primaryVerified =
+          testAndSelectFastestCandidates(
+            configs = primaryConfigs,
+            maxCount = maxCount,
+            prioritizedSavedNodes = prioritizedSavedNodes,
+            onLogUpdate = onLogUpdate,
+          )
+        if (primaryVerified.isNotEmpty()) {
+          return@withContext primaryVerified
+        }
+        onLogUpdate("عدم اتصال سرورهای اولویت اول؛ بررسی مخازن پشتیبان ...")
+      }
+
+      val fallbackConfigs = fetchFallbackConfigs(onLogUpdate)
+      if (fallbackConfigs.isEmpty() && prioritizedSavedNodes.isEmpty()) return@withContext emptyList()
       onLogUpdate("تست سرور ها")
       testAndSelectFastestCandidates(
-        configs = configs,
+        configs = fallbackConfigs,
         maxCount = maxCount,
         prioritizedSavedNodes = prioritizedSavedNodes,
         onLogUpdate = onLogUpdate,
@@ -240,7 +379,7 @@ class SoliSpiritRepository(
       val request =
         Request.Builder()
           .url(source.url)
-          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/MEH-VPN/MEH-VPN)")
+          .header("User-Agent", "MEH-V2Ray-Android/26.10.3 (+https://github.com/rzashakeri/v2ray-configs)")
           .header("Accept", "text/plain, */*")
           .build()
 
@@ -274,9 +413,6 @@ class SoliSpiritRepository(
     configs: List<V2RayConfig>,
     maxCount: Int = 6,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
-    maxWaves: Int = 3,
-    concurrency: Int = CONCURRENT_TEST_LIMIT,
-    verifyConcurrency: Int = 6,
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
@@ -290,7 +426,7 @@ class SoliSpiritRepository(
       val supported = validSaved + remainingSupported
       if (supported.isEmpty()) return@withContext emptyList()
 
-      val semaphore = Semaphore(concurrency.coerceAtLeast(1))
+      val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
       val completedCount = AtomicInteger(0)
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
@@ -298,9 +434,9 @@ class SoliSpiritRepository(
       val fullSocialPool = mutableListOf<V2RayConfig>()
       val partialSocialPool = mutableListOf<V2RayConfig>()
       val fallbackHttpsPool = mutableListOf<V2RayConfig>()
-      val stage2Semaphore = Semaphore(verifyConcurrency.coerceAtLeast(1))
+      val stage2Semaphore = Semaphore(6)
 
-      val waves = supported.chunked(WAVE_SIZE).take(maxWaves.coerceAtLeast(1))
+      val waves = supported.chunked(WAVE_SIZE).take(3)
       for (wave in waves) {
         coroutineContext.ensureActive()
         val stage1Passed =
@@ -349,7 +485,7 @@ class SoliSpiritRepository(
                         V2RayOutboundClient.measureSmallDownloadThroughputKbps(
                           config = candidate,
                           timeoutMs = 2600,
-                          targetBytes = 49_152,
+                          targetBytes = 16_384,
                         )
                       }
                       val twitterJob = async {

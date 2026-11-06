@@ -343,8 +343,9 @@ class MehViewModel(
 
   /**
    * Primary V2Ray connection pipeline using the latest V2Ray core:
-   * 1. Fetches configs from `SoliSpirit/v2ray-configs` & `MohammadBahemmat/V2ray-Collector`.
-   * 2. Benchmarks and selects the fastest verified candidates.
+   * 1. Priority #1: Fetches and tests configs from `rzashakeri/v2ray-configs`.
+   * 2. Fallback: Only if Priority #1 yields no configs or none of its servers pass verification,
+   *    fetches and tests configs from `SoliSpirit/v2ray-configs` & `MohammadBahemmat/V2ray-Collector`.
    * 3. Starts the VPN tunnel service.
    */
   private fun startV2RayConnectionPipeline(
@@ -357,7 +358,7 @@ class MehViewModel(
         try {
           MehTelemetry.logConnectAttempt()
 
-          // Stage 1: دریافت لیست سرور ها (kept fixed in liveLogLine while sub-logs stream below it)
+          // Step 1 (Priority #1): دریافت لیست سرور ها از rzashakeri/v2ray-configs
           _uiState.update {
             it.copy(
               phase = MehPhase.FETCHING_CONFIGS,
@@ -368,50 +369,101 @@ class MehViewModel(
             )
           }
 
-          val configs =
-            repository.fetchConfigsFromSoliSpirit { logLine ->
+          val primaryConfigs =
+            repository.fetchPrimaryConfigs { logLine ->
               appendLogLine(
                 message = logLine,
                 level = HackerLogLevel.SOURCE,
               )
             }
-          if (configs.isEmpty()) {
-            MehTelemetry.logError(
-              stage = "fetch_configs",
-              errorMessage = "No V2Ray configs fetched",
-            )
+
+          var verifiedCandidates: List<V2RayConfig> = emptyList()
+
+          if (primaryConfigs.isNotEmpty()) {
+            MehTelemetry.logConfigsFetched(primaryConfigs.size)
+
             _uiState.update {
               it.copy(
-                phase = MehPhase.ERROR,
-                liveLogLine = "",
-                terminalLogs = emptyList(),
+                phase = MehPhase.TESTING_SPEED,
+                liveLogLine = LOG_TESTING,
               )
             }
-            return@launch
+            delay(120L)
+
+            verifiedCandidates =
+              repository.testAndSelectFastestCandidates(
+                configs = primaryConfigs,
+                maxCount = 6,
+                prioritizedSavedNodes = cachedLastCandidates,
+              ) { logLine ->
+                appendLogLine(
+                  message = logLine,
+                  level = HackerLogLevel.SCAN,
+                )
+              }
           }
 
-          MehTelemetry.logConfigsFetched(configs.size)
-
-          // Stage 2: تست سرور ها (kept fixed in liveLogLine while sub-logs stream below it)
-          _uiState.update {
-            it.copy(
-              phase = MehPhase.TESTING_SPEED,
-              liveLogLine = LOG_TESTING,
-            )
-          }
-          delay(120L)
-
-          val verifiedCandidates =
-            repository.testAndSelectFastestCandidates(
-              configs = configs,
-              maxCount = 6,
-              prioritizedSavedNodes = cachedLastCandidates,
-            ) { logLine ->
+          // Step 2 (Fallback): فقط در صورتی که سرورهای اولویت اول وصل نشدند سراغ دو لینک دیگر برو
+          if (verifiedCandidates.isEmpty()) {
+            if (primaryConfigs.isNotEmpty()) {
               appendLogLine(
-                message = logLine,
-                level = HackerLogLevel.SCAN,
+                message = "عدم اتصال سرورهای اولویت اول؛ بررسی مخازن پشتیبان ...",
+                level = HackerLogLevel.SOURCE,
               )
             }
+
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.FETCHING_CONFIGS,
+                liveLogLine = LOG_FETCHING,
+              )
+            }
+
+            val fallbackConfigs =
+              repository.fetchFallbackConfigs { logLine ->
+                appendLogLine(
+                  message = logLine,
+                  level = HackerLogLevel.SOURCE,
+                )
+              }
+
+            if (fallbackConfigs.isEmpty()) {
+              MehTelemetry.logError(
+                stage = "fetch_configs",
+                errorMessage = "No V2Ray configs fetched from primary or fallback sources",
+              )
+              _uiState.update {
+                it.copy(
+                  phase = MehPhase.ERROR,
+                  liveLogLine = "",
+                  terminalLogs = emptyList(),
+                )
+              }
+              return@launch
+            }
+
+            MehTelemetry.logConfigsFetched(fallbackConfigs.size)
+
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.TESTING_SPEED,
+                liveLogLine = LOG_TESTING,
+              )
+            }
+            delay(120L)
+
+            verifiedCandidates =
+              repository.testAndSelectFastestCandidates(
+                configs = fallbackConfigs,
+                maxCount = 6,
+                prioritizedSavedNodes = cachedLastCandidates,
+              ) { logLine ->
+                appendLogLine(
+                  message = logLine,
+                  level = HackerLogLevel.SCAN,
+                )
+              }
+          }
 
           if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(

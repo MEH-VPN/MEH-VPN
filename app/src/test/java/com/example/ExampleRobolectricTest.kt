@@ -63,10 +63,20 @@ class ExampleRobolectricTest {
     composeTestRule.onNodeWithTag("vpn_toggle_button").performClick()
     assertTrue(clicked)
 
-    // Verify MohammadBahemmat/V2ray-Collector is configured in SoliSpiritRepository sources
+    // Verify rzashakeri/v2ray-configs is Priority #1 and fallback sources are registered
     assertTrue(
-      "Expected MohammadBahemmat/V2ray-Collector sources to be registered",
-      com.example.data.SoliSpiritRepository.SOLISPIRIT_SOURCES.any {
+      "Expected rzashakeri/v2ray-configs to be Priority #1 in SOLISPIRIT_SOURCES",
+      com.example.data.SoliSpiritRepository.SOLISPIRIT_SOURCES.first().url.contains("rzashakeri/v2ray-configs"),
+    )
+    assertTrue(
+      "Expected PRIMARY_RZASHAKERI_SOURCES to be registered",
+      com.example.data.SoliSpiritRepository.PRIMARY_RZASHAKERI_SOURCES.all {
+        it.url.contains("rzashakeri/v2ray-configs")
+      },
+    )
+    assertTrue(
+      "Expected MohammadBahemmat/V2ray-Collector sources to be registered in fallback",
+      com.example.data.SoliSpiritRepository.FALLBACK_SOURCES.any {
         it.url.contains("MohammadBahemmat/V2ray-Collector")
       },
     )
