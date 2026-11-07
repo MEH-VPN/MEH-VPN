@@ -255,12 +255,24 @@ class MehVpnService : VpnService() {
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
 
+      // Duplicate and detach an independent native file descriptor for Go tun2socks:
+      // 1. Android Bionic fdsan tags establishedPfd as owned by ParcelFileDescriptor.
+      // 2. When Engine.stop() closes the FD from native Go, fdsan triggers fatal SIGABRT if still owned by Java.
+      // 3. Duplicating the FD and calling detachFd() yields an unmanaged FD (tag == 0) for tun2socks.
+      // 4. When tun2socks stops, it safely closes its detached FD, and vpnInterface cleanly closes its own.
+      val tunFd =
+        try {
+          ParcelFileDescriptor.dup(establishedPfd.fileDescriptor)?.detachFd() ?: establishedPfd.fd
+        } catch (_: Exception) {
+          establishedPfd.fd
+        }
+
       // 3. Start native Go tun2socks engine with the established TUN file descriptor
       try {
         val key =
           Key().apply {
             mtu = 1400L
-            device = "fd://${establishedPfd.fd}"
+            device = "fd://$tunFd"
             proxy = "socks5://127.0.0.1:$proxyPort"
             logLevel = "error"
           }
