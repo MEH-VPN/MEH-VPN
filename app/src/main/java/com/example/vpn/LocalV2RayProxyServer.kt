@@ -3,6 +3,7 @@ package com.example.vpn
 import com.example.model.V2RayConfig
 import com.example.model.V2RayProtocol
 import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -44,6 +45,26 @@ class LocalV2RayProxyServer(
   private val protector: (Socket) -> Boolean,
   private val udpProtector: (DatagramSocket) -> Boolean = { true },
 ) {
+  private class PersistentUdpSession(
+    val key: String,
+    val connection: V2RayOutboundClient.TunnelConnection,
+    val clientAddr: InetAddress,
+    val clientPort: Int,
+    val socksUdpHeader: ByteArray,
+  ) {
+    @Volatile var lastActiveMs: Long = System.currentTimeMillis()
+    @Volatile var isClosed: Boolean = false
+    val writeLock = Any()
+
+    fun close() {
+      isClosed = true
+      try {
+        connection.close()
+      } catch (_: Exception) {}
+    }
+  }
+
+  private val activeUdpSessions = ConcurrentHashMap<String, PersistentUdpSession>()
   constructor(
     config: V2RayConfig,
     protector: (Socket) -> Boolean,
@@ -81,6 +102,8 @@ class LocalV2RayProxyServer(
     private const val DNS_SLOT_TIMEOUT_MS = 1500
     private const val DNS_DOH_TIMEOUT_MS = 1500
 
+    private const val MAX_MAPPING_ENTRIES = 4096
+
     private val realIpToDomain = ConcurrentHashMap<String, String>()
     private val domainToRealIp = ConcurrentHashMap<String, String>()
 
@@ -90,6 +113,10 @@ class LocalV2RayProxyServer(
     fun recordRealDnsARecords(domain: String, dnsBytes: ByteArray) {
       val cleanDomain = domain.trim().trimEnd('.').lowercase()
       if (cleanDomain.isEmpty() || dnsBytes.size < 12) return
+      if (realIpToDomain.size >= MAX_MAPPING_ENTRIES) {
+        realIpToDomain.clear()
+        domainToRealIp.clear()
+      }
       val qdCount = ((dnsBytes[4].toInt() and 0xFF) shl 8) or (dnsBytes[5].toInt() and 0xFF)
       val anCount = ((dnsBytes[6].toInt() and 0xFF) shl 8) or (dnsBytes[7].toInt() and 0xFF)
       if (anCount <= 0) return
@@ -140,9 +167,20 @@ class LocalV2RayProxyServer(
       return syntheticIpToDomain[hostOrIp.trim()]
     }
 
+    fun clearMappingCaches() {
+      realIpToDomain.clear()
+      domainToRealIp.clear()
+      syntheticDomainToIp.clear()
+      syntheticIpToDomain.clear()
+    }
+
     private fun allocateSyntheticIpForDomain(domain: String): String {
       val cleanDomain = domain.trim().trimEnd('.').lowercase()
       syntheticDomainToIp[cleanDomain]?.let { return it }
+      if (syntheticDomainToIp.size >= MAX_MAPPING_ENTRIES) {
+        syntheticDomainToIp.clear()
+        syntheticIpToDomain.clear()
+      }
       val seq = syntheticIpCounter.getAndIncrement() and 0x0FFFF
       val oct3 = (seq / 250) and 0xFF
       val oct4 = (seq % 250) + 2 // 2..251, never 0, 1 or 255
@@ -331,6 +369,10 @@ class LocalV2RayProxyServer(
       udpRelaySocket?.close()
     } catch (_: Exception) {}
     closeAllPersistentDnsSlots()
+    for ((_, sess) in activeUdpSessions) {
+      sess.close()
+    }
+    activeUdpSessions.clear()
     V2RayOutboundClient.clearAllPrewarmedTransports()
     serverSocket = null
     udpRelaySocket = null
@@ -338,6 +380,7 @@ class LocalV2RayProxyServer(
     inFlightDnsLocks.clear()
     consecutiveFailures.clear()
     penalizedIndices.clear()
+    clearMappingCaches()
     try {
       relayExecutor.shutdownNow()
     } catch (_: Exception) {}
@@ -383,6 +426,10 @@ class LocalV2RayProxyServer(
     activeConfigIndex.set(nextIdx)
     consecutiveFailures[nextIdx]?.set(0)
     closeAllPersistentDnsSlots()
+    for ((_, sess) in activeUdpSessions) {
+      sess.close()
+    }
+    activeUdpSessions.clear()
     MehDiag.recordNodeSwitch()
     if (reason == "keep_alive_timeout") {
       MehDiag.recordKeepAliveTriggeredFailover()
@@ -421,6 +468,10 @@ class LocalV2RayProxyServer(
       }
     }
     closeAllPersistentDnsSlots()
+    for ((_, sess) in activeUdpSessions) {
+      sess.close()
+    }
+    activeUdpSessions.clear()
     MehDiag.recordNodeSwitch()
     if (running.get()) {
       V2RayOutboundClient.warmUpNodePoolAsync(
@@ -944,6 +995,116 @@ class LocalV2RayProxyServer(
    * - Port 443 (QUIC): Dropped so browsers/Instagram immediately use the 0-RTT pre-warmed TCP HTTP/2 pool.
    * - Other UDP ports (Voice calls, WebRTC, STUN, NTP, gaming): Relayed via VLESS UDP (`Command = 0x02`).
    */
+  private fun relayVlessUdpSession(
+    udpServer: DatagramSocket,
+    socksUdpHeader: ByteArray,
+    clientAddr: InetAddress,
+    clientPort: Int,
+    effectiveDstHost: String,
+    dstPort: Int,
+    udpPayload: ByteArray,
+  ) {
+    val sessionKey = "$clientPort:$effectiveDstHost:$dstPort"
+    val existing = activeUdpSessions[sessionKey]
+
+    if (existing != null && !existing.isClosed) {
+      existing.lastActiveMs = System.currentTimeMillis()
+      try {
+        val framedOut = ByteArray(2 + udpPayload.size)
+        framedOut[0] = ((udpPayload.size ushr 8) and 0xFF).toByte()
+        framedOut[1] = (udpPayload.size and 0xFF).toByte()
+        System.arraycopy(udpPayload, 0, framedOut, 2, udpPayload.size)
+        synchronized(existing.writeLock) {
+          existing.connection.outputStream.write(framedOut)
+          existing.connection.outputStream.flush()
+        }
+        MehDiag.recordBytesUploaded(framedOut.size.toLong())
+        return
+      } catch (_: Exception) {
+        existing.close()
+        activeUdpSessions.remove(sessionKey, existing)
+      }
+    }
+
+    try {
+      val tunnel =
+        V2RayOutboundClient.openTunnel(
+          config = activeConfig,
+          targetHost = effectiveDstHost,
+          targetPort = dstPort,
+          timeoutMs = 4000,
+          protector = protector,
+          usePrewarmedPool = true,
+          vlessCommand = V2RayOutboundClient.VLESS_CMD_UDP,
+        )
+
+      val session =
+        PersistentUdpSession(
+          key = sessionKey,
+          connection = tunnel,
+          clientAddr = clientAddr,
+          clientPort = clientPort,
+          socksUdpHeader = socksUdpHeader,
+        )
+      activeUdpSessions[sessionKey] = session
+
+      val framedOut = ByteArray(2 + udpPayload.size)
+      framedOut[0] = ((udpPayload.size ushr 8) and 0xFF).toByte()
+      framedOut[1] = (udpPayload.size and 0xFF).toByte()
+      System.arraycopy(udpPayload, 0, framedOut, 2, udpPayload.size)
+      synchronized(session.writeLock) {
+        tunnel.outputStream.write(framedOut)
+        tunnel.outputStream.flush()
+      }
+      MehDiag.recordBytesUploaded(framedOut.size.toLong())
+
+      relayExecutor.execute {
+        try {
+          tunnel.setReadTimeout(30_000)
+          val dataIn = DataInputStream(tunnel.inputStream)
+          val lenHeader = ByteArray(2)
+          while (running.get() && !session.isClosed && !udpServer.isClosed) {
+            try {
+              dataIn.readFully(lenHeader)
+            } catch (_: SocketTimeoutException) {
+              if (System.currentTimeMillis() - session.lastActiveMs > 30_000L) {
+                break
+              }
+              continue
+            }
+            val respLen = ((lenHeader[0].toInt() and 0xFF) shl 8) or (lenHeader[1].toInt() and 0xFF)
+            if (respLen !in 1..65507) break
+            val respPayload = ByteArray(respLen)
+            dataIn.readFully(respPayload)
+            MehDiag.recordBytesDownloaded(respLen.toLong())
+            MehDiag.recordUdpVlessRelayedPacket()
+            sendSocks5UdpReply(udpServer, session.socksUdpHeader, respPayload, session.clientAddr, session.clientPort)
+            session.lastActiveMs = System.currentTimeMillis()
+          }
+        } catch (_: Exception) {
+        } finally {
+          session.close()
+          activeUdpSessions.remove(sessionKey, session)
+        }
+      }
+    } catch (_: Exception) {
+      val vlessReply =
+        V2RayOutboundClient.exchangeVlessUdpDatagram(
+          config = activeConfig,
+          targetHost = effectiveDstHost,
+          targetPort = dstPort,
+          udpPayload = udpPayload,
+          timeoutMs = 3000,
+          protector = protector,
+        )
+      if (vlessReply != null) {
+        sendSocks5UdpReply(udpServer, socksUdpHeader, vlessReply, clientAddr, clientPort)
+      } else {
+        MehDiag.recordUdpDroppedPacket()
+      }
+    }
+  }
+
   private fun handleSocks5UdpDatagram(
     udpServer: DatagramSocket,
     packet: ByteArray,
@@ -1017,20 +1178,36 @@ class LocalV2RayProxyServer(
       return
     }
 
-    // 4. VLESS UDP (Command = 0x02) for voice calls, STUN/WebRTC, NTP, and custom UDP ports
-    val vlessReply =
-      V2RayOutboundClient.exchangeVlessUdpDatagram(
-        config = activeConfig,
-        targetHost = effectiveDstHost,
-        targetPort = dstPort,
+    // 4. Persistent VLESS UDP Session for VoIP/Discord/gaming and custom UDP ports
+    val isVless =
+      activeConfig.protocol == V2RayProtocol.VLESS ||
+        activeConfig.protocol == V2RayProtocol.MVLESS ||
+        activeConfig.protocol == V2RayProtocol.JVLESS
+    if (isVless) {
+      relayVlessUdpSession(
+        udpServer = udpServer,
+        socksUdpHeader = socksUdpHeader,
+        clientAddr = clientAddr,
+        clientPort = clientPort,
+        effectiveDstHost = effectiveDstHost,
+        dstPort = dstPort,
         udpPayload = udpPayload,
-        timeoutMs = 3000,
-        protector = protector,
       )
-    if (vlessReply != null) {
-      sendSocks5UdpReply(udpServer, socksUdpHeader, vlessReply, clientAddr, clientPort)
     } else {
-      MehDiag.recordUdpDroppedPacket()
+      val vlessReply =
+        V2RayOutboundClient.exchangeVlessUdpDatagram(
+          config = activeConfig,
+          targetHost = effectiveDstHost,
+          targetPort = dstPort,
+          udpPayload = udpPayload,
+          timeoutMs = 3000,
+          protector = protector,
+        )
+      if (vlessReply != null) {
+        sendSocks5UdpReply(udpServer, socksUdpHeader, vlessReply, clientAddr, clientPort)
+      } else {
+        MehDiag.recordUdpDroppedPacket()
+      }
     }
   }
 

@@ -13,6 +13,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import com.example.BuildConfig
 import com.example.MainActivity
 import com.example.data.SoliSpiritRepository
 import com.example.R
@@ -233,7 +234,7 @@ class MehVpnService : VpnService() {
       val proxyPort = proxyServer.start()
       localProxyServer = proxyServer
 
-      // 2. Establish full-device Android IPv4 TUN interface (0.0.0.0/0) excluding our own app.
+      // 2. Establish full-device Android TUN interface (0.0.0.0/0 and ::/0) excluding our own app.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
@@ -242,6 +243,12 @@ class MehVpnService : VpnService() {
           .addRoute("0.0.0.0", 0)
           .addDnsServer("8.8.8.8")
           .addDnsServer("1.1.1.1")
+
+      // Route all IPv6 traffic into the TUN interface to prevent physical network IPv6 leaks
+      try {
+        builder.addAddress("fd00::10:10:14:2", 64)
+        builder.addRoute("::", 0)
+      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -267,7 +274,7 @@ class MehVpnService : VpnService() {
           establishedPfd.fd
         }
 
-      // 3. Start native Go tun2socks engine with the established TUN file descriptor
+      // 3. Start native Go tun2socks engine with the detached TUN file descriptor
       try {
         val key =
           Key().apply {
@@ -348,10 +355,13 @@ class MehVpnService : VpnService() {
         var consecutiveFailures = 0
 
         // Counters are only useful if somebody can read them: `adb logcat -s MehDiag`.
-        launch {
-          while (isActive) {
-            delay(DIAG_LOG_INTERVAL_MS)
-            android.util.Log.i("MehDiag", MehDiag.formatCompactSummary())
+        // Run logcat writer only in DEBUG builds to save battery and reduce CPU wakeups.
+        if (BuildConfig.DEBUG) {
+          launch {
+            while (isActive) {
+              delay(DIAG_LOG_INTERVAL_MS)
+              android.util.Log.i("MehDiag", MehDiag.formatCompactSummary())
+            }
           }
         }
 
@@ -740,7 +750,7 @@ class MehVpnService : VpnService() {
     private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
 
     /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
-    private const val DIAG_LOG_INTERVAL_MS = 5_000L
+    private const val DIAG_LOG_INTERVAL_MS = 30_000L
 
     /** Keep-alive probe interval (45s instead of 15s for battery/data savings). */
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
