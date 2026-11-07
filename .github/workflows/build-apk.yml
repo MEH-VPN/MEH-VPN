@@ -76,8 +76,9 @@ jobs:
           mkdir -p dist
           VERSION="${{ github.ref_name }}"
           [ -z "$VERSION" ] && VERSION="v1.0.0"
+          SAFE_VERSION=$(echo "$VERSION" | tr '/' '-')
           SRC_APK=$(ls app/build/outputs/apk/debug/*.apk | head -n 1)
-          cp "$SRC_APK" "dist/MEH-VPN-${VERSION}.apk"
+          cp "$SRC_APK" "dist/MEH-VPN-${SAFE_VERSION}.apk"
           cp "$SRC_APK" "dist/MEH-VPN-latest.apk"
           echo "Packaged artifacts:"
           ls -l dist/
