@@ -532,6 +532,11 @@ class SoliSpiritRepository(
 
     private const val WAVE_SIZE = 80
     private const val CONCURRENT_TEST_LIMIT = 32
+    // Fast-connect path only: more parallel probes + a shorter first-pass probe so the
+    // user waits less. Background refinement keeps the low-cost defaults (concurrency 6).
+    private const val FAST_CONNECT_CONCURRENCY = 64
+    private const val FAST_CONNECT_PROBE_TIMEOUT_MS = 1500
+    private const val MAX_CONFIGS_PER_SOURCE = 1000
   }
 
   /**
@@ -709,7 +714,7 @@ private suspend fun fetchFromSourceList(
             ?.buffered()
             ?.useLines { lines -> lines.take(2000).joinToString("\n") }
             .orEmpty()
-        V2RayConfigParser.parseSubscriptionContent(bodyText)
+        V2RayConfigParser.parseSubscriptionContent(bodyText).take(MAX_CONFIGS_PER_SOURCE)
       }
     } catch (_: IOException) {
       emptyList()
@@ -994,6 +999,8 @@ private suspend fun fetchFromSourceList(
     configs: List<V2RayConfig>,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
     poolSize: Int = 4,
+    concurrency: Int = FAST_CONNECT_CONCURRENCY,
+    probeTimeoutMs: Int = FAST_CONNECT_PROBE_TIMEOUT_MS,
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
@@ -1013,7 +1020,7 @@ private suspend fun fetchFromSourceList(
       if (supported.isEmpty()) return@withContext emptyList()
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
-      val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
+      val semaphore = Semaphore(concurrency)
       for ((waveIdx, wave) in supported.chunked(WAVE_SIZE).withIndex()) {
         coroutineContext.ensureActive()
         val stage1Passed =
@@ -1023,7 +1030,7 @@ private suspend fun fetchFromSourceList(
                 async {
                   semaphore.withPermit {
                     coroutineContext.ensureActive()
-                    measureNodeSpeed(config)
+                    measureNodeSpeed(config, timeoutMs = probeTimeoutMs)
                   }
                 }
               }
@@ -1057,7 +1064,8 @@ private suspend fun fetchFromSourceList(
     }
 
   /**
-   * Fast first connect: probes configs wave by wave (80 per wave, 32 concurrent) and returns
+   * Fast first connect: probes configs wave by wave (80 per wave, 64 concurrent, 1500 ms
+   * first-pass probe) and returns
    * the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check, without
    * waiting for the rest of the wave or later waves. Saved healthy nodes are tried first.
    * The caller connects to the returned node immediately; the background refinement keeps
@@ -1075,7 +1083,55 @@ private suspend fun fetchFromSourceList(
       onLogUpdate = onLogUpdate,
     ).firstOrNull()
 
-fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
+  /**
+   * Pipelined fast connect: fetches sources in batches of 4 and probes each batch the
+   * moment it arrives, instead of downloading the whole tier first. Saved healthy nodes
+   * are tested before any download. Returns the first passing node plus up to
+   * [poolSize - 1] backups from the same wave, or empty when no batch yields a server.
+   */
+  suspend fun findFirstPassingFromSources(
+    sources: List<SubscriptionSource>,
+    prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+    poolSize: Int = 4,
+    onLogUpdate: (String) -> Unit,
+  ): List<V2RayConfig> =
+    withContext(ioDispatcher) {
+      val savedFirst =
+        findFastCandidatesWithFailoverPool(
+          configs = prioritizedSavedNodes,
+          poolSize = poolSize,
+          onLogUpdate = onLogUpdate,
+        )
+      if (savedFirst.isNotEmpty()) return@withContext savedFirst
+
+      for (batch in sources.chunked(4)) {
+        coroutineContext.ensureActive()
+        val batchConfigs =
+          coroutineScope {
+            batch
+              .map { source ->
+                async { fetchSingleSource(source) }
+              }
+              .awaitAll()
+          }.flatten()
+            .filter { V2RayOutboundClient.isSupportedByEngine(it) }
+            .distinctBy { it.endpointKey }
+        if (batchConfigs.isEmpty()) continue
+        val found =
+          findFastCandidatesWithFailoverPool(
+            configs = batchConfigs,
+            poolSize = poolSize,
+            onLogUpdate = onLogUpdate,
+          )
+        if (found.isNotEmpty()) return@withContext found
+      }
+      emptyList()
+    }
+
+fun measureNodeSpeed(
+  config: V2RayConfig,
+  timeoutMs: Int = 2600,
+): V2RayConfig? {
     // UDP-only protocols can never pass the TCP 204 probe; skip them here as well
     // so background refine calls do not waste a probe slot on them either.
     if (config.protocol == V2RayProtocol.HYSTERIA2 ||
@@ -1086,7 +1142,7 @@ fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
     }
     val resolvedIp = V2RayOutboundClient.resolveEndpointIpv4(config.address) ?: return null
     val withIp = config.copy(resolvedIp = resolvedIp)
-    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(withIp, timeoutMs = 2600) ?: return null
+    val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(withIp, timeoutMs = timeoutMs) ?: return null
     val score = 10_000.0 / realDelayMs.toDouble()
     return withIp.copy(
       latencyMs = realDelayMs,
