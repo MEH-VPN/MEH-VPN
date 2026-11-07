@@ -386,7 +386,7 @@ class MehViewModel(
 
           verifiedCandidates =
             repository.findFirstPassingFromSources(
-              sources = repository.PRIMARY_RZASHAKERI_SOURCES,
+              sources = SoliSpiritRepository.PRIMARY_RZASHAKERI_SOURCES,
               prioritizedSavedNodes = cachedLastCandidates,
               poolSize = 5,
             ) { logLine ->
@@ -408,7 +408,7 @@ class MehViewModel(
 
             verifiedCandidates =
               repository.findFirstPassingFromSources(
-                sources = repository.MHCFP_SOURCES,
+                sources = SoliSpiritRepository.MHCFP_SOURCES,
                 prioritizedSavedNodes = cachedLastCandidates,
                 poolSize = 5,
               ) { logLine ->
@@ -436,7 +436,7 @@ class MehViewModel(
 
             verifiedCandidates =
               repository.findFirstPassingFromSources(
-                sources = repository.FALLBACK_SOURCES,
+                sources = SoliSpiritRepository.FALLBACK_SOURCES,
                 prioritizedSavedNodes = cachedLastCandidates,
                 poolSize = 5,
               ) { logLine ->
