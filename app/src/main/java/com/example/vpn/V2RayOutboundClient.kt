@@ -25,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -483,6 +484,25 @@ object V2RayOutboundClient {
    * Resolves a V2Ray server hostname to a clean public IPv4 address, rejecting private/sinkhole IPs
    * (such as 10.10.34.x ISP DNS poisoning).
    */
+  private val dnsExecutor = Executors.newCachedThreadPool { runnable ->
+    Thread(runnable, "meh-dns").apply { isDaemon = true }
+  }
+
+  /**
+   * System DNS (`InetAddress.getAllByName`) has no timeout and can block a probe thread
+   * for tens of seconds on a dead domain. Bound it to 3 seconds; on timeout the caller
+   * falls through to the DoH fallback, which is itself socket-timeout bounded.
+   */
+  private fun resolveHostWithTimeout(host: String, timeoutMs: Long = 3000L): Array<InetAddress>? {
+    val future = dnsExecutor.submit<Array<InetAddress>> { InetAddress.getAllByName(host) }
+    return try {
+      future.get(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: Exception) {
+      future.cancel(true)
+      null
+    }
+  }
+
   fun resolveEndpointIpv4(host: String): String? {
     val trimmed = host.trim()
     if (trimmed.isEmpty()) return null
@@ -496,7 +516,7 @@ object V2RayOutboundClient {
     }
 
     try {
-      val candidates = InetAddress.getAllByName(trimmed)
+      val candidates = resolveHostWithTimeout(trimmed).orEmpty()
       for (addr in candidates) {
         if (addr is Inet4Address) {
           val bytes = addr.address
