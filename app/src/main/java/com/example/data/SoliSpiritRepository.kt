@@ -67,6 +67,16 @@ class SoliSpiritRepository(
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
+          name = "RzaShakeri/VMess-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vmess.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/SS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/ss.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
           name = "RzaShakeri/Sub1-CDN",
           url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Subscriptions/Sub1.txt",
           repoLabel = "rzashakeri/v2ray-configs",
@@ -85,6 +95,16 @@ class SoliSpiritRepository(
         SubscriptionSource(
           name = "RzaShakeri/Trojan-Fastly",
           url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/VMess-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vmess.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/SS-Fastly",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/ss.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
@@ -111,6 +131,16 @@ class SoliSpiritRepository(
         SubscriptionSource(
           name = "RzaShakeri/Trojan-Raw",
           url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/trojan.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/VMess-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/vmess.txt",
+          repoLabel = "rzashakeri/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "RzaShakeri/SS-Raw",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/ss.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
@@ -153,10 +183,30 @@ class SoliSpiritRepository(
           url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/trojan.txt",
           repoLabel = "SoliSpirit/v2ray-configs",
         ),
-        // Batch 2: Trojan & Fastly mirrors from both repositories
+        // Batch 2: Trojan, VMess, SS & Fastly mirrors from both repositories
         SubscriptionSource(
           name = "Bahemmat/Trojan-CDN",
           url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/trojan_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VMess-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/vmess.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/VMess-CDN",
+          url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/vmess_servers.txt",
+          repoLabel = "MohammadBahemmat/V2ray-Collector",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/SS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/SoliSpirit/v2ray-configs@main/Protocols/ss.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "Bahemmat/SS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/servers/shadowsocks_servers.txt",
           repoLabel = "MohammadBahemmat/V2ray-Collector",
         ),
         SubscriptionSource(
@@ -230,6 +280,16 @@ class SoliSpiritRepository(
         SubscriptionSource(
           name = "SoliSpirit/VLESS-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/VMess-Raw",
+          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vmess.txt",
+          repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "SoliSpirit/SS-Raw",
+          url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/ss.txt",
           repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(

@@ -356,7 +356,14 @@ object V2RayOutboundClient {
   }
 
   private fun canUsePrewarmedPool(config: V2RayConfig): Boolean {
-    if (config.protocol == V2RayProtocol.SERVERLESS) return false
+    if (config.protocol == V2RayProtocol.SERVERLESS ||
+      config.protocol == V2RayProtocol.WIREGUARD ||
+      config.protocol == V2RayProtocol.SOCKS5 ||
+      config.protocol == V2RayProtocol.HTTP_PROXY ||
+      config.network.equals("kcp", ignoreCase = true)
+    ) {
+      return false
+    }
     return isSupportedByEngine(config)
   }
 
@@ -384,45 +391,87 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Returns true if this config uses a clean protocol/transport combination supported by the V2Ray engine.
+   * Returns true if this config uses a protocol, transport, and security layer supported by our unified engine.
    */
   fun isSupportedByEngine(config: V2RayConfig): Boolean {
     if (config.protocol == V2RayProtocol.SERVERLESS) {
       return true
     }
-    val isVlessFamily =
-      config.protocol == V2RayProtocol.VLESS ||
-        config.protocol == V2RayProtocol.MVLESS ||
-        config.protocol == V2RayProtocol.JVLESS
-    if (!isVlessFamily && config.protocol != V2RayProtocol.TROJAN) {
-      return false
-    }
     if (config.address.contains(":")) {
       return false
     }
-    val net = config.network.lowercase()
-    if (net != "tcp" && net != "ws" && net != "httpupgrade") {
+    when (config.protocol) {
+      V2RayProtocol.SHADOWSOCKS -> {
+        val cipher = config.cipher.ifBlank { config.authId.substringBefore(":") }
+        return VmessAndShadowsocksEngine.isSupportedShadowsocksCipher(cipher)
+      }
+      V2RayProtocol.WIREGUARD -> {
+        return config.authId.isNotBlank() && config.publicKey.isNotBlank()
+      }
+      V2RayProtocol.HYSTERIA2,
+      V2RayProtocol.TUIC -> {
+        return config.authId.isNotBlank()
+      }
+      V2RayProtocol.SOCKS5,
+      V2RayProtocol.HTTP_PROXY -> {
+        return config.address.isNotBlank() && config.port in 1..65535
+      }
+      V2RayProtocol.VMESS -> {
+        if (parseUuidBytes(config.authId) == null) return false
+      }
+      V2RayProtocol.VLESS,
+      V2RayProtocol.MVLESS,
+      V2RayProtocol.JVLESS -> {
+        if (parseUuidBytes(config.authId) == null) return false
+        val enc = config.encryption.lowercase().trim()
+        if (enc != "none" && enc != "") return false
+        val flw = config.flow.lowercase().trim()
+        if (flw.isNotEmpty() &&
+          flw != "xtls-rprx-vision" &&
+          flw != "xtls-rprx-vision-udp443"
+        ) {
+          return false
+        }
+      }
+      V2RayProtocol.TROJAN -> {
+        if (config.authId.isBlank()) return false
+      }
+      else -> return false
+    }
+
+    val net = config.network.lowercase().trim()
+    if (net != "tcp" &&
+      net != "ws" &&
+      net != "httpupgrade" &&
+      net != "grpc" &&
+      net != "xhttp" &&
+      net != "splithttp" &&
+      net != "h2" &&
+      net != "http" &&
+      net != "kcp" &&
+      net != "mkcp" &&
+      net != "quic" &&
+      net != "udp"
+    ) {
       return false
     }
-    val sec = config.security.lowercase()
-    if (sec != "none" && sec != "tls" && sec != "") {
+
+    val sec = config.security.lowercase().trim()
+    if (sec != "none" &&
+      sec != "tls" &&
+      sec != "reality" &&
+      sec != "ss" &&
+      sec != "noise" &&
+      sec != ""
+    ) {
       return false
     }
-    if (config.pbk.isNotEmpty()) {
+    if (sec == "reality" && config.pbk.isBlank()) {
       return false
     }
-    if (isVlessFamily && config.flow.isNotBlank()) {
-      return false
-    }
-    val enc = config.encryption.lowercase()
-    if (enc != "none" && enc != "") {
-      return false
-    }
-    val hdr = config.headerType.lowercase()
-    if (hdr != "none" && hdr != "" && hdr != "---") {
-      return false
-    }
-    if (isVlessFamily && parseUuidBytes(config.authId) == null) {
+
+    val hdr = config.headerType.lowercase().trim()
+    if (hdr != "none" && hdr != "http" && hdr != "" && hdr != "---") {
       return false
     }
     return true
@@ -882,6 +931,17 @@ object V2RayOutboundClient {
     timeoutMs: Int,
     protector: ((Socket) -> Boolean)?,
   ): PrewarmedNodeTransport {
+    val net = config.network.lowercase().trim()
+    if (net == "kcp" || net == "mkcp") {
+      val (kcpIn, kcpOut) = AdvancedTransportsEngine.openMkcpTransport(config, timeoutMs, protector)
+      return PrewarmedNodeTransport(
+        rawSocket = Socket(),
+        tlsSocket = null,
+        transportIn = kcpIn,
+        transportOut = kcpOut,
+      )
+    }
+
     val rawSocket = Socket()
     try {
       try {
@@ -905,42 +965,82 @@ object V2RayOutboundClient {
         }
       rawSocket.connect(remoteEndpoint, timeoutMs)
 
-      val isTls = config.security.equals("tls", ignoreCase = true)
+      val sec = config.security.lowercase().trim()
+      val isReality = sec == "reality" || config.pbk.isNotBlank()
+      val isTls = sec == "tls"
       var activeSslSocket: SSLSocket? = null
       val (rawTransportIn, rawTransportOut) =
-        if (isTls) {
-          val tlsTriple = establishTlsStreams(rawSocket, config, timeoutMs)
-          activeSslSocket = tlsTriple.third
-          Pair(tlsTriple.first, tlsTriple.second)
-        } else {
-          val tcpProfile =
-            if (config.fragmentProfile.startsWith("patterniha")) {
-              GfwKnockerXrayCore.FragmentConfig.PATTERNIHA_TCP_DIRECT
-            } else {
-              GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS
-            }
-          Pair(
-            BufferedInputStream(rawSocket.getInputStream(), 32768),
-            GfwKnockerXrayCore.FragmentWriterOutputStream(
-              rawSocket.getOutputStream(),
-              tcpProfile,
-            ),
-          )
+        when {
+          isReality -> {
+            val realityTriple =
+              AdvancedTransportsEngine.establishRealityTlsStreams(rawSocket, config, timeoutMs)
+            activeSslSocket = realityTriple.third
+            Pair(realityTriple.first, realityTriple.second)
+          }
+          isTls -> {
+            val tlsTriple = establishTlsStreams(rawSocket, config, timeoutMs)
+            activeSslSocket = tlsTriple.third
+            Pair(tlsTriple.first, tlsTriple.second)
+          }
+          else -> {
+            val tcpProfile =
+              if (config.fragmentProfile.startsWith("patterniha")) {
+                GfwKnockerXrayCore.FragmentConfig.PATTERNIHA_TCP_DIRECT
+              } else {
+                GfwKnockerXrayCore.FragmentConfig.DEFAULT_TCP_PACKETS
+              }
+            Pair(
+              BufferedInputStream(rawSocket.getInputStream(), 32768),
+              GfwKnockerXrayCore.FragmentWriterOutputStream(
+                rawSocket.getOutputStream(),
+                tcpProfile,
+              ),
+            )
+          }
         }
 
       var transportIn: InputStream = rawTransportIn
       var transportOut: OutputStream = rawTransportOut
 
-      if (config.network.equals("ws", ignoreCase = true)) {
-        performWebSocketUpgrade(config, transportIn, transportOut)
-        val wsOut = WebSocketFrameOutputStream(transportOut)
-        val wsIn = WebSocketFrameInputStream(transportIn) { pongPayload ->
-          wsOut.sendPong(pongPayload)
+      when (net) {
+        "ws" -> {
+          performWebSocketUpgrade(config, transportIn, transportOut)
+          val wsOut = WebSocketFrameOutputStream(transportOut)
+          val wsIn = WebSocketFrameInputStream(transportIn) { pongPayload ->
+            wsOut.sendPong(pongPayload)
+          }
+          transportIn = wsIn
+          transportOut = wsOut
         }
-        transportIn = wsIn
-        transportOut = wsOut
-      } else if (config.network.equals("httpupgrade", ignoreCase = true)) {
-        GfwKnockerXrayCore.performHttpUpgrade(config, transportIn, transportOut)
+        "httpupgrade" -> {
+          GfwKnockerXrayCore.performHttpUpgrade(config, transportIn, transportOut)
+        }
+        "grpc" -> {
+          val (gIn, gOut) =
+            AdvancedTransportsEngine.openGrpcOrH2Stream(config, transportIn, transportOut, isGrpc = true)
+          transportIn = gIn
+          transportOut = gOut
+        }
+        "h2", "http" -> {
+          val (hIn, hOut) =
+            AdvancedTransportsEngine.openGrpcOrH2Stream(config, transportIn, transportOut, isGrpc = false)
+          transportIn = hIn
+          transportOut = hOut
+        }
+        "xhttp", "splithttp" -> {
+          val (xIn, xOut) =
+            AdvancedTransportsEngine.openXhttpStream(config, transportIn, transportOut)
+          transportIn = xIn
+          transportOut = xOut
+        }
+        "tcp" -> {
+          if (config.headerType.equals("http", ignoreCase = true)) {
+            val (obfsIn, obfsOut) =
+              AdvancedTransportsEngine.wrapTcpHttpObfuscation(config, transportIn, transportOut)
+            transportIn = obfsIn
+            transportOut = obfsOut
+          }
+        }
       }
 
       return PrewarmedNodeTransport(
@@ -982,6 +1082,21 @@ object V2RayOutboundClient {
           timeoutMs = timeoutMs,
           protector = protector,
           fallbackIpv4 = fallbackIpv4,
+        ).also { MehDiag.recordTcpConnectSuccess() }
+      } catch (e: Exception) {
+        MehDiag.recordTcpConnectFailure()
+        throw e
+      }
+    }
+
+    if (config.protocol == V2RayProtocol.WIREGUARD) {
+      return try {
+        NextGenProtocolsEngine.openWireGuardTunnel(
+          config = config,
+          targetHost = targetHost,
+          targetPort = targetPort,
+          timeoutMs = timeoutMs,
+          protector = protector,
         ).also { MehDiag.recordTcpConnectSuccess() }
       } catch (e: Exception) {
         MehDiag.recordTcpConnectFailure()
@@ -1049,6 +1164,68 @@ object V2RayOutboundClient {
               config,
               targetHost,
               targetPort,
+              command = if (vlessCommand == VLESS_CMD_UDP) 0x03 else 0x01,
+            )
+          V2RayProtocol.VMESS ->
+            VmessAndShadowsocksEngine.setupVmessStream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+              isUdp = (vlessCommand == VLESS_CMD_UDP),
+            )
+          V2RayProtocol.SHADOWSOCKS ->
+            VmessAndShadowsocksEngine.setupShadowsocksStream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+            )
+          V2RayProtocol.HYSTERIA2 ->
+            NextGenProtocolsEngine.setupHysteria2Stream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+            )
+          V2RayProtocol.TUIC ->
+            NextGenProtocolsEngine.setupTuicV5Stream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+            )
+          V2RayProtocol.SOCKS5 ->
+            VmessAndShadowsocksEngine.setupSocks5Stream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
+            )
+          V2RayProtocol.HTTP_PROXY ->
+            VmessAndShadowsocksEngine.setupHttpProxyStream(
+              transport.rawSocket,
+              transport.tlsSocket,
+              transport.transportIn,
+              transport.transportOut,
+              config,
+              targetHost,
+              targetPort,
             )
           else -> throw IOException("Unsupported protocol: ${config.protocol}")
         }
@@ -1062,8 +1239,8 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Opens a VLESS UDP (`Command = 0x02`) tunnel to [targetHost]:[targetPort] and exchanges a
-   * length-framed UDP datagram (`[2-byte length][payload]`).
+   * Exchanges a UDP datagram over the active node using VLESS UDP (`0x02`), Trojan UDP (`0x03`),
+   * VMess UDP (`0x02`), or Shadowsocks UDP.
    */
   fun exchangeVlessUdpDatagram(
     config: V2RayConfig,
@@ -1073,11 +1250,35 @@ object V2RayOutboundClient {
     timeoutMs: Int = 3500,
     protector: ((Socket) -> Boolean)? = null,
   ): ByteArray? {
-    val isVlessFamily =
+    if (udpPayload.isEmpty() || udpPayload.size > 65507) return null
+
+    if (config.protocol == V2RayProtocol.TROJAN) {
+      return NextGenProtocolsEngine.exchangeTrojanUdpDatagram(
+        config = config,
+        targetHost = targetHost,
+        targetPort = targetPort,
+        udpPayload = udpPayload,
+        timeoutMs = timeoutMs,
+        protector = protector,
+      )
+    }
+
+    if (config.protocol == V2RayProtocol.SHADOWSOCKS) {
+      return VmessAndShadowsocksEngine.exchangeShadowsocksUdpDatagram(
+        config = config,
+        targetHost = targetHost,
+        targetPort = targetPort,
+        udpPayload = udpPayload,
+        timeoutMs = timeoutMs,
+      )
+    }
+
+    val isVlessOrVmess =
       config.protocol == V2RayProtocol.VLESS ||
         config.protocol == V2RayProtocol.MVLESS ||
-        config.protocol == V2RayProtocol.JVLESS
-    if (!isVlessFamily || udpPayload.isEmpty() || udpPayload.size > 65507) return null
+        config.protocol == V2RayProtocol.JVLESS ||
+        config.protocol == V2RayProtocol.VMESS
+    if (!isVlessOrVmess) return null
 
     return try {
       openTunnel(
@@ -1090,6 +1291,18 @@ object V2RayOutboundClient {
         vlessCommand = VLESS_CMD_UDP,
       ).use { tunnel ->
         tunnel.setReadTimeout(timeoutMs)
+        if (config.protocol == V2RayProtocol.VMESS) {
+          tunnel.outputStream.write(udpPayload)
+          tunnel.outputStream.flush()
+          MehDiag.recordBytesUploaded(udpPayload.size.toLong())
+          val recvBuf = ByteArray(65507)
+          val n = tunnel.inputStream.read(recvBuf)
+          if (n <= 0) return null
+          MehDiag.recordBytesDownloaded(n.toLong())
+          MehDiag.recordUdpVlessRelayedPacket()
+          return recvBuf.copyOf(n)
+        }
+
         val framedOut = ByteArray(2 + udpPayload.size)
         framedOut[0] = ((udpPayload.size ushr 8) and 0xFF).toByte()
         framedOut[1] = (udpPayload.size and 0xFF).toByte()
@@ -1193,10 +1406,17 @@ object V2RayOutboundClient {
         .trim()
         .trimEnd('.')
 
-    val isWsOrUpgrade =
-      config.network.equals("ws", ignoreCase = true) ||
-        config.network.equals("httpupgrade", ignoreCase = true)
-    val alpn = if (isWsOrUpgrade) arrayOf("http/1.1") else null
+    val net = config.network.lowercase().trim()
+    val isWsOrUpgrade = net == "ws" || net == "httpupgrade" || net == "xhttp" || net == "splithttp"
+    val isH2OrGrpc = net == "grpc" || net == "h2" || net == "http"
+    val alpn =
+      when {
+        isH2OrGrpc -> arrayOf("h2")
+        isWsOrUpgrade -> arrayOf("http/1.1")
+        config.alpn.isNotBlank() ->
+          config.alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toTypedArray()
+        else -> null
+      }
 
     val desiredCiphers =
       if (config.cipherSuites.isNotBlank()) {
@@ -1329,11 +1549,15 @@ object V2RayOutboundClient {
       parseUuidBytes(config.authId) ?: throw IOException("Invalid VLESS UUID: ${config.authId}")
 
     val wireVersion = GfwKnockerXrayCore.vlessWireVersionFor(config.protocol).toInt() and 0xFF
+    val flowAddon = AdvancedTransportsEngine.encodeVlessFlowAddon(config.flow)
 
     val header = ByteArrayOutputStream(64)
     header.write(wireVersion) // 0x00 (VLESS), 150/0x96 (MVLESS), or 0x78 (JVLESS)
     header.write(uuidBytes) // 16-byte UUID
-    header.write(0x00) // Addons length = 0
+    header.write(flowAddon.size and 0xFF) // Addons length (0 or 18 for xtls-rprx-vision)
+    if (flowAddon.isNotEmpty()) {
+      header.write(flowAddon)
+    }
     header.write(command and 0xFF) // Command = 0x01 (TCP) or 0x02 (UDP)
     header.write((targetPort ushr 8) and 0xFF) // Port high byte
     header.write(targetPort and 0xFF) // Port low byte
@@ -1415,6 +1639,12 @@ object V2RayOutboundClient {
         }
       }
 
+    if (config.flow.startsWith("xtls-rprx-vision", ignoreCase = true) && command == VLESS_CMD_TCP) {
+      val (visionIn, visionOut) =
+        AdvancedTransportsEngine.wrapXtlsVisionStream(uuidBytes, vlessIn, vlessOut)
+      return TunnelConnection(socket, visionIn, visionOut, tlsSocket)
+    }
+
     return TunnelConnection(socket, vlessIn, vlessOut, tlsSocket)
   }
 
@@ -1426,12 +1656,13 @@ object V2RayOutboundClient {
     config: V2RayConfig,
     targetHost: String,
     targetPort: Int,
+    command: Int = 0x01,
   ): TunnelConnection {
     val passwordHashHex = sha224Hex(config.authId)
     val header = ByteArrayOutputStream(128)
     header.write(passwordHashHex.toByteArray(Charsets.US_ASCII))
     header.write(byteArrayOf(0x0D, 0x0A))
-    header.write(0x01) // CONNECT
+    header.write(command and 0xFF) // 0x01 = CONNECT (TCP), 0x03 = UDP ASSOCIATE (Trojan UDP)
     writeSocks5Address(header, targetHost)
     header.write((targetPort ushr 8) and 0xFF)
     header.write(targetPort and 0xFF)
@@ -1502,6 +1733,8 @@ object V2RayOutboundClient {
     out.write(domainBytes.size)
     out.write(domainBytes)
   }
+
+  internal fun parseUuidBytesInternal(uuidStr: String): ByteArray? = parseUuidBytes(uuidStr)
 
   private fun parseUuidBytes(uuidStr: String): ByteArray? {
     val hex = uuidStr.trim().replace("-", "")

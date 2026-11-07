@@ -268,4 +268,99 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("node3.example.org", server.replaceServerPool(emptyList()).address)
     server.stop()
   }
+
+  @Test
+  fun allNewProtocolsAndTransports_parseAndAreSupportedByEngine() {
+    val vmessJson =
+      """{"v":"2","ps":"VMess-WS","add":"vmess.example.org","port":"443","id":"11111111-2222-3333-4444-555555555555","aid":"0","scy":"auto","net":"ws","type":"none","host":"vmess.example.org","path":"/vmess","tls":"tls","sni":"vmess.example.org"}"""
+    val vmessUri =
+      "vmess://" +
+        java.util.Base64.getEncoder().encodeToString(vmessJson.toByteArray(Charsets.UTF_8))
+
+    val ssUserInfoB64 =
+      java.util.Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString("chacha20-ietf-poly1305:mySecretPass123".toByteArray(Charsets.UTF_8))
+    val ssUri = "ss://$ssUserInfoB64@ss.example.org:8388#Shadowsocks-ChaCha"
+
+    val ss2022KeyB64 =
+      java.util.Base64.getEncoder().encodeToString(ByteArray(16) { (it + 1).toByte() })
+    val ss2022Uri = "ss://2022-blake3-aes-128-gcm:$ss2022KeyB64@ss2022.example.org:8388#SS2022"
+
+    val realityPubKeyB64 =
+      java.util.Base64.getUrlEncoder()
+        .withoutPadding()
+        .encodeToString(ByteArray(32) { (it + 5).toByte() })
+    val realityVisionUri =
+      "vless://11111111-2222-3333-4444-555555555555@reality.example.org:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=$realityPubKeyB64&sid=1a2b3c4d&type=tcp#Reality-Vision"
+
+    val tcpHttpObfsUri =
+      "vless://11111111-2222-3333-4444-555555555555@mci.example.org:8080?encryption=none&security=none&type=tcp&headerType=http&host=speedtest.net&path=%2F#TCP-HTTP-Obfs"
+
+    val grpcUri =
+      "vless://11111111-2222-3333-4444-555555555555@grpc.example.org:443?encryption=none&security=tls&sni=grpc.example.org&type=grpc&serviceName=GunService#VLESS-gRPC"
+
+    val xhttpUri =
+      "vless://11111111-2222-3333-4444-555555555555@xhttp.example.org:443?encryption=none&security=tls&sni=xhttp.example.org&type=xhttp&path=%2Fsplit#VLESS-XHTTP"
+
+    val h2Uri =
+      "trojan://trojanPass123@h2.example.org:443?security=tls&sni=h2.example.org&type=h2&path=%2Fh2path#Trojan-H2"
+
+    val kcpUri =
+      "vless://11111111-2222-3333-4444-555555555555@kcp.example.org:2083?encryption=none&security=none&type=kcp&seed=mykcpseed#VLESS-mKCP"
+
+    val hy2Uri =
+      "hy2://hy2SecretAuth@hy2.example.org:443?sni=hy2.example.org&obfs=salamander&obfs-password=salamanderPass#Hysteria2"
+
+    val tuicUri =
+      "tuic://11111111-2222-3333-4444-555555555555:tuicPass@tuic.example.org:443?sni=tuic.example.org&alpn=h3#TUICv5"
+
+    val wgPrivB64 =
+      java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 11).toByte() })
+    val wgPubB64 =
+      java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 21).toByte() })
+    val wgUri =
+      "wg://$wgPrivB64@162.159.192.1:2408?publicKey=$wgPubB64&address=172.16.0.2/32&reserved=12,34,56#Warp-WG"
+
+    val socksUri = "socks5://user1:pass1@socks.example.org:1080#Direct-SOCKS5"
+    val httpProxyUri = "http://user1:pass1@proxy.example.org:8080#Direct-HTTP-Proxy"
+
+    val uris =
+      listOf(
+        vmessUri,
+        ssUri,
+        ss2022Uri,
+        realityVisionUri,
+        tcpHttpObfsUri,
+        grpcUri,
+        xhttpUri,
+        h2Uri,
+        kcpUri,
+        hy2Uri,
+        tuicUri,
+        wgUri,
+        socksUri,
+        httpProxyUri,
+      )
+
+    for (uri in uris) {
+      val parsed = com.example.model.V2RayConfigParser.parseSingleUri(uri)
+      org.junit.Assert.assertNotNull("Failed to parse URI: $uri", parsed)
+      assertTrue(
+        "Expected engine support for ${parsed!!.protocol} (${parsed.network}/${parsed.security}): $uri",
+        com.example.vpn.V2RayOutboundClient.isSupportedByEngine(parsed),
+      )
+    }
+
+    // Verify ChaCha20-Poly1305 & X25519 & TCP HTTP Obfuscation primitives
+    val key32 = ByteArray(32) { it.toByte() }
+    val nonce12 = ByteArray(12) { (it + 1).toByte() }
+    val msg = "meh-vpn-protocol-test".toByteArray(Charsets.UTF_8)
+    val sealed = com.example.vpn.ChaCha20Poly1305Pure.encrypt(key32, nonce12, msg, ByteArray(0))
+    val opened = com.example.vpn.ChaCha20Poly1305Pure.decrypt(key32, nonce12, sealed, ByteArray(0))
+    org.junit.Assert.assertArrayEquals(msg, opened)
+
+    val pub = com.example.vpn.X25519Pure.scalarMultBase(key32)
+    org.junit.Assert.assertEquals(32, pub.size)
+  }
 }
