@@ -342,15 +342,16 @@ class MehViewModel(
   }
 
   /**
-   * Primary V2Ray connection pipeline using the latest V2Ray core:
-   * 1. Tier 1: Fetches configs from `rzashakeri/v2ray-configs` and connects to the first
-   *    server that passes the probe.
-   * 2. Tier 2: Only if Tier 1 yields no working server, same for the mhcfpTopic subscription.
-   * 3. Tier 3: Only if Tier 2 also yields nothing, same for the remaining subscriptions
-   *    (PSG, SoliSpirit & V2ray-Collector).
-   * 4. Starts the VPN tunnel service with the first passing server; the background
-   *    refinement keeps testing the remaining pool and upgrades later if a clearly
-   *    better node appears.
+   * Primary V2Ray connection pipeline using the latest V2Ray core. Each tier is searched
+   * with a pipelined fetch+test: sources are fetched in batches of 4 and each batch is
+   * probed the moment it arrives (64 parallel probes, 1500 ms first-pass timeout), so the
+   * first passing server connects within seconds instead of after the whole tier downloads.
+   * 1. Tier 1: `rzashakeri/v2ray-configs`.
+   * 2. Tier 2: Only if Tier 1 yields no working server, the mhcfpTopic subscription.
+   * 3. Tier 3: Only if Tier 2 also yields nothing, the remaining subscriptions.
+   * 4. Starts the VPN tunnel service with the first passing server (plus up to 4 backups
+   *    in the failover pool); the background refinement keeps testing the remaining pool
+   *    and upgrades later if a clearly better node appears.
    */
   private fun startV2RayConnectionPipeline(
     context: Context,
@@ -373,19 +374,30 @@ class MehViewModel(
             )
           }
 
-          val primaryConfigs =
-            repository.fetchPrimaryConfigs { logLine ->
+          var verifiedCandidates: List<V2RayConfig> = emptyList()
+
+          _uiState.update {
+            it.copy(
+              phase = MehPhase.TESTING_SPEED,
+              liveLogLine = LOG_TESTING,
+            )
+          }
+          delay(120L)
+
+          verifiedCandidates =
+            repository.findFirstPassingFromSources(
+              sources = repository.PRIMARY_RZASHAKERI_SOURCES,
+              prioritizedSavedNodes = cachedLastCandidates,
+              poolSize = 5,
+            ) { logLine ->
               appendLogLine(
                 message = logLine,
-                level = HackerLogLevel.SOURCE,
+                level = HackerLogLevel.SCAN,
               )
             }
 
-          var verifiedCandidates: List<V2RayConfig> = emptyList()
-
-          if (primaryConfigs.isNotEmpty()) {
-            MehTelemetry.logConfigsFetched(primaryConfigs.size)
-
+                    // Step 2 (Tier 2): mhcfp — only if Priority #1 yielded no working server
+          if (verifiedCandidates.isEmpty()) {
             _uiState.update {
               it.copy(
                 phase = MehPhase.TESTING_SPEED,
@@ -395,8 +407,8 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.findFastCandidatesWithFailoverPool(
-                configs = primaryConfigs,
+              repository.findFirstPassingFromSources(
+                sources = repository.MHCFP_SOURCES,
                 prioritizedSavedNodes = cachedLastCandidates,
                 poolSize = 5,
               ) { logLine ->
@@ -407,88 +419,12 @@ class MehViewModel(
               }
           }
 
-                    // Step 2 (Tier 2): mhcfp — only if Priority #1 yielded no working server
-          if (verifiedCandidates.isEmpty()) {
-            _uiState.update {
-              it.copy(
-                phase = MehPhase.FETCHING_CONFIGS,
-                liveLogLine = LOG_FETCHING,
-              )
-            }
-
-            val mhcfpConfigs =
-              repository.fetchMhcfpConfigs { logLine ->
-                appendLogLine(
-                  message = logLine,
-                  level = HackerLogLevel.SOURCE,
-                )
-              }
-
-            if (mhcfpConfigs.isNotEmpty()) {
-              MehTelemetry.logConfigsFetched(mhcfpConfigs.size)
-
-              _uiState.update {
-                it.copy(
-                  phase = MehPhase.TESTING_SPEED,
-                  liveLogLine = LOG_TESTING,
-                )
-              }
-              delay(120L)
-
-              verifiedCandidates =
-                repository.findFastCandidatesWithFailoverPool(
-                  configs = mhcfpConfigs,
-                  prioritizedSavedNodes = cachedLastCandidates,
-                  poolSize = 5,
-                ) { logLine ->
-                  appendLogLine(
-                    message = logLine,
-                    level = HackerLogLevel.SCAN,
-                  )
-                }
-            }
-          }
-
           // Step 3 (Tier 3): فقط در صورتی که سرورهای اولویت اول و دوم وصل نشدند سراغ بقیه ساب‌ها برو
           if (verifiedCandidates.isEmpty()) {
-            if (primaryConfigs.isNotEmpty()) {
-              appendLogLine(
-                message = "عدم اتصال سرورهای اولویت اول؛ بررسی مخازن پشتیبان ...",
-                level = HackerLogLevel.SOURCE,
-              )
-            }
-
-            _uiState.update {
-              it.copy(
-                phase = MehPhase.FETCHING_CONFIGS,
-                liveLogLine = LOG_FETCHING,
-              )
-            }
-
-            val fallbackConfigs =
-              repository.fetchFallbackConfigs { logLine ->
-                appendLogLine(
-                  message = logLine,
-                  level = HackerLogLevel.SOURCE,
-                )
-              }
-
-            if (fallbackConfigs.isEmpty()) {
-              MehTelemetry.logError(
-                stage = "fetch_configs",
-                errorMessage = "No V2Ray configs fetched from primary or fallback sources",
-              )
-              _uiState.update {
-                it.copy(
-                  phase = MehPhase.ERROR,
-                  liveLogLine = "",
-                  terminalLogs = emptyList(),
-                )
-              }
-              return@launch
-            }
-
-            MehTelemetry.logConfigsFetched(fallbackConfigs.size)
+            appendLogLine(
+              message = "عدم اتصال سرورهای اولویت اول؛ بررسی مخازن پشتیبان ...",
+              level = HackerLogLevel.SOURCE,
+            )
 
             _uiState.update {
               it.copy(
@@ -499,8 +435,8 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.findFastCandidatesWithFailoverPool(
-                configs = fallbackConfigs,
+              repository.findFirstPassingFromSources(
+                sources = repository.FALLBACK_SOURCES,
                 prioritizedSavedNodes = cachedLastCandidates,
                 poolSize = 5,
               ) { logLine ->
