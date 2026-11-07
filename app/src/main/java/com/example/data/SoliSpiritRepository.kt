@@ -156,16 +156,28 @@ class SoliSpiritRepository(
         ),
       )
 
-    val FALLBACK_SOURCES =
+    /**
+     * Tier 2 subscription sources (mhcfpTopic/config). Fetched only when Priority #1
+     * (rzashakeri/v2ray-configs) yields no working server.
+     */
+    val MHCFP_SOURCES =
       listOf(
-                // Batch 1: Fresh third-party subscriptions (added 2026-11-07 at the user's request).
-        // The PSG page (itsyebekhe.github.io/PSG/) is an HTML generator, not a subscription file,
-        // so the app fetches its underlying subscription file config.txt from the PSG repo.
         SubscriptionSource(
           name = "MhcfpTopic/XrayFinal-CDN",
           url = "https://cdn.jsdelivr.net/gh/mhcfpTopic/config@main/xray_final.txt",
           repoLabel = "mhcfpTopic/config",
         ),
+        SubscriptionSource(
+          name = "MhcfpTopic/XrayFinal-Raw",
+          url = "https://raw.githubusercontent.com/mhcfpTopic/config/main/xray_final.txt",
+          repoLabel = "mhcfpTopic/config",
+        ),
+      )
+    val FALLBACK_SOURCES =
+      listOf(
+                // Batch 1: Fresh third-party subscriptions (added 2026-11-07 at the user's request).
+        // The PSG page (itsyebekhe.github.io/PSG/) is an HTML generator, not a subscription file,
+        // so the app fetches its underlying subscription file config.txt from the PSG repo.
         SubscriptionSource(
           name = "PSG/Config-CDN",
           url = "https://cdn.jsdelivr.net/gh/itsyebekhe/PSG@main/config.txt",
@@ -312,11 +324,6 @@ class SoliSpiritRepository(
           repoLabel = "SoliSpirit/v2ray-configs",
         ),
         SubscriptionSource(
-          name = "MhcfpTopic/XrayFinal-Raw",
-          url = "https://raw.githubusercontent.com/mhcfpTopic/config/main/xray_final.txt",
-          repoLabel = "mhcfpTopic/config",
-        ),
-        SubscriptionSource(
           name = "PSG/Config-Raw",
           url = "https://raw.githubusercontent.com/itsyebekhe/PSG/refs/heads/main/config.txt",
           repoLabel = "itsyebekhe/PSG",
@@ -324,10 +331,11 @@ class SoliSpiritRepository(
       )
 
     /**
-     * Combined list of all registered sources with `rzashakeri/v2ray-configs` as Priority #1,
-     * followed by `SoliSpirit/v2ray-configs` and `MohammadBahemmat/V2ray-Collector`.
+     * Combined list of all registered sources: `rzashakeri/v2ray-configs` (Priority #1),
+     * `mhcfpTopic/config` (Priority #2), then `SoliSpirit/v2ray-configs` and
+     * `MohammadBahemmat/V2ray-Collector`.
      */
-    val SOLISPIRIT_SOURCES = PRIMARY_RZASHAKERI_SOURCES + FALLBACK_SOURCES
+    val SOLISPIRIT_SOURCES = PRIMARY_RZASHAKERI_SOURCES + MHCFP_SOURCES + FALLBACK_SOURCES
 
     private const val WAVE_SIZE = 80
     private const val CONCURRENT_TEST_LIMIT = 32
@@ -364,7 +372,45 @@ class SoliSpiritRepository(
       configs
     }
 
-  private suspend fun fetchFromSourceList(
+  /**
+   * Fetches configs from the tier-2 repository (mhcfpTopic/config) when Priority #1
+   * yields no working server.
+   */
+  suspend fun fetchMhcfpConfigs(
+    onLogUpdate: (String) -> Unit,
+  ): List<V2RayConfig> =
+    withContext(ioDispatcher) {
+      onLogUpdate("اتصال به ساب mhcfp ...")
+      val configs = fetchFromSourceList(MHCFP_SOURCES)
+      if (configs.isNotEmpty()) {
+        onLogUpdate("${configs.size} سرور از ساب mhcfp دریافت شد")
+      }
+      configs
+    }
+
+  /**
+   * All configs from every tier (primary + mhcfp + fallback), deduplicated by endpoint.
+   * Used by the background node refinement so it can keep testing the whole pool,
+   * not just the Priority #1 repository.
+   */
+  suspend fun fetchAllTierConfigs(): List<V2RayConfig> =
+    withContext(ioDispatcher) {
+      val merged = LinkedHashMap<String, V2RayConfig>()
+      for (configs in listOf(
+        fetchFromSourceList(PRIMARY_RZASHAKERI_SOURCES),
+        fetchFromSourceList(MHCFP_SOURCES),
+        fetchFromSourceList(FALLBACK_SOURCES),
+      )) {
+        for (cfg in configs) {
+          if (!merged.containsKey(cfg.endpointKey)) {
+            merged[cfg.endpointKey] = cfg
+          }
+        }
+      }
+      merged.values.toList()
+    }
+
+private suspend fun fetchFromSourceList(
     sources: List<SubscriptionSource>,
   ): List<V2RayConfig> {
     val collected = LinkedHashMap<String, V2RayConfig>()
@@ -744,7 +790,75 @@ class SoliSpiritRepository(
   ): V2RayConfig? =
     testAndSelectFastestCandidates(configs, maxCount = 1, onLogUpdate = onLogUpdate).firstOrNull()
 
-  fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
+  /**
+   * Fast first connect: probes configs wave by wave (80 per wave, 32 concurrent) and returns
+   * the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check, without
+   * waiting for the rest of the wave or later waves. Saved healthy nodes are tried first.
+   * The caller connects to the returned node immediately; the background refinement keeps
+   * testing the remaining pool and upgrades later if a clearly better node appears.
+   */
+  suspend fun findFirstPassingCandidate(
+    configs: List<V2RayConfig>,
+    prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+    onLogUpdate: (String) -> Unit,
+  ): V2RayConfig? =
+    withContext(ioDispatcher) {
+      val testable: (V2RayConfig) -> Boolean = {
+        V2RayOutboundClient.isSupportedByEngine(it) &&
+          it.protocol != V2RayProtocol.HYSTERIA2 &&
+          it.protocol != V2RayProtocol.TUIC &&
+          it.protocol != V2RayProtocol.WIREGUARD
+      }
+      val validSaved = prioritizedSavedNodes.filter(testable)
+      val savedKeys = validSaved.map { it.endpointKey }.toSet()
+      val remaining =
+        configs
+          .filter { testable(it) && it.endpointKey !in savedKeys }
+          .shuffled()
+      val supported = validSaved + remaining
+      if (supported.isEmpty()) return@withContext null
+
+      onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
+      val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
+      for ((waveIdx, wave) in supported.chunked(WAVE_SIZE).withIndex()) {
+        coroutineContext.ensureActive()
+        val stage1Passed =
+          coroutineScope {
+            wave
+              .map { config ->
+                async {
+                  semaphore.withPermit {
+                    coroutineContext.ensureActive()
+                    measureNodeSpeed(config)
+                  }
+                }
+              }
+              .awaitAll()
+              .filterNotNull()
+              .sortedBy { it.latencyMs }
+          }
+        if (stage1Passed.isEmpty()) {
+          onLogUpdate("موج ${waveIdx + 1}: هیچ سروری از تست عبور نکرد")
+          continue
+        }
+        // Fastest passer of this wave: one quick TLS check, then connect to it right away.
+        for (candidate in stage1Passed.take(3)) {
+          val httpsLatency =
+            V2RayOutboundClient.verifyHttpsAndDnsCapability(
+              config = candidate,
+              timeoutMs = 3000,
+            )
+          if (httpsLatency != null) {
+            onLogUpdate("بهترین سرور انتخاب شد (پینگ ${candidate.latencyMs}ms)")
+            return@withContext candidate
+          }
+        }
+        onLogUpdate("موج ${waveIdx + 1}: عبور از تست اولیه ولی تایید TLS نشد")
+      }
+      null
+    }
+
+fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
     // UDP-only protocols can never pass the TCP 204 probe; skip them here as well
     // so background refine calls do not waste a probe slot on them either.
     if (config.protocol == V2RayProtocol.HYSTERIA2 ||
