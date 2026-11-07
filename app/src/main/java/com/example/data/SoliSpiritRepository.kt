@@ -1042,21 +1042,32 @@ private suspend fun fetchFromSourceList(
           onLogUpdate("موج ${waveIdx + 1}: هیچ سروری از تست عبور نکرد")
           continue
         }
-        // Fastest passer of this wave: one quick TLS check, then connect to it right away.
-        for (candidate in stage1Passed.take(3)) {
-          val httpsLatency =
-            V2RayOutboundClient.verifyHttpsAndDnsCapability(
-              config = candidate,
-              timeoutMs = 3000,
-            )
-          if (httpsLatency != null) {
-            onLogUpdate("بهترین سرور انتخاب شد (پینگ ${candidate.latencyMs}ms)")
-            val backups =
-              stage1Passed
-                .filter { it.endpointKey != candidate.endpointKey }
-                .take(poolSize - 1)
-            return@withContext listOf(candidate) + backups
+                // Fastest passers of this wave: quick TLS checks in parallel (not one by one),
+        // then connect to the fastest verified one right away.
+        val verifiedCandidate =
+          coroutineScope {
+            stage1Passed.take(3)
+              .map { candidate ->
+                async {
+                  val httpsLatency =
+                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                      config = candidate,
+                      timeoutMs = 3000,
+                    )
+                  if (httpsLatency != null) candidate else null
+                }
+              }
+              .awaitAll()
+              .filterNotNull()
+              .firstOrNull()
           }
+        if (verifiedCandidate != null) {
+          onLogUpdate("بهترین سرور انتخاب شد (پینگ ${verifiedCandidate.latencyMs}ms)")
+          val backups =
+            stage1Passed
+              .filter { it.endpointKey != verifiedCandidate.endpointKey }
+              .take(poolSize - 1)
+          return@withContext listOf(verifiedCandidate) + backups
         }
         onLogUpdate("موج ${waveIdx + 1}: عبور از تست اولیه ولی تایید TLS نشد")
       }
@@ -1104,8 +1115,10 @@ private suspend fun fetchFromSourceList(
         )
       if (savedFirst.isNotEmpty()) return@withContext savedFirst
 
-      for (batch in sources.chunked(4)) {
+            var testedCount = 0
+      for ((batchIdx, batch) in sources.chunked(4).withIndex()) {
         coroutineContext.ensureActive()
+        onLogUpdate("دریافت دسته ${batchIdx + 1} از ساب‌ها ...")
         val batchConfigs =
           coroutineScope {
             batch
@@ -1117,6 +1130,7 @@ private suspend fun fetchFromSourceList(
             .filter { V2RayOutboundClient.isSupportedByEngine(it) }
             .distinctBy { it.endpointKey }
         if (batchConfigs.isEmpty()) continue
+        onLogUpdate("${batchConfigs.size} سرور از دسته ${batchIdx + 1} دریافت شد")
         val found =
           findFastCandidatesWithFailoverPool(
             configs = batchConfigs,
@@ -1124,6 +1138,13 @@ private suspend fun fetchFromSourceList(
             onLogUpdate = onLogUpdate,
           )
         if (found.isNotEmpty()) return@withContext found
+        testedCount += batchConfigs.size
+        // Same budget as the old fetch-then-test path (~380 configs per tier): without it,
+        // a tier with dozens of dead sources grinds through every batch and feels slower.
+        if (testedCount >= 400) {
+          onLogUpdate("به حد تست این مرحله رسیدیم؛ سراغ مرحله بعد ...")
+          break
+        }
       }
       emptyList()
     }
