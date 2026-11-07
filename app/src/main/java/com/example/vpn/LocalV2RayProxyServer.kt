@@ -81,6 +81,8 @@ class LocalV2RayProxyServer(
     private const val DNS_SLOT_TIMEOUT_MS = 1500
     private const val DNS_DOH_TIMEOUT_MS = 1500
 
+    private const val MAX_MAPPING_ENTRIES = 4096
+
     private val realIpToDomain = ConcurrentHashMap<String, String>()
     private val domainToRealIp = ConcurrentHashMap<String, String>()
 
@@ -90,6 +92,10 @@ class LocalV2RayProxyServer(
     fun recordRealDnsARecords(domain: String, dnsBytes: ByteArray) {
       val cleanDomain = domain.trim().trimEnd('.').lowercase()
       if (cleanDomain.isEmpty() || dnsBytes.size < 12) return
+      if (realIpToDomain.size >= MAX_MAPPING_ENTRIES) {
+        realIpToDomain.clear()
+        domainToRealIp.clear()
+      }
       val qdCount = ((dnsBytes[4].toInt() and 0xFF) shl 8) or (dnsBytes[5].toInt() and 0xFF)
       val anCount = ((dnsBytes[6].toInt() and 0xFF) shl 8) or (dnsBytes[7].toInt() and 0xFF)
       if (anCount <= 0) return
@@ -140,9 +146,20 @@ class LocalV2RayProxyServer(
       return syntheticIpToDomain[hostOrIp.trim()]
     }
 
+    fun clearMappingCaches() {
+      realIpToDomain.clear()
+      domainToRealIp.clear()
+      syntheticDomainToIp.clear()
+      syntheticIpToDomain.clear()
+    }
+
     private fun allocateSyntheticIpForDomain(domain: String): String {
       val cleanDomain = domain.trim().trimEnd('.').lowercase()
       syntheticDomainToIp[cleanDomain]?.let { return it }
+      if (syntheticDomainToIp.size >= MAX_MAPPING_ENTRIES) {
+        syntheticDomainToIp.clear()
+        syntheticIpToDomain.clear()
+      }
       val seq = syntheticIpCounter.getAndIncrement() and 0x0FFFF
       val oct3 = (seq / 250) and 0xFF
       val oct4 = (seq % 250) + 2 // 2..251, never 0, 1 or 255
@@ -338,6 +355,7 @@ class LocalV2RayProxyServer(
     inFlightDnsLocks.clear()
     consecutiveFailures.clear()
     penalizedIndices.clear()
+    clearMappingCaches()
     try {
       relayExecutor.shutdownNow()
     } catch (_: Exception) {}
