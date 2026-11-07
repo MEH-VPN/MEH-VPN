@@ -395,15 +395,16 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.findFirstPassingCandidate(
+              repository.findFastCandidatesWithFailoverPool(
                 configs = primaryConfigs,
                 prioritizedSavedNodes = cachedLastCandidates,
+                poolSize = 5,
               ) { logLine ->
                 appendLogLine(
                   message = logLine,
                   level = HackerLogLevel.SCAN,
                 )
-              }?.let { listOf(it) } ?: emptyList()
+              }
           }
 
                     // Step 2 (Tier 2): mhcfp — only if Priority #1 yielded no working server
@@ -435,15 +436,16 @@ class MehViewModel(
               delay(120L)
 
               verifiedCandidates =
-                repository.findFirstPassingCandidate(
+                repository.findFastCandidatesWithFailoverPool(
                   configs = mhcfpConfigs,
                   prioritizedSavedNodes = cachedLastCandidates,
+                  poolSize = 5,
                 ) { logLine ->
                   appendLogLine(
                     message = logLine,
                     level = HackerLogLevel.SCAN,
                   )
-                }?.let { listOf(it) } ?: emptyList()
+                }
             }
           }
 
@@ -497,15 +499,16 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.findFirstPassingCandidate(
+              repository.findFastCandidatesWithFailoverPool(
                 configs = fallbackConfigs,
                 prioritizedSavedNodes = cachedLastCandidates,
+                poolSize = 5,
               ) { logLine ->
                 appendLogLine(
                   message = logLine,
                   level = HackerLogLevel.SCAN,
                 )
-              }?.let { listOf(it) } ?: emptyList()
+              }
           }
 
           if (verifiedCandidates.isEmpty()) {

@@ -378,11 +378,19 @@ class MehVpnService : VpnService() {
                   if (verifySwitched != null) {
                     lastPing = verifySwitched
                   }
-                } else if (consecutiveFailures == 3) {
-                  MehTelemetry.logError(
-                    stage = "keep_alive_probe",
-                    errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
-                  )
+                } else {
+                  // No alternative healthy node in pool: immediately trigger emergency background refinement
+                  launch {
+                    try {
+                      refineNodesOnce(proxyServer, proxyPort, force = true)
+                    } catch (_: Exception) {}
+                  }
+                  if (consecutiveFailures == 3) {
+                    MehTelemetry.logError(
+                      stage = "keep_alive_probe",
+                      errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+                    )
+                  }
                 }
               }
             }
@@ -457,6 +465,7 @@ class MehVpnService : VpnService() {
   private suspend fun refineNodesOnce(
     proxyServer: LocalV2RayProxyServer,
     proxyPort: Int,
+    force: Boolean = false,
   ): Boolean {
     val active = proxyServer.activeConfig
     val others = proxyServer.currentPool().filter { it.endpointKey != active.endpointKey }
@@ -491,15 +500,17 @@ class MehVpnService : VpnService() {
 
     val isBetter =
       if (currentScored == null) {
-        // Failed the full test: only abandon it if the keep-alive style probe fails as well.
-        V2RayOutboundClient.verifyHttpsAndDnsCapability(
-          config = active,
-          timeoutMs = 3500,
-          protector = { socket -> protectOutboundSocket(socket) },
-        ) == null
+        // Failed the full test: only abandon it if the keep-alive style probe fails as well or if forced
+        force ||
+          V2RayOutboundClient.verifyHttpsAndDnsCapability(
+            config = active,
+            timeoutMs = 3500,
+            protector = { socket -> protectOutboundSocket(socket) },
+          ) == null
       } else {
-        best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
-          best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE
+        force ||
+          (best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
+            best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE)
       }
     if (!isBetter) return false
 
@@ -699,8 +710,8 @@ class MehVpnService : VpnService() {
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
-    /** Background node refinement: first check after 3 min, then every 10 min (20 on metered). */
-    private const val REFINE_FIRST_DELAY_MS = 3 * 60_000L
+    /** Background node refinement: first check after 20s, then every 10 min (20 on metered). */
+    private const val REFINE_FIRST_DELAY_MS = 20_000L
     private const val REFINE_INTERVAL_MS = 10 * 60_000L
     private const val REFINE_INTERVAL_METERED_MS = 20 * 60_000L
 
