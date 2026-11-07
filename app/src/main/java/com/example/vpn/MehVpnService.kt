@@ -13,6 +13,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import com.example.BuildConfig
 import com.example.MainActivity
 import com.example.data.SoliSpiritRepository
 import com.example.R
@@ -348,10 +349,13 @@ class MehVpnService : VpnService() {
         var consecutiveFailures = 0
 
         // Counters are only useful if somebody can read them: `adb logcat -s MehDiag`.
-        launch {
-          while (isActive) {
-            delay(DIAG_LOG_INTERVAL_MS)
-            android.util.Log.i("MehDiag", MehDiag.formatCompactSummary())
+        // Run logcat writer only in DEBUG builds to save battery and reduce CPU wakeups.
+        if (BuildConfig.DEBUG) {
+          launch {
+            while (isActive) {
+              delay(DIAG_LOG_INTERVAL_MS)
+              android.util.Log.i("MehDiag", MehDiag.formatCompactSummary())
+            }
           }
         }
 
@@ -740,7 +744,7 @@ class MehVpnService : VpnService() {
     private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
 
     /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
-    private const val DIAG_LOG_INTERVAL_MS = 5_000L
+    private const val DIAG_LOG_INTERVAL_MS = 30_000L
 
     /** Keep-alive probe interval (45s instead of 15s for battery/data savings). */
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
