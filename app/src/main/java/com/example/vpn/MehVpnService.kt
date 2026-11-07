@@ -543,7 +543,7 @@ class MehVpnService : VpnService() {
     }
     val fetched =
       try {
-        nodeRepository.fetchConfigsFromSoliSpirit { _ -> }
+        nodeRepository.fetchAllTierConfigs()
       } catch (ce: CancellationException) {
         throw ce
       } catch (_: Exception) {
