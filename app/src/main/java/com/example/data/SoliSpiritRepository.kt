@@ -431,6 +431,96 @@ class SoliSpiritRepository(
           url = "https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt",
           repoLabel = "patterniha/Free-Configs",
           ),
+        SubscriptionSource(
+          name = "F0rc3Run/VLESS-Raw",
+          url = "https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/main/splitted-by-protocol/vless.txt",
+          repoLabel = "F0rc3Run/F0rc3Run",
+        ),
+        SubscriptionSource(
+          name = "ThomasJasper/Sublist1-Raw",
+          url = "https://raw.githubusercontent.com/ThomasJasperthecat/sub/main/sublist1.txt",
+          repoLabel = "ThomasJasperthecat/sub",
+        ),
+        SubscriptionSource(
+          name = "Pawdroid/FreeServers-Raw",
+          url = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+          repoLabel = "Pawdroid/Free-servers",
+        ),
+        SubscriptionSource(
+          name = "Igareck/VLESS-Reality-Mobile-Raw",
+          url = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+          repoLabel = "igareck/vpn-configs-for-russia",
+        ),
+        SubscriptionSource(
+          name = "Igareck/BLACK-VLESS-RUS-Raw",
+          url = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
+          repoLabel = "igareck/vpn-configs-for-russia",
+        ),
+        SubscriptionSource(
+          name = "Igareck/BLACK-VLESS-RUS-Mobile-Raw",
+          url = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
+          repoLabel = "igareck/vpn-configs-for-russia",
+        ),
+        SubscriptionSource(
+          name = "Igareck/BLACK-SS-All-RUS-Raw",
+          url = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS+All_RUS.txt",
+          repoLabel = "igareck/vpn-configs-for-russia",
+        ),
+        SubscriptionSource(
+          name = "ShadowException/VPNcat-Raw",
+          url = "https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat",
+          repoLabel = "ShadowException/VPN",
+        ),
+        SubscriptionSource(
+          name = "Pytimusprime/AllServers-Raw",
+          url = "https://raw.githubusercontent.com/pytimusprime/FreeV2ray/refs/heads/main/all_servers.txt",
+          repoLabel = "pytimusprime/FreeV2ray",
+        ),
+        SubscriptionSource(
+          name = "Arshiacomplus/Sub-Raw",
+          url = "https://raw.githubusercontent.com/arshiacomplus/v2rayExtractor/refs/heads/main/mix/sub.html",
+          repoLabel = "arshiacomplus/v2rayExtractor",
+        ),
+        SubscriptionSource(
+          name = "Ermaozi/V2Ray-Raw",
+          url = "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+          repoLabel = "ermaozi/get_subscribe",
+        ),
+        SubscriptionSource(
+          name = "BarryFar/Sub1-Raw",
+          url = "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub1.txt",
+          repoLabel = "barry-far/V2ray-config",
+        ),
+        SubscriptionSource(
+          name = "BarryFar/Sub2-Raw",
+          url = "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub2.txt",
+          repoLabel = "barry-far/V2ray-Config",
+        ),
+        SubscriptionSource(
+          name = "BarryFar/Sub3-Raw",
+          url = "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub3.txt",
+          repoLabel = "barry-far/V2ray-Config",
+        ),
+        SubscriptionSource(
+          name = "ALIILAPRO/Sub-Raw",
+          url = "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
+          repoLabel = "ALIILAPRO/v2rayNG-Config",
+        ),
+        SubscriptionSource(
+          name = "Mahdibland/SubMerge-Raw",
+          url = "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
+          repoLabel = "mahdibland/V2RayAggregator",
+        ),
+        SubscriptionSource(
+          name = "MasirSefid/Sub-Raw",
+          url = "https://raw.githubusercontent.com/masir-sefid/Sub/main/@Masir_Sefid.txt",
+          repoLabel = "masir-sefid/Sub",
+        ),
+        SubscriptionSource(
+          name = "MasirSefid/TelegramChannel-Raw",
+          url = "https://raw.githubusercontent.com/masir-sefid/Sub/main/Telegram-Channel-@Masir_Sefid.txt",
+          repoLabel = "masir-sefid/Sub",
+        ),
       )
 
     /**
