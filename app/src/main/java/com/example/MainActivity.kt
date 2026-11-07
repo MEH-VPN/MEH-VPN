@@ -1,6 +1,9 @@
 package com.example
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -50,13 +53,18 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,6 +92,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.data.AppUpdateInfo
 import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
 import com.example.ui.HackerLogEntry
@@ -130,8 +139,26 @@ class MainActivity : ComponentActivity() {
             )
           }
 
+        var showUpdateSheet by remember { mutableStateOf(false) }
+
+        if (showUpdateSheet && uiState.updateInfo != null) {
+          UpdateBottomSheet(
+            updateInfo = uiState.updateInfo!!,
+            onDismiss = { showUpdateSheet = false },
+            onDirectDownload = {
+              showUpdateSheet = false
+              context.openUrlSafely(uiState.updateInfo!!.downloadUrl)
+            },
+            onTelegram = {
+              showUpdateSheet = false
+              context.openTelegramSafely(uiState.updateInfo!!.telegramUrl)
+            },
+          )
+        }
+
         MehMinimalScreen(
           uiState = uiState,
+          onUpdateClick = { showUpdateSheet = true },
           onPowerToggle = {
             mehViewModel.onPowerButtonClicked(
               context = context,
@@ -159,6 +186,7 @@ fun MehMinimalScreen(
   uiState: MehUiState,
   onPowerToggle: () -> Unit,
   onConnectLastServer: () -> Unit = {},
+  onUpdateClick: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor by
@@ -208,7 +236,27 @@ fun MehMinimalScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
       ) {
         // Equal top weight keeps the power button permanently locked at the vertical center
-        Spacer(modifier = Modifier.weight(1f))
+        Box(
+          modifier =
+            Modifier.weight(1f)
+              .fillMaxWidth(),
+          contentAlignment = Alignment.TopCenter,
+        ) {
+          AnimatedVisibility(
+            visible = uiState.updateInfo != null,
+            enter = fadeIn(tween(320)) + expandVertically(tween(320)),
+            exit = fadeOut(tween(200)) + shrinkVertically(tween(200)),
+          ) {
+            uiState.updateInfo?.let { updateInfo ->
+              Box(modifier = Modifier.padding(top = 16.dp)) {
+                UpdateNotificationPill(
+                  versionName = updateInfo.latestVersionName,
+                  onClick = onUpdateClick,
+                )
+              }
+            }
+          }
+        }
 
         // 1. Power Button (fixed position, always runs main pipeline by default)
         CircularPowerButton(
@@ -608,5 +656,212 @@ private fun MinimalLogList(
         )
       }
     }
+  }
+}
+
+@Composable
+fun UpdateNotificationPill(
+  versionName: String,
+  onClick: () -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  val haptic = LocalHapticFeedback.current
+  val infiniteTransition = rememberInfiniteTransition(label = "updatePulse")
+  val pulseAlpha by
+    infiniteTransition.animateFloat(
+      initialValue = 0.35f,
+      targetValue = 1f,
+      animationSpec =
+        infiniteRepeatable(
+          animation = tween(durationMillis = 850, easing = FastOutSlowInEasing),
+          repeatMode = RepeatMode.Reverse,
+        ),
+      label = "pulseAlpha",
+    )
+
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Row(
+      modifier =
+        modifier
+          .clip(RoundedCornerShape(20.dp))
+          .background(ObsidianSurface.copy(alpha = 0.92f))
+          .border(
+            width = 1.dp,
+            color = AmberPulse.copy(alpha = 0.45f + 0.35f * pulseAlpha),
+            shape = RoundedCornerShape(20.dp),
+          )
+          .clickable {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onClick()
+          }
+          .padding(horizontal = 14.dp, vertical = 8.dp)
+          .testTag("update_notification_pill"),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.Center,
+    ) {
+      Box(
+        modifier =
+          Modifier.size(8.dp)
+            .clip(CircleShape)
+            .background(AmberPulse.copy(alpha = pulseAlpha))
+      )
+
+      Spacer(modifier = Modifier.width(8.dp))
+
+      Text(
+        text = "${stringResource(R.string.update_available)} ($versionName)",
+        style = MaterialTheme.typography.labelMedium,
+        fontFamily = VazirmatnFontFamily,
+        fontWeight = FontWeight.Medium,
+        color = TextPrimary,
+      )
+    }
+  }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun UpdateBottomSheet(
+  updateInfo: AppUpdateInfo,
+  onDismiss: () -> Unit,
+  onDirectDownload: () -> Unit,
+  onTelegram: () -> Unit,
+) {
+  val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+  ModalBottomSheet(
+    onDismissRequest = onDismiss,
+    sheetState = sheetState,
+    containerColor = ObsidianElevated,
+    contentColor = TextPrimary,
+    scrimColor = Color.Black.copy(alpha = 0.65f),
+    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+  ) {
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+      Column(
+        modifier =
+          Modifier.fillMaxWidth()
+            .padding(horizontal = 24.dp)
+            .padding(bottom = 32.dp, top = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+      ) {
+        Text(
+          text = stringResource(R.string.update_dialog_title),
+          style = MaterialTheme.typography.titleMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = FontWeight.Bold,
+          color = TextPrimary,
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        Text(
+          text = "${stringResource(R.string.update_dialog_subtitle)} (${updateInfo.latestVersionName})",
+          style = MaterialTheme.typography.bodySmall,
+          fontFamily = VazirmatnFontFamily,
+          color = TextSecondary,
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Direct Download Button
+        Row(
+          modifier =
+            Modifier.fillMaxWidth()
+              .height(52.dp)
+              .clip(RoundedCornerShape(16.dp))
+              .background(
+                Brush.horizontalGradient(
+                  colors = listOf(CyberCyan.copy(alpha = 0.9f), NeonEmerald.copy(alpha = 0.85f))
+                )
+              )
+              .clickable(onClick = onDirectDownload)
+              .padding(horizontal = 16.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.Center,
+        ) {
+          Icon(
+            painter = painterResource(R.drawable.ic_download_rounded),
+            contentDescription = null,
+            tint = Color.Black,
+            modifier = Modifier.size(22.dp),
+          )
+          Spacer(modifier = Modifier.width(10.dp))
+          Text(
+            text = stringResource(R.string.update_btn_direct),
+            style = MaterialTheme.typography.bodyMedium,
+            fontFamily = VazirmatnFontFamily,
+            fontWeight = FontWeight.Bold,
+            color = Color.Black,
+          )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Telegram Channel Button
+        Row(
+          modifier =
+            Modifier.fillMaxWidth()
+              .height(52.dp)
+              .clip(RoundedCornerShape(16.dp))
+              .background(ObsidianSurface)
+              .border(1.dp, Color(0xFF2AABEE).copy(alpha = 0.6f), RoundedCornerShape(16.dp))
+              .clickable(onClick = onTelegram)
+              .padding(horizontal = 16.dp),
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.Center,
+        ) {
+          Icon(
+            painter = painterResource(R.drawable.ic_telegram_rounded),
+            contentDescription = null,
+            tint = Color(0xFF2AABEE),
+            modifier = Modifier.size(22.dp),
+          )
+          Spacer(modifier = Modifier.width(10.dp))
+          Text(
+            text = stringResource(R.string.update_btn_telegram),
+            style = MaterialTheme.typography.bodyMedium,
+            fontFamily = VazirmatnFontFamily,
+            fontWeight = FontWeight.Medium,
+            color = TextPrimary,
+          )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Dismiss Action
+        Text(
+          text = stringResource(R.string.update_btn_dismiss),
+          style = MaterialTheme.typography.bodySmall,
+          fontFamily = VazirmatnFontFamily,
+          color = TextMuted,
+          modifier =
+            Modifier.clip(RoundedCornerShape(8.dp))
+              .clickable(onClick = onDismiss)
+              .padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+      }
+    }
+  }
+}
+
+private fun Context.openUrlSafely(url: String) {
+  runCatching {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    startActivity(intent)
+  }
+}
+
+private fun Context.openTelegramSafely(telegramUrl: String) {
+  runCatching {
+    val tgIntent =
+      Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=MEH_VPN_channel")).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+    startActivity(tgIntent)
+  }.onFailure {
+    openUrlSafely(telegramUrl)
   }
 }

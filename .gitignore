@@ -18,3 +18,5 @@ local.properties
 debug.keystore
 
 dist/
+
+PROJECT_STATE.md
