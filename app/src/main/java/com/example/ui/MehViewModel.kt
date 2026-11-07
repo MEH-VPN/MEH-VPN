@@ -343,10 +343,14 @@ class MehViewModel(
 
   /**
    * Primary V2Ray connection pipeline using the latest V2Ray core:
-   * 1. Priority #1: Fetches and tests configs from `rzashakeri/v2ray-configs`.
-   * 2. Fallback: Only if Priority #1 yields no configs or none of its servers pass verification,
-   *    fetches and tests configs from `SoliSpirit/v2ray-configs` & `MohammadBahemmat/V2ray-Collector`.
-   * 3. Starts the VPN tunnel service.
+   * 1. Tier 1: Fetches configs from `rzashakeri/v2ray-configs` and connects to the first
+   *    server that passes the probe.
+   * 2. Tier 2: Only if Tier 1 yields no working server, same for the mhcfpTopic subscription.
+   * 3. Tier 3: Only if Tier 2 also yields nothing, same for the remaining subscriptions
+   *    (PSG, SoliSpirit & V2ray-Collector).
+   * 4. Starts the VPN tunnel service with the first passing server; the background
+   *    refinement keeps testing the remaining pool and upgrades later if a clearly
+   *    better node appears.
    */
   private fun startV2RayConnectionPipeline(
     context: Context,
@@ -391,19 +395,59 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.testAndSelectFastestCandidates(
+              repository.findFirstPassingCandidate(
                 configs = primaryConfigs,
-                maxCount = 6,
                 prioritizedSavedNodes = cachedLastCandidates,
               ) { logLine ->
                 appendLogLine(
                   message = logLine,
                   level = HackerLogLevel.SCAN,
                 )
-              }
+              }?.let { listOf(it) } ?: emptyList()
           }
 
-          // Step 2 (Fallback): فقط در صورتی که سرورهای اولویت اول وصل نشدند سراغ دو لینک دیگر برو
+                    // Step 2 (Tier 2): mhcfp — only if Priority #1 yielded no working server
+          if (verifiedCandidates.isEmpty()) {
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.FETCHING_CONFIGS,
+                liveLogLine = LOG_FETCHING,
+              )
+            }
+
+            val mhcfpConfigs =
+              repository.fetchMhcfpConfigs { logLine ->
+                appendLogLine(
+                  message = logLine,
+                  level = HackerLogLevel.SOURCE,
+                )
+              }
+
+            if (mhcfpConfigs.isNotEmpty()) {
+              MehTelemetry.logConfigsFetched(mhcfpConfigs.size)
+
+              _uiState.update {
+                it.copy(
+                  phase = MehPhase.TESTING_SPEED,
+                  liveLogLine = LOG_TESTING,
+                )
+              }
+              delay(120L)
+
+              verifiedCandidates =
+                repository.findFirstPassingCandidate(
+                  configs = mhcfpConfigs,
+                  prioritizedSavedNodes = cachedLastCandidates,
+                ) { logLine ->
+                  appendLogLine(
+                    message = logLine,
+                    level = HackerLogLevel.SCAN,
+                  )
+                }?.let { listOf(it) } ?: emptyList()
+            }
+          }
+
+          // Step 3 (Tier 3): فقط در صورتی که سرورهای اولویت اول و دوم وصل نشدند سراغ بقیه ساب‌ها برو
           if (verifiedCandidates.isEmpty()) {
             if (primaryConfigs.isNotEmpty()) {
               appendLogLine(
@@ -453,16 +497,15 @@ class MehViewModel(
             delay(120L)
 
             verifiedCandidates =
-              repository.testAndSelectFastestCandidates(
+              repository.findFirstPassingCandidate(
                 configs = fallbackConfigs,
-                maxCount = 6,
                 prioritizedSavedNodes = cachedLastCandidates,
               ) { logLine ->
                 appendLogLine(
                   message = logLine,
                   level = HackerLogLevel.SCAN,
                 )
-              }
+              }?.let { listOf(it) } ?: emptyList()
           }
 
           if (verifiedCandidates.isEmpty()) {
@@ -482,7 +525,7 @@ class MehViewModel(
 
           prepareAndStartVpn(
             context = context,
-            candidates = verifiedCandidates,
+            candidates = (verifiedCandidates + cachedLastCandidates).distinctBy { it.endpointKey },
             onRequestVpnPermission = onRequestVpnPermission,
           )
         } catch (ce: CancellationException) {
