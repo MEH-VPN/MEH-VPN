@@ -190,7 +190,98 @@ class SoliSpiritRepository(
           url = "https://cdn.jsdelivr.net/gh/patterniha/Free-Configs@main/configs.txt",
           repoLabel = "patterniha/Free-Configs",
           ),
-        // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
+        // Community subscriptions added 2026-11-07 (vetted: small/tested lists first, giants last).
+        SubscriptionSource(
+            name = "F0rc3Run/VLESS-CDN",
+          url = "https://cdn.jsdelivr.net/gh/F0rc3Run/F0rc3Run@main/splitted-by-protocol/vless.txt",
+          repoLabel = "F0rc3Run/F0rc3Run",
+          ),
+    SubscriptionSource(
+        name = "EmptyMouse/Sync",
+      url = "https://empty-mouse-fbb7.alizareh4024.workers.dev/sync?sub=%D8%B3%D9%88%D8%B3%D9%85%D8%A7%D8%B1%F0%9F%A6%8E",
+      repoLabel = "alizareh4024/workers",
+      ),
+    SubscriptionSource(
+        name = "ThomasJasper/Sublist1-CDN",
+      url = "https://cdn.jsdelivr.net/gh/ThomasJasperthecat/sub@main/sublist1.txt",
+      repoLabel = "ThomasJasperthecat/sub",
+      ),
+    SubscriptionSource(
+        name = "Pawdroid/FreeServers-CDN",
+      url = "https://cdn.jsdelivr.net/gh/Pawdroid/Free-servers@main/sub",
+      repoLabel = "Pawdroid/Free-servers",
+      ),
+    SubscriptionSource(
+        name = "Igareck/VLESS-Reality-Mobile-CDN",
+      url = "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+      repoLabel = "igareck/vpn-configs-for-russia",
+      ),
+    SubscriptionSource(
+        name = "Igareck/BLACK-VLESS-RUS-CDN",
+      url = "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS.txt",
+      repoLabel = "igareck/vpn-configs-for-russia",
+      ),
+    SubscriptionSource(
+        name = "Igareck/BLACK-VLESS-RUS-Mobile-CDN",
+      url = "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_VLESS_RUS_mobile.txt",
+      repoLabel = "igareck/vpn-configs-for-russia",
+      ),
+    SubscriptionSource(
+        name = "Igareck/BLACK-SS-All-RUS-CDN",
+      url = "https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/BLACK_SS+All_RUS.txt",
+      repoLabel = "igareck/vpn-configs-for-russia",
+      ),
+    SubscriptionSource(
+        name = "ShadowException/VPNcat-CDN",
+      url = "https://cdn.jsdelivr.net/gh/ShadowException/VPN@main/configs/VPN-cat",
+      repoLabel = "ShadowException/VPN",
+      ),
+    SubscriptionSource(
+        name = "Iampedi5/Base64",
+      url = "https://sub.iampedi5.live/sub/base64.txt",
+      repoLabel = "iampedi5/live",
+      ),
+    SubscriptionSource(
+        name = "Pytimusprime/AllServers-CDN",
+      url = "https://cdn.jsdelivr.net/gh/pytimusprime/FreeV2ray@main/all_servers.txt",
+      repoLabel = "pytimusprime/FreeV2ray",
+      ),
+    SubscriptionSource(
+        name = "Arshiacomplus/Sub-CDN",
+      url = "https://cdn.jsdelivr.net/gh/arshiacomplus/v2rayExtractor@main/mix/sub.html",
+      repoLabel = "arshiacomplus/v2rayExtractor",
+      ),
+    SubscriptionSource(
+        name = "Ermaozi/V2Ray-CDN",
+      url = "https://cdn.jsdelivr.net/gh/ermaozi/get_subscribe@main/subscribe/v2ray.txt",
+      repoLabel = "ermaozi/get_subscribe",
+      ),
+    SubscriptionSource(
+        name = "BarryFar/Sub1-CDN",
+      url = "https://cdn.jsdelivr.net/gh/barry-far/V2ray-Config@main/Sub1.txt",
+      repoLabel = "barry-far/V2ray-Config",
+      ),
+    SubscriptionSource(
+        name = "BarryFar/Sub2-CDN",
+      url = "https://cdn.jsdelivr.net/gh/barry-far/V2ray-Config@main/Sub2.txt",
+      repoLabel = "barry-far/V2ray-Config",
+      ),
+    SubscriptionSource(
+        name = "BarryFar/Sub3-CDN",
+      url = "https://cdn.jsdelivr.net/gh/barry-far/V2ray-Config@main/Sub3.txt",
+      repoLabel = "barry-far/V2ray-Config",
+      ),
+    SubscriptionSource(
+        name = "ALIILAPRO/Sub-CDN",
+      url = "https://cdn.jsdelivr.net/gh/ALIILAPRO/v2rayNG-Config@main/sub.txt",
+      repoLabel = "ALIILAPRO/v2rayNG-Config",
+      ),
+    SubscriptionSource(
+        name = "Mahdibland/SubMerge-CDN",
+      url = "https://cdn.jsdelivr.net/gh/mahdibland/V2RayAggregator@master/sub/sub_merge.txt",
+      repoLabel = "mahdibland/V2RayAggregator",
+      ),
+    // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
         SubscriptionSource(
           name = "Bahemmat/Tested-CDN",
           url = "https://cdn.jsdelivr.net/gh/MohammadBahemmat/V2ray-Collector@main/Tested.txt",
