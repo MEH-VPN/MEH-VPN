@@ -2,6 +2,7 @@ package com.example.data
 
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
+import com.example.model.V2RayProtocol
 import com.example.vpn.V2RayOutboundClient
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -58,104 +59,99 @@ class SoliSpiritRepository(
         // Batch 1: Primary CDN & Raw endpoints from rzashakeri/v2ray-configs (Priority #1)
         SubscriptionSource(
           name = "RzaShakeri/VLESS-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/vless.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Trojan-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/trojan.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/VMess-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vmess.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/vmess.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/SS-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/ss.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/shadowsocks.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Sub1-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Subscriptions/Sub1.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/all_base64.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/AllSub-CDN",
-          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/All_Configs_Sub.txt",
+          url = "https://cdn.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/all.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         // Batch 2: Fastly & GCore mirrors for rzashakeri/v2ray-configs
         SubscriptionSource(
           name = "RzaShakeri/VLESS-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/vless.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Trojan-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/trojan.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/VMess-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vmess.txt",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/vmess.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/SS-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/ss.txt",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/shadowsocks.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Sub1-Fastly",
-          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Subscriptions/Sub1.txt",
+          url = "https://fastly.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/all_base64.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/VLESS-GCore",
-          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/vless.txt",
+          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/vless.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         // Batch 3: Raw GitHub & root file endpoints for rzashakeri/v2ray-configs
         SubscriptionSource(
           name = "RzaShakeri/Trojan-GCore",
-          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/Protocols/trojan.txt",
+          url = "https://gcore.jsdelivr.net/gh/rzashakeri/v2ray-configs@main/configs/trojan.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/VLESS-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/vless.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/vless.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Trojan-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/trojan.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/trojan.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/VMess-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/vmess.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/vmess.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/SS-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Protocols/ss.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/shadowsocks.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/Sub1-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Subscriptions/Sub1.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/all_base64.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
         SubscriptionSource(
           name = "RzaShakeri/AllSub-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/All_Configs_Sub.txt",
-          repoLabel = "rzashakeri/v2ray-configs",
-        ),
-        SubscriptionSource(
-          name = "RzaShakeri/Tested-Raw",
-          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/Tested.txt",
+          url = "https://raw.githubusercontent.com/rzashakeri/v2ray-configs/main/configs/all.txt",
           repoLabel = "rzashakeri/v2ray-configs",
         ),
       )
@@ -479,11 +475,19 @@ class SoliSpiritRepository(
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
-      val validSaved = prioritizedSavedNodes.filter { V2RayOutboundClient.isSupportedByEngine(it) }
+      // Hysteria2, TUIC and WireGuard are UDP-only and can never pass the TCP 204 probe,
+      // so they must not occupy stage-1 wave slots.
+      val testable: (V2RayConfig) -> Boolean = {
+        V2RayOutboundClient.isSupportedByEngine(it) &&
+          it.protocol != V2RayProtocol.HYSTERIA2 &&
+          it.protocol != V2RayProtocol.TUIC &&
+          it.protocol != V2RayProtocol.WIREGUARD
+      }
+      val validSaved = prioritizedSavedNodes.filter(testable)
       val savedKeys = validSaved.map { it.endpointKey }.toSet()
       val remainingSupported =
         configs
-          .filter { V2RayOutboundClient.isSupportedByEngine(it) && it.endpointKey !in savedKeys }
+          .filter { testable(it) && it.endpointKey !in savedKeys }
           .shuffled()
 
       val supported = validSaved + remainingSupported
@@ -491,6 +495,7 @@ class SoliSpiritRepository(
 
       val semaphore = Semaphore(concurrency.coerceAtLeast(1))
       val completedCount = AtomicInteger(0)
+      val passedCount = AtomicInteger(0)
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
 
@@ -500,7 +505,7 @@ class SoliSpiritRepository(
       val stage2Semaphore = Semaphore(verifyConcurrency.coerceAtLeast(1))
 
       val waves = supported.chunked(WAVE_SIZE).take(maxWaves.coerceAtLeast(1))
-      for (wave in waves) {
+      for ((waveIdx, wave) in waves.withIndex()) {
         coroutineContext.ensureActive()
         val stage1Passed =
           coroutineScope {
@@ -510,7 +515,11 @@ class SoliSpiritRepository(
                   semaphore.withPermit {
                     coroutineContext.ensureActive()
                     val measured = measureNodeSpeed(config)
-                    completedCount.incrementAndGet()
+                    val done = completedCount.incrementAndGet()
+                    if (measured != null) passedCount.incrementAndGet()
+                    if (done % 20 == 0) {
+                      onLogUpdate("تست سرور ها: $done/${wave.size} کامل شد، ${passedCount.get()} موفق")
+                    }
                     measured
                   }
                 }
@@ -525,7 +534,10 @@ class SoliSpiritRepository(
               )
           }
 
-        if (stage1Passed.isEmpty()) continue
+        if (stage1Passed.isEmpty()) {
+          onLogUpdate("موج ${waveIdx + 1}: هیچ سروری از تست عبور نکرد")
+          continue
+        }
 
         val topToVerify = stage1Passed.take(12)
         onLogUpdate("بررسی کیفیت و پهنای باند سرورهای منتخب ...")
@@ -709,6 +721,14 @@ class SoliSpiritRepository(
     testAndSelectFastestCandidates(configs, maxCount = 1, onLogUpdate = onLogUpdate).firstOrNull()
 
   fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
+    // UDP-only protocols can never pass the TCP 204 probe; skip them here as well
+    // so background refine calls do not waste a probe slot on them either.
+    if (config.protocol == V2RayProtocol.HYSTERIA2 ||
+      config.protocol == V2RayProtocol.TUIC ||
+      config.protocol == V2RayProtocol.WIREGUARD
+    ) {
+      return null
+    }
     val resolvedIp = V2RayOutboundClient.resolveEndpointIpv4(config.address) ?: return null
     val withIp = config.copy(resolvedIp = resolvedIp)
     val realDelayMs = V2RayOutboundClient.measureRealProxyDelay(withIp, timeoutMs = 2600) ?: return null
