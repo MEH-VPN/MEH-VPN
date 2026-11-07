@@ -468,7 +468,7 @@ class SoliSpiritRepository(
           response.body
             ?.charStream()
             ?.buffered()
-            ?.useLines { lines -> lines.take(700).joinToString("\n") }
+            ?.useLines { lines -> lines.take(2000).joinToString("\n") }
             .orEmpty()
         V2RayConfigParser.parseSubscriptionContent(bodyText)
       }
@@ -492,7 +492,7 @@ class SoliSpiritRepository(
     configs: List<V2RayConfig>,
     maxCount: Int = 6,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
-    maxWaves: Int = 3,
+    maxWaves: Int = Int.MAX_VALUE,
     concurrency: Int = CONCURRENT_TEST_LIMIT,
     verifyConcurrency: Int = 6,
     onLogUpdate: (String) -> Unit,
@@ -527,6 +527,7 @@ class SoliSpiritRepository(
       val fallbackHttpsPool = mutableListOf<V2RayConfig>()
       val stage2Semaphore = Semaphore(verifyConcurrency.coerceAtLeast(1))
 
+      // Default maxWaves is uncapped, so all fetched configs are tested wave by wave; callers needing a cap pass maxWaves explicitly.
       val waves = supported.chunked(WAVE_SIZE).take(maxWaves.coerceAtLeast(1))
       for ((waveIdx, wave) in waves.withIndex()) {
         coroutineContext.ensureActive()
