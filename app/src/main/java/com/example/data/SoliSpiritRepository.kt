@@ -803,17 +803,18 @@ private suspend fun fetchFromSourceList(
     testAndSelectFastestCandidates(configs, maxCount = 1, onLogUpdate = onLogUpdate).firstOrNull()
 
   /**
-   * Fast first connect: probes configs wave by wave (80 per wave, 32 concurrent) and returns
-   * the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check, without
-   * waiting for the rest of the wave or later waves. Saved healthy nodes are tried first.
-   * The caller connects to the returned node immediately; the background refinement keeps
-   * testing the remaining pool and upgrades later if a clearly better node appears.
+   * Fast first connect with immediate failover pool:
+   * Finds the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check
+   * to serve as primary, plus includes up to [poolSize - 1] additional stage-1 passing nodes
+   * as backup candidates in the local proxy failover pool so the connection can instantly
+   * survive packet loss or node drops before background refinement kicks in.
    */
-  suspend fun findFirstPassingCandidate(
+  suspend fun findFastCandidatesWithFailoverPool(
     configs: List<V2RayConfig>,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+    poolSize: Int = 4,
     onLogUpdate: (String) -> Unit,
-  ): V2RayConfig? =
+  ): List<V2RayConfig> =
     withContext(ioDispatcher) {
       val testable: (V2RayConfig) -> Boolean = {
         V2RayOutboundClient.isSupportedByEngine(it) &&
@@ -828,7 +829,7 @@ private suspend fun fetchFromSourceList(
           .filter { testable(it) && it.endpointKey !in savedKeys }
           .shuffled()
       val supported = validSaved + remaining
-      if (supported.isEmpty()) return@withContext null
+      if (supported.isEmpty()) return@withContext emptyList()
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
       val semaphore = Semaphore(CONCURRENT_TEST_LIMIT)
@@ -862,13 +863,36 @@ private suspend fun fetchFromSourceList(
             )
           if (httpsLatency != null) {
             onLogUpdate("بهترین سرور انتخاب شد (پینگ ${candidate.latencyMs}ms)")
-            return@withContext candidate
+            val backups =
+              stage1Passed
+                .filter { it.endpointKey != candidate.endpointKey }
+                .take(poolSize - 1)
+            return@withContext listOf(candidate) + backups
           }
         }
         onLogUpdate("موج ${waveIdx + 1}: عبور از تست اولیه ولی تایید TLS نشد")
       }
-      null
+      emptyList()
     }
+
+  /**
+   * Fast first connect: probes configs wave by wave (80 per wave, 32 concurrent) and returns
+   * the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check, without
+   * waiting for the rest of the wave or later waves. Saved healthy nodes are tried first.
+   * The caller connects to the returned node immediately; the background refinement keeps
+   * testing the remaining pool and upgrades later if a clearly better node appears.
+   */
+  suspend fun findFirstPassingCandidate(
+    configs: List<V2RayConfig>,
+    prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+    onLogUpdate: (String) -> Unit,
+  ): V2RayConfig? =
+    findFastCandidatesWithFailoverPool(
+      configs = configs,
+      prioritizedSavedNodes = prioritizedSavedNodes,
+      poolSize = 1,
+      onLogUpdate = onLogUpdate,
+    ).firstOrNull()
 
 fun measureNodeSpeed(config: V2RayConfig): V2RayConfig? {
     // UDP-only protocols can never pass the TCP 204 probe; skip them here as well
