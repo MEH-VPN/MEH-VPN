@@ -234,7 +234,7 @@ class MehVpnService : VpnService() {
       val proxyPort = proxyServer.start()
       localProxyServer = proxyServer
 
-      // 2. Establish full-device Android IPv4 TUN interface (0.0.0.0/0) excluding our own app.
+      // 2. Establish full-device Android TUN interface (0.0.0.0/0 and ::/0) excluding our own app.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
@@ -243,6 +243,12 @@ class MehVpnService : VpnService() {
           .addRoute("0.0.0.0", 0)
           .addDnsServer("8.8.8.8")
           .addDnsServer("1.1.1.1")
+
+      // Route all IPv6 traffic into the TUN interface to prevent physical network IPv6 leaks
+      try {
+        builder.addAddress("fd00::10:10:14:2", 64)
+        builder.addRoute("::", 0)
+      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -268,7 +274,7 @@ class MehVpnService : VpnService() {
           establishedPfd.fd
         }
 
-      // 3. Start native Go tun2socks engine with the established TUN file descriptor
+      // 3. Start native Go tun2socks engine with the detached TUN file descriptor
       try {
         val key =
           Key().apply {
