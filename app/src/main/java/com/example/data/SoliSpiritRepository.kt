@@ -183,6 +183,13 @@ class SoliSpiritRepository(
           url = "https://cdn.jsdelivr.net/gh/itsyebekhe/PSG@main/config.txt",
           repoLabel = "itsyebekhe/PSG",
         ),
+        // Patterniha Free-Configs: 15 tested vless configs (3 nodes x variants).
+        // Parser already handles its SNI-Spoofing/frag variants natively.
+        SubscriptionSource(
+          name = "Patterniha/FreeConfigs-CDN",
+          url = "https://cdn.jsdelivr.net/gh/patterniha/Free-Configs@main/configs.txt",
+          repoLabel = "patterniha/Free-Configs",
+          ),
         // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
         SubscriptionSource(
           name = "Bahemmat/Tested-CDN",
@@ -328,6 +335,11 @@ class SoliSpiritRepository(
           url = "https://raw.githubusercontent.com/itsyebekhe/PSG/refs/heads/main/config.txt",
           repoLabel = "itsyebekhe/PSG",
         ),
+        SubscriptionSource(
+          name = "Patterniha/FreeConfigs-Raw",
+          url = "https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt",
+          repoLabel = "patterniha/Free-Configs",
+          ),
       )
 
     /**
