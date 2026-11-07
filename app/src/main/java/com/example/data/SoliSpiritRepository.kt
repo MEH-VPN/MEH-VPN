@@ -158,6 +158,19 @@ class SoliSpiritRepository(
 
     val FALLBACK_SOURCES =
       listOf(
+                // Batch 1: Fresh third-party subscriptions (added 2026-11-07 at the user's request).
+        // The PSG page (itsyebekhe.github.io/PSG/) is an HTML generator, not a subscription file,
+        // so the app fetches its underlying subscription file config.txt from the PSG repo.
+        SubscriptionSource(
+          name = "MhcfpTopic/XrayFinal-CDN",
+          url = "https://cdn.jsdelivr.net/gh/mhcfpTopic/config@main/xray_final.txt",
+          repoLabel = "mhcfpTopic/config",
+        ),
+        SubscriptionSource(
+          name = "PSG/Config-CDN",
+          url = "https://cdn.jsdelivr.net/gh/itsyebekhe/PSG@main/config.txt",
+          repoLabel = "itsyebekhe/PSG",
+        ),
         // Batch 1: Primary CDN endpoints from both SoliSpirit & MohammadBahemmat/V2ray-Collector
         SubscriptionSource(
           name = "Bahemmat/Tested-CDN",
@@ -297,6 +310,16 @@ class SoliSpiritRepository(
           name = "SoliSpirit/Sub1-Raw",
           url = "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Subscriptions/Sub1.txt",
           repoLabel = "SoliSpirit/v2ray-configs",
+        ),
+        SubscriptionSource(
+          name = "MhcfpTopic/XrayFinal-Raw",
+          url = "https://raw.githubusercontent.com/mhcfpTopic/config/main/xray_final.txt",
+          repoLabel = "mhcfpTopic/config",
+        ),
+        SubscriptionSource(
+          name = "PSG/Config-Raw",
+          url = "https://raw.githubusercontent.com/itsyebekhe/PSG/refs/heads/main/config.txt",
+          repoLabel = "itsyebekhe/PSG",
         ),
       )
 
