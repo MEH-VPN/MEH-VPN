@@ -16,8 +16,10 @@ android {
     applicationId = "com.aistudio.mehvpn.vraykx"
     minSdk = 21
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    val appVersionCode = (project.findProperty("appVersionCode") as? String)?.toIntOrNull() ?: 10313
+    val appVersionName = (project.findProperty("appVersionName") as? String) ?: "1.3.13"
+    versionCode = appVersionCode
+    versionName = appVersionName
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

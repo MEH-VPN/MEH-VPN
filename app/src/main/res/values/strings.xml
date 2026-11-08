@@ -10,4 +10,10 @@
     <string name="vpn_notification_title">MEH VPN</string>
     <string name="vpn_notification_disconnect">قطع اتصال</string>
     <string name="connect_last_server">اتصال با آخرین سرور</string>
+    <string name="update_available">نسخه جدید موجود است</string>
+    <string name="update_dialog_title">به‌روزرسانی مه وی‌پی‌ان</string>
+    <string name="update_dialog_subtitle">نسخه جدید آماده دریافت است</string>
+    <string name="update_btn_direct">دانلود مستقیم (گیت‌هاب)</string>
+    <string name="update_btn_telegram">کانال تلگرام</string>
+    <string name="update_btn_dismiss">فعلاً نه</string>
 </resources>

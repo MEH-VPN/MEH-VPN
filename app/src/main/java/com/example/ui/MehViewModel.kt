@@ -5,7 +5,9 @@ import android.content.Intent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.AppUpdateInfo
 import com.example.data.MehConnectionMethod
+import com.example.data.UpdateChecker
 import com.example.data.SoliSpiritRepository
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
@@ -59,6 +61,7 @@ data class MehUiState(
   val selectedConfig: V2RayConfig? = null,
   val lastConnectedConfig: V2RayConfig? = null,
   val activeMethod: MehConnectionMethod? = null,
+  val updateInfo: AppUpdateInfo? = null,
 ) {
   val isBusy: Boolean
     get() =
@@ -72,6 +75,7 @@ data class MehUiState(
 
 class MehViewModel(
   private val repository: SoliSpiritRepository = SoliSpiritRepository(),
+  private val updateChecker: UpdateChecker = UpdateChecker(),
 ) : ViewModel() {
 
   companion object {
@@ -97,6 +101,15 @@ class MehViewModel(
   private val logIdGenerator = AtomicLong(1L)
 
   init {
+    viewModelScope.launch {
+      runCatching {
+        val update = updateChecker.check()
+        if (update != null) {
+          _uiState.update { it.copy(updateInfo = update) }
+        }
+      }
+    }
+
     viewModelScope.launch {
       MehVpnService.tunnelSession.collect { session ->
         if (session.isRunning) {
@@ -158,6 +171,10 @@ class MehViewModel(
    * Loads the last connected server configuration from `SharedPreferences` so the user can
    * optionally reconnect to it with one tap.
    */
+  fun dismissUpdate() {
+    _uiState.update { it.copy(updateInfo = null) }
+  }
+
   fun loadSavedLastServer(context: Context) {
     try {
       val prefs = context.applicationContext.getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
