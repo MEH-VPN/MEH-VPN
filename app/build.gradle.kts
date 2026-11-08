@@ -13,7 +13,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.mehvpn.vraykx"
+    applicationId = "com.meh.vpn"
     minSdk = 21
     targetSdk = 36
     val appVersionCode = (project.findProperty("appVersionCode") as? String)?.toIntOrNull() ?: 10313
