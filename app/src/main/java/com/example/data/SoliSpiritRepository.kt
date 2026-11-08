@@ -534,7 +534,10 @@ class SoliSpiritRepository(
     private const val CONCURRENT_TEST_LIMIT = 32
     // Fast-connect path only: more parallel probes + a shorter first-pass probe so the
     // user waits less. Background refinement keeps the low-cost defaults (concurrency 6).
-    private const val FAST_CONNECT_CONCURRENCY = 64
+    // Aggressive first-30s mode: 128 parallel probes in waves of 160, so the first
+    // passing server is found sooner.
+    private const val FAST_CONNECT_CONCURRENCY = 128
+    private const val FAST_CONNECT_WAVE_SIZE = 160
     private const val FAST_CONNECT_PROBE_TIMEOUT_MS = 1500
     private const val MAX_CONFIGS_PER_SOURCE = 1000
   }
@@ -1001,6 +1004,7 @@ private suspend fun fetchFromSourceList(
     poolSize: Int = 4,
     concurrency: Int = FAST_CONNECT_CONCURRENCY,
     probeTimeoutMs: Int = FAST_CONNECT_PROBE_TIMEOUT_MS,
+    waveSize: Int = WAVE_SIZE,
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
@@ -1021,7 +1025,7 @@ private suspend fun fetchFromSourceList(
 
       onLogUpdate("شروع تست سرعت روی ${supported.size} سرور ...")
       val semaphore = Semaphore(concurrency)
-      for ((waveIdx, wave) in supported.chunked(WAVE_SIZE).withIndex()) {
+      for ((waveIdx, wave) in supported.chunked(waveSize).withIndex()) {
         coroutineContext.ensureActive()
         val stage1Passed =
           coroutineScope {
@@ -1111,6 +1115,7 @@ private suspend fun fetchFromSourceList(
         findFastCandidatesWithFailoverPool(
           configs = prioritizedSavedNodes,
           poolSize = poolSize,
+          waveSize = FAST_CONNECT_WAVE_SIZE,
           onLogUpdate = onLogUpdate,
         )
       if (savedFirst.isNotEmpty()) return@withContext savedFirst
@@ -1137,6 +1142,7 @@ private suspend fun fetchFromSourceList(
           findFastCandidatesWithFailoverPool(
             configs = batchConfigs,
             poolSize = poolSize,
+            waveSize = FAST_CONNECT_WAVE_SIZE,
             onLogUpdate = onLogUpdate,
           )
         if (found.isNotEmpty()) return@withContext found
