@@ -1,5 +1,5 @@
 {
-  "name": "Meh",
+  "name": "MEH",
   "description": "Minimalist one-tap V2Ray VPN client that fetches live configs from SoliSpirit/v2ray-configs, benchmarks server speed, and auto-connects to the fastest node.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

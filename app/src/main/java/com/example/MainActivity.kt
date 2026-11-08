@@ -236,21 +236,28 @@ fun MehMinimalScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
       ) {
         // Equal top weight keeps the power button permanently locked at the vertical center
-        AnimatedVisibility(
-          visible = uiState.updateInfo != null,
-          enter = fadeIn(tween(320)) + expandVertically(tween(320)),
-          exit = fadeOut(tween(200)) + shrinkVertically(tween(200)),
-          modifier = Modifier.weight(1f).fillMaxWidth(),
+        Box(
+          modifier =
+            Modifier.weight(1f)
+              .fillMaxWidth(),
+          contentAlignment = Alignment.TopCenter,
         ) {
-          uiState.updateInfo?.let { updateInfo ->
-            Box(
-              modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-              contentAlignment = Alignment.TopCenter,
-            ) {
-              UpdateNotificationPill(
-                versionName = updateInfo.latestVersionName,
-                onClick = onUpdateClick,
-              )
+          androidx.compose.animation.AnimatedVisibility(
+            visible = uiState.updateInfo != null,
+            enter = fadeIn(tween(320)) + expandVertically(tween(320)),
+            exit = fadeOut(tween(200)) + shrinkVertically(tween(200)),
+            modifier = Modifier.fillMaxWidth(),
+          ) {
+            uiState.updateInfo?.let { updateInfo ->
+              Box(
+                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                contentAlignment = Alignment.TopCenter,
+              ) {
+                UpdateNotificationPill(
+                  versionName = updateInfo.latestVersionName,
+                  onClick = onUpdateClick,
+                )
+              }
             }
           }
         }
