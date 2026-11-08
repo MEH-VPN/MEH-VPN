@@ -210,13 +210,16 @@ class MehViewModel(
 
   private fun saveLastConnectedCandidates(context: Context, candidates: List<V2RayConfig>) {
     if (candidates.isEmpty()) return
-    cachedLastCandidates = candidates
+    // Accumulate working servers across sessions (up to 20) instead of keeping only
+    // the latest pool, so the next connect tries proven servers first.
+    val merged = (candidates + cachedLastCandidates).distinctBy { it.endpointKey }.take(20)
+    cachedLastCandidates = merged
     _uiState.update { current ->
-      current.copy(lastConnectedConfig = candidates.first())
+      current.copy(lastConnectedConfig = merged.first())
     }
     try {
       val arr = JSONArray()
-      for (cfg in candidates) {
+      for (cfg in merged) {
         val obj =
           JSONObject().apply {
             put("rawUri", cfg.rawUri)

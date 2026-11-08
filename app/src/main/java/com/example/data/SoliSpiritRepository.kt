@@ -1115,7 +1115,9 @@ private suspend fun fetchFromSourceList(
         )
       if (savedFirst.isNotEmpty()) return@withContext savedFirst
 
-            var testedCount = 0
+            // No per-tier test budget on the connect path: the search keeps going through
+      // every batch until a server passes (or the sources run out). Stopping early
+      // is what used to turn the circle red while untested servers remained.
       for ((batchIdx, batch) in sources.chunked(4).withIndex()) {
         coroutineContext.ensureActive()
         onLogUpdate("دریافت دسته ${batchIdx + 1} از ساب‌ها ...")
@@ -1138,13 +1140,6 @@ private suspend fun fetchFromSourceList(
             onLogUpdate = onLogUpdate,
           )
         if (found.isNotEmpty()) return@withContext found
-        testedCount += batchConfigs.size
-        // Same budget as the old fetch-then-test path (~380 configs per tier): without it,
-        // a tier with dozens of dead sources grinds through every batch and feels slower.
-        if (testedCount >= 400) {
-          onLogUpdate("به حد تست این مرحله رسیدیم؛ سراغ مرحله بعد ...")
-          break
-        }
       }
       emptyList()
     }
