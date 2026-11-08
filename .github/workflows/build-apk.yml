@@ -68,6 +68,20 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      # app/google-services.json is gitignored (it carries the Firebase
+      # project config). Restore it from the GOOGLE_SERVICES_JSON
+      # repository secret so Firebase Analytics is actually configured
+      # in the built APK; without it the build fails on the
+      # MissingGoogleServicesStrategy.ERROR setting in
+      # app/build.gradle.kts instead of silently shipping dead Analytics.
+      - name: Restore google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "$GOOGLE_SERVICES_JSON" | base64 -d > app/google-services.json
+          fi
+
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
