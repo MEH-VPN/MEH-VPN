@@ -2,13 +2,8 @@ package com.example.telemetry
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import com.google.firebase.Firebase
-import com.google.firebase.FirebaseApp
-import com.google.firebase.analytics.FirebaseAnalytics
-import com.google.firebase.analytics.analytics
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
@@ -16,11 +11,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Handles Firebase Analytics, Active User Tracking, and Error Telemetry for MEH VPN:
- * - Verifies and initializes `FirebaseApp` and `FirebaseAnalytics` across both UI (`MainActivity`)
- *   and background VPN service (`MehVpnService`) lifecycles.
- * - Assigns a persistent anonymous installation ID (`user_id`) and user properties (`app_version`,
- *   `android_sdk`, `device_model`, `vpn_status`) for accurate DAU/MAU and Realtime Active User metrics.
+ * Local no-op telemetry facade for MEH VPN (Firebase Analytics removed:
+ * no event is sent anywhere). It keeps the same public API and local bookkeeping
+ * so a future analytics backend (e.g. AppMetrica) can plug into the same call sites:
+ * - Assigns a persistent anonymous installation ID (`user_id`) and tracks the current
+ *   `vpn_status` locally for session and error diagnostics.
  * - Tracks `app_open`, `screen_view`, `vpn_connect_attempt`, `vpn_configs_fetched`, `vpn_connected`,
  *   `vpn_active_heartbeat`, and `vpn_disconnected`.
  * - Persists uncaught crashes (`uncaught_crash`) and pre-connection errors (`app_error_report`) in
@@ -44,7 +39,7 @@ object MehTelemetry {
   )
 
   data class TelemetryDiagnostics(
-    val isFirebaseInitialized: Boolean,
+    val isTelemetryInitialized: Boolean,
     val clientUserId: String,
     val activeSessionsCount: Int,
     val totalErrorsLogged: Int,
@@ -54,7 +49,7 @@ object MehTelemetry {
   )
 
   @Volatile private var appContext: Context? = null
-  @Volatile private var analyticsInstance: FirebaseAnalytics? = null
+  @Volatile private var isTelemetryInitialized = false
   @Volatile private var crashHandlerInstalled = false
   @Volatile private var clientUserId: String = ""
   @Volatile private var currentVpnStatus: String = "disconnected"
@@ -82,52 +77,10 @@ object MehTelemetry {
         errorCounter.set(prefs.getInt(KEY_TOTAL_ERRORS, 0))
       }
 
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-        try {
-          if (FirebaseApp.getApps(ctx).isEmpty()) {
-            FirebaseApp.initializeApp(ctx)
-          }
-        } catch (_: Throwable) {}
-
-        val fa =
-          analyticsInstance
-            ?: FirebaseAnalytics.getInstance(ctx).also { analyticsInstance = it }
-        fa.setAnalyticsCollectionEnabled(true)
-        fa.setUserId(storedId)
-
-        val appVersion = resolveAppVersion(ctx)
-        fa.setUserProperty("app_version", appVersion.take(36))
-        fa.setUserProperty("android_sdk", Build.VERSION.SDK_INT.toString())
-        fa.setUserProperty("device_model", "${Build.MANUFACTURER}_${Build.MODEL}".take(36))
-        fa.setUserProperty("vpn_status", currentVpnStatus.take(36))
-
-        val defaultParams =
-          Bundle().apply {
-            putString("app_version", appVersion.take(36))
-            putInt("android_sdk", Build.VERSION.SDK_INT)
-            putString("device_model", "${Build.MANUFACTURER} ${Build.MODEL}".take(40))
-          }
-        fa.setDefaultEventParameters(defaultParams)
-      }
-
+      isTelemetryInitialized = true
       flushPendingErrorReports()
     } catch (t: Throwable) {
-      Log.w(TAG, "Firebase Analytics init warning: ${t.message}")
-    }
-  }
-
-  private fun analyticsOrNull(): FirebaseAnalytics? {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
-    analyticsInstance?.let { return it }
-    val ctx = appContext
-    return try {
-      if (ctx != null) {
-        FirebaseAnalytics.getInstance(ctx).also { analyticsInstance = it }
-      } else {
-        Firebase.analytics.also { analyticsInstance = it }
-      }
-    } catch (_: Throwable) {
-      null
+      Log.w(TAG, "Telemetry init warning: ${t.message}")
     }
   }
 
@@ -154,7 +107,7 @@ object MehTelemetry {
 
   /**
    * Logs an active user session (`app_open` + `user_active_session` + `screen_view`) when the app
-   * is launched or brought to foreground so Firebase Analytics counts active users accurately.
+   * is launched or brought to foreground, for local session tracking only.
    */
   fun logAppOpen(screenName: String = "MehMinimalScreen") {
     val sessionNum = sessionCounter.incrementAndGet()
@@ -168,15 +121,15 @@ object MehTelemetry {
         putInt("session_number", sessionNum)
         putString("vpn_status", currentVpnStatus)
       }
-    logEvent(FirebaseAnalytics.Event.APP_OPEN, openParams)
+    logEvent("app_open", openParams)
     logEvent("user_active_session", openParams)
 
     val screenParams =
       Bundle().apply {
-        putString(FirebaseAnalytics.Param.SCREEN_NAME, screenName.take(60))
-        putString(FirebaseAnalytics.Param.SCREEN_CLASS, "MainActivity")
+        putString("screen_name", screenName.take(60))
+        putString("screen_class", "MainActivity")
       }
-    logEvent(FirebaseAnalytics.Event.SCREEN_VIEW, screenParams)
+    logEvent("screen_view", screenParams)
   }
 
   fun logConnectAttempt() {
@@ -210,8 +163,8 @@ object MehTelemetry {
   }
 
   /**
-   * Logs periodic active tunnel engagement while the VPN is connected in the background so
-   * long-lived VPN users are accurately reflected in Firebase active user engagement metrics.
+   * Logs periodic active tunnel engagement while the VPN is connected in the background, for
+   * local session tracking only.
    */
   fun logActiveSessionHeartbeat(
     serverName: String,
@@ -294,7 +247,7 @@ object MehTelemetry {
 
   /**
    * Flushes any persisted crash or pre-connection error reports stored in `SharedPreferences`
-   * to Firebase Analytics.
+   * to the local event log.
    */
   fun flushPendingErrorReports(): Int {
     val ctx = appContext ?: return 0
@@ -347,15 +300,8 @@ object MehTelemetry {
         0
       }
 
-    val isReady =
-      try {
-        analyticsInstance != null || (ctx != null && FirebaseApp.getApps(ctx).isNotEmpty())
-      } catch (_: Throwable) {
-        false
-      }
-
     return TelemetryDiagnostics(
-      isFirebaseInitialized = isReady,
+      isTelemetryInitialized = isTelemetryInitialized,
       clientUserId = clientUserId,
       activeSessionsCount = sessionCounter.get(),
       totalErrorsLogged = errorCounter.get(),
@@ -367,11 +313,7 @@ object MehTelemetry {
 
   private fun updateVpnStatusProperty(status: String) {
     currentVpnStatus = status
-    try {
-      analyticsOrNull()?.setUserProperty("vpn_status", status.take(36))
-    } catch (_: Throwable) {}
   }
-
   private fun enqueuePendingError(
     stage: String,
     errorType: String,
@@ -440,10 +382,6 @@ object MehTelemetry {
       recentEventsBuffer.add(RecordedTelemetryEvent(name = name, params = map))
     } catch (_: Throwable) {}
 
-    try {
-      analyticsOrNull()?.logEvent(name, params)
-    } catch (_: Throwable) {
-      // Safe fallback in unit tests or pre-M devices
-    }
+    Log.d(TAG, "Telemetry event (local only): $name")
   }
 }
