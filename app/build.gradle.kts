@@ -3,7 +3,7 @@ plugins {
   alias(libs.plugins.kotlin.compose)
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.secrets)
-  
+}  
 
 android {
   namespace = "com.example"
@@ -114,6 +114,7 @@ dependencies {
   // Sign-In via Credential Manager:
     // implementation(libs.androidx.credentials)
   // implementation(libs.androidx.credentials.play.services)
+// implementation(libs.googleid)
         implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   // implementation(libs.logging.interceptor)
