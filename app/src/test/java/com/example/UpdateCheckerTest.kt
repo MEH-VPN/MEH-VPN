@@ -2,6 +2,8 @@ package com.example
 
 import com.example.data.AppUpdateInfo
 import com.example.data.SemanticVersion
+import com.example.data.UpdateChecker
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -75,5 +77,20 @@ class UpdateCheckerTest {
       info.downloadUrl,
     )
     assertEquals("https://t.me/MEH_VPN_channel", info.telegramUrl)
+  }
+
+  @Test
+  fun check_detectsUpdateWhenRunning1_3_17_andRemoteIs1_3_18() = runTest {
+    val checker = UpdateChecker()
+    val update = checker.check(currentVersionRaw = "1.3.17")
+    assertNotNull("Expected update to be found for 1.3.17", update)
+    assertEquals("1.3.18", update?.latestVersionName)
+  }
+
+  @Test
+  fun check_returnsNullWhenRunningLatestVersion() = runTest {
+    val checker = UpdateChecker()
+    val update = checker.check(currentVersionRaw = "1.3.18")
+    assertNull("Expected null when already running latest version 1.3.18", update)
   }
 }

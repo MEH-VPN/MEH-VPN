@@ -4,6 +4,8 @@ import com.example.BuildConfig
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -70,8 +72,14 @@ data class AppUpdateInfo(
 }
 
 /**
- * Lightweight, zero-rate-limit update checker.
- * Checks CDN/Raw version.json first, with safe fallback to GitHub 302 release redirect.
+ * Lightweight, resilient, zero-rate-limit update checker.
+ *
+ * Discovers the latest version across multiple resilient endpoints:
+ * 1. jsDelivr Package API: automatically tracks GitHub tags via CDN (unblocked in Iran, 0 rate limit).
+ * 2. GitHub 302 release redirect: checks HTTP Location header on /releases/latest (0 rate limit).
+ * 3. Static version.json: served via jsDelivr CDN and GitHub raw.
+ *
+ * Compares the highest discovered version against the running app version.
  */
 class UpdateChecker(
   private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -84,12 +92,14 @@ class UpdateChecker(
 ) {
 
   companion object {
+    private const val JSDELIVR_PACKAGE_API =
+      "https://data.jsdelivr.com/v1/package/gh/MEH-VPN/MEH-VPN"
+    private const val GITHUB_LATEST_RELEASE_URL =
+      "https://github.com/MEH-VPN/MEH-VPN/releases/latest"
     private const val CDN_VERSION_JSON =
       "https://cdn.jsdelivr.net/gh/MEH-VPN/MEH-VPN@main/version.json"
     private const val RAW_VERSION_JSON =
       "https://raw.githubusercontent.com/MEH-VPN/MEH-VPN/main/version.json"
-    private const val GITHUB_LATEST_RELEASE_URL =
-      "https://github.com/MEH-VPN/MEH-VPN/releases/latest"
   }
 
   suspend fun check(currentVersionRaw: String = BuildConfig.VERSION_NAME): AppUpdateInfo? =
@@ -97,32 +107,78 @@ class UpdateChecker(
       runCatching {
         val currentVersion = SemanticVersion.parse(currentVersionRaw) ?: SemanticVersion(1, 3, 13)
 
-        // 1. Try reading version.json from CDN or GitHub Raw
-        val fromJson = fetchFromJson(CDN_VERSION_JSON) ?: fetchFromJson(RAW_VERSION_JSON)
-        if (fromJson != null) {
-          val remote = SemanticVersion.parse(fromJson.latestVersionName)
-          if (remote != null && remote > currentVersion) {
-            return@withContext fromJson
-          }
-          return@withContext null
-        }
+        // Query available zero-rate-limit sources concurrently
+        coroutineScope {
+          val jsdelivrDeferred = async { fetchTagFromJsdelivrPackage() }
+          val githubDeferred = async { fetchTagFromGithubRedirect() }
+          val jsonDeferred = async { fetchFromJson(CDN_VERSION_JSON) ?: fetchFromJson(RAW_VERSION_JSON) }
 
-        // 2. Fallback: check 302 redirect from GitHub releases/latest (Zero rate-limit)
-        val tagFromRedirect = fetchTagFromGithubRedirect()
-        if (tagFromRedirect != null) {
-          val remote = SemanticVersion.parse(tagFromRedirect)
-          if (remote != null && remote > currentVersion) {
-            return@withContext AppUpdateInfo(
-              latestVersionName = tagFromRedirect,
-              downloadUrl = AppUpdateInfo.DEFAULT_GITHUB_APK_URL,
-              telegramUrl = AppUpdateInfo.DEFAULT_TELEGRAM_URL,
+          val jsdelivrTag = jsdelivrDeferred.await()
+          val githubTag = githubDeferred.await()
+          val jsonInfo = jsonDeferred.await()
+
+          val jsdelivrSemver = SemanticVersion.parse(jsdelivrTag)
+          val githubSemver = SemanticVersion.parse(githubTag)
+          val jsonSemver = SemanticVersion.parse(jsonInfo?.latestVersionName)
+
+          // Determine the highest available remote version among all successful sources
+          var highestVersion: SemanticVersion? = null
+          var candidateVersionName: String = ""
+
+          if (jsdelivrSemver != null && (highestVersion == null || jsdelivrSemver > highestVersion)) {
+            highestVersion = jsdelivrSemver
+            candidateVersionName = jsdelivrTag!!.trim().removePrefix("v").removePrefix("V")
+          }
+          if (githubSemver != null && (highestVersion == null || githubSemver > highestVersion)) {
+            highestVersion = githubSemver
+            candidateVersionName = githubTag!!.trim().removePrefix("v").removePrefix("V")
+          }
+          if (jsonSemver != null && (highestVersion == null || jsonSemver > highestVersion)) {
+            highestVersion = jsonSemver
+            candidateVersionName = jsonInfo!!.latestVersionName.trim().removePrefix("v").removePrefix("V")
+          }
+
+          if (highestVersion != null && highestVersion > currentVersion) {
+            return@coroutineScope AppUpdateInfo(
+              latestVersionName = candidateVersionName,
+              latestVersionCode = jsonInfo?.latestVersionCode ?: 0,
+              downloadUrl = jsonInfo?.downloadUrl ?: AppUpdateInfo.DEFAULT_GITHUB_APK_URL,
+              telegramUrl = jsonInfo?.telegramUrl ?: AppUpdateInfo.DEFAULT_TELEGRAM_URL,
             )
           }
-        }
 
-        null
+          null
+        }
       }.getOrNull()
     }
+
+  private fun fetchTagFromJsdelivrPackage(): String? {
+    return runCatching {
+      val req = Request.Builder().url(JSDELIVR_PACKAGE_API).build()
+      httpClient.newCall(req).execute().use { response ->
+        if (!response.isSuccessful) return null
+        val bodyStr = response.body?.string() ?: return null
+        val json = JSONObject(bodyStr)
+        val versions = json.optJSONArray("versions") ?: return null
+        if (versions.length() == 0) return null
+        versions.optString(0, "").ifBlank { null }
+      }
+    }.getOrNull()
+  }
+
+  private fun fetchTagFromGithubRedirect(): String? {
+    return runCatching {
+      val req = Request.Builder().url(GITHUB_LATEST_RELEASE_URL).head().build()
+      httpClient.newCall(req).execute().use { response ->
+        val location = response.header("Location") ?: return null
+        val tag =
+          location.substringAfterLast("/tag/", "").ifBlank {
+            location.substringAfterLast("/")
+          }
+        tag.ifBlank { null }
+      }
+    }.getOrNull()
+  }
 
   private fun fetchFromJson(url: String): AppUpdateInfo? {
     return runCatching {
@@ -139,20 +195,6 @@ class UpdateChecker(
           downloadUrl = json.optString("download_url", AppUpdateInfo.DEFAULT_GITHUB_APK_URL),
           telegramUrl = json.optString("telegram_url", AppUpdateInfo.DEFAULT_TELEGRAM_URL),
         )
-      }
-    }.getOrNull()
-  }
-
-  private fun fetchTagFromGithubRedirect(): String? {
-    return runCatching {
-      val req = Request.Builder().url(GITHUB_LATEST_RELEASE_URL).head().build()
-      httpClient.newCall(req).execute().use { response ->
-        val location = response.header("Location") ?: return null
-        val tag =
-          location.substringAfterLast("/tag/", "").ifBlank {
-            location.substringAfterLast("/")
-          }
-        tag.ifBlank { null }
       }
     }.getOrNull()
   }

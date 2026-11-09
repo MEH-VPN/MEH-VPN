@@ -83,7 +83,11 @@ jobs:
           fi
 
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+        run: |
+          VERSION="${{ github.ref_name }}"
+          CLEAN_VER="${VERSION#v}"
+          [ -z "$CLEAN_VER" ] && CLEAN_VER="1.3.18"
+          gradle assembleDebug -PappVersionName="$CLEAN_VER" --stacktrace
 
       - name: Package named release artifacts
         run: |
