@@ -338,7 +338,7 @@ class MehVpnService : VpnService() {
    *   (`MehDiag.hasRecentDownloadTraffic(30_000L)`).
    * - If 2 consecutive keep-alive probes fail on an idle connection, automatically rotates to the
    *   next healthy node in `serverPool` via `proxyServer.switchToNextHealthyNode("keep_alive_timeout")`.
-   * - Sends Firebase active session heartbeat only once every ~10 minutes (13 ticks x 45s = 585s).
+   * - Sends active session heartbeat only once every ~10 minutes (13 ticks x 45s = 585s).
    */
   private fun startProtectedKeepAliveProbe(
     proxyServer: LocalV2RayProxyServer,
