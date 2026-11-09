@@ -83,29 +83,15 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun firebaseTelemetry_initializesAndTracksActiveUsersAndFlushesErrors() {
+  fun telemetry_initializesAndTracksActiveUsersAndFlushesErrors() {
     val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
-
-    // 1. Verify Google Services plugin generated valid Firebase project resources
-    val googleAppIdRes = context.resources.getIdentifier("google_app_id", "string", context.packageName)
-    val projectIdRes = context.resources.getIdentifier("project_id", "string", context.packageName)
-    assertTrue("google_app_id resource must exist", googleAppIdRes != 0)
-    assertTrue("project_id resource must exist", projectIdRes != 0)
-    org.junit.Assert.assertEquals(
-      "1:468881393461:android:595ee77141fb8a77606e7c",
-      context.getString(googleAppIdRes),
-    )
-    org.junit.Assert.assertEquals(
-      "gen-lang-client-0005537360",
-      context.getString(projectIdRes),
-    )
 
     // 2. Verify MehTelemetry initialization & active user tracking
     com.example.telemetry.MehTelemetry.initialize(context)
     com.example.telemetry.MehTelemetry.logAppOpen("MehMinimalScreen")
 
     val diagAfterOpen = com.example.telemetry.MehTelemetry.getDiagnostics()
-    assertTrue("Firebase should be initialized", diagAfterOpen.isFirebaseInitialized)
+    assertTrue("Telemetry should be initialized", diagAfterOpen.isTelemetryInitialized)
     assertTrue("Client user ID must be generated and persisted", diagAfterOpen.clientUserId.startsWith("meh_"))
     assertTrue("Active session count must increment", diagAfterOpen.activeSessionsCount >= 1)
     assertTrue(
