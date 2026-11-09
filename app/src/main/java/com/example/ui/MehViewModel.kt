@@ -101,20 +101,16 @@ class MehViewModel(
   private val logIdGenerator = AtomicLong(1L)
 
   init {
-    viewModelScope.launch {
-      runCatching {
-        val update = updateChecker.check()
-        if (update != null) {
-          _uiState.update { it.copy(updateInfo = update) }
-        }
-      }
-    }
+    checkForUpdates()
 
     viewModelScope.launch {
       MehVpnService.tunnelSession.collect { session ->
         if (session.isRunning) {
           val wasAlreadyConnected = _uiState.value.phase == MehPhase.CONNECTED
           if (!wasAlreadyConnected) {
+            if (_uiState.value.updateInfo == null) {
+              checkForUpdates()
+            }
             pendingSave?.let { (ctx, list) -> saveLastConnectedCandidates(ctx, list) }
             pendingSave = null
             val cfg = _uiState.value.selectedConfig
@@ -171,6 +167,17 @@ class MehViewModel(
    * Loads the last connected server configuration from `SharedPreferences` so the user can
    * optionally reconnect to it with one tap.
    */
+  fun checkForUpdates() {
+    viewModelScope.launch {
+      runCatching {
+        val update = updateChecker.check()
+        if (update != null) {
+          _uiState.update { it.copy(updateInfo = update) }
+        }
+      }
+    }
+  }
+
   fun dismissUpdate() {
     _uiState.update { it.copy(updateInfo = null) }
   }
