@@ -379,16 +379,12 @@ class MehViewModel(
   }
 
   /**
-   * Primary V2Ray connection pipeline using the latest V2Ray core. Each tier is searched
-   * with a pipelined fetch+test: sources are fetched in batches of 4 and each batch is
-   * probed the moment it arrives (64 parallel probes, 1500 ms first-pass timeout), so the
-   * first passing server connects within seconds instead of after the whole tier downloads.
-   * 1. Tier 1: `rzashakeri/v2ray-configs`.
-   * 2. Tier 2: Only if Tier 1 yields no working server, the mhcfpTopic subscription.
-   * 3. Tier 3: Only if Tier 2 also yields nothing, the remaining subscriptions.
-   * 4. Starts the VPN tunnel service with the first passing server (plus up to 4 backups
-   *    in the failover pool); the background refinement keeps testing the remaining pool
-   *    and upgrades later if a clearly better node appears.
+   * Round 5 scans all tiers (primary, mhcfp, fallback) for at least 60 seconds at full
+     * fast-connect power and connects to the fastest verified node instead of the
+     * first one that passes; a verified node under 1000 ms ends the scan at once.
+     * Starts the VPN tunnel service with the fastest node (plus up to 4 backups
+     * in the failover pool); the background refinement keeps testing the remaining pool
+     * and upgrades later if a clearly better node appears.
    */
   private fun startV2RayConnectionPipeline(
     context: Context,
@@ -422,71 +418,18 @@ class MehViewModel(
           }
           delay(120L)
 
-          verifiedCandidates =
-            repository.findFirstPassingFromSources(
-              sources = SoliSpiritRepository.PRIMARY_RZASHAKERI_SOURCES,
-              prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
-            excludedEndpointKeys = deadKeys,
-              poolSize = 5,
-            ) { logLine ->
-              appendLogLine(
-                message = logLine,
-                level = HackerLogLevel.SCAN,
-              )
-            }
-
-                    // Step 2 (Tier 2): mhcfp — only if Priority #1 yielded no working server
-          if (verifiedCandidates.isEmpty()) {
-            _uiState.update {
-              it.copy(
-                phase = MehPhase.TESTING_SPEED,
-                liveLogLine = LOG_TESTING,
-              )
-            }
-            delay(120L)
-
-            verifiedCandidates =
-              repository.findFirstPassingFromSources(
-                sources = SoliSpiritRepository.MHCFP_SOURCES,
-                prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
-            excludedEndpointKeys = deadKeys,
-                poolSize = 5,
-              ) { logLine ->
-                appendLogLine(
-                  message = logLine,
-                  level = HackerLogLevel.SCAN,
-                )
-              }
-          }
-
-          // Step 3 (Tier 3): فقط در صورتی که سرورهای اولویت اول و دوم وصل نشدند سراغ بقیه ساب‌ها برو
-          if (verifiedCandidates.isEmpty()) {
-            appendLogLine(
-              message = "عدم اتصال سرورهای اولویت اول؛ بررسی مخازن پشتیبان ...",
-              level = HackerLogLevel.SOURCE,
-            )
-
-            _uiState.update {
-              it.copy(
-                phase = MehPhase.TESTING_SPEED,
-                liveLogLine = LOG_TESTING,
-              )
-            }
-            delay(120L)
-
-            verifiedCandidates =
-              repository.findFirstPassingFromSources(
-                sources = SoliSpiritRepository.FALLBACK_SOURCES,
-                prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
-            excludedEndpointKeys = deadKeys,
-                poolSize = 5,
-              ) { logLine ->
-                appendLogLine(
-                  message = logLine,
-                  level = HackerLogLevel.SCAN,
-                )
-              }
-          }
+          // Round 5: scan every tier for at least 60 seconds and connect to the
+                    // fastest verified node instead of the first one that passes.
+                    verifiedCandidates =
+                        repository.scanBestCandidatesAcrossAllTiers(
+                            prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+                            excludedEndpointKeys = deadKeys,
+                        ) { logLine ->
+                            appendLogLine(
+                                message = logLine,
+                                level = HackerLogLevel.SCAN,
+                            )
+                        }
 
           if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(
