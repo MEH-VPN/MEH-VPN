@@ -49,12 +49,12 @@ object VmessAndShadowsocksEngine {
       "aes-256-gcm",
       "chacha20-ietf-poly1305",
       "chacha20-poly1305",
-      "xchacha20-ietf-poly1305",
       "2022-blake3-aes-128-gcm",
       "2022-blake3-aes-256-gcm",
-      "2022-blake3-chacha20-poly1305",
-      "none",
-      "plain" -> true
+      "2022-blake3-chacha20-poly1305" -> true
+      // xchacha20-ietf-poly1305 (needs HChaCha20 + 24-byte nonce), "none" and "plain" are not
+      // implemented by the stream code below: accepting them made the node connect and then
+      // fail every read, so they must be rejected up front.
       else -> false
     }
   }
