@@ -615,9 +615,102 @@ object V2RayOutboundClient {
   }
 
   /**
-   * Stage 1 Fast Probe: Opens a V2Ray tunnel to `connectivitycheck.gstatic.com:80`
-   * and verifies `HTTP/1.1 204`.
+   * Stage 1 Fast Probe: Opens V2Ray tunnels to connectivitycheck.gstatic.com:80 and www.cloudflare.com:80;
+   * and verifies HTTP/1.1 204 from Google and HTTP/1.1 2xx (or a 3xx redirect to HTTPS) from Cloudflare.
    */
+  /**
+   * Plain-HTTP probe through [resolvedConfig]: GET [requestPath] on [targetHost]:80 and
+   * require the response status line to start with one of [expectedStatusPrefixes] (for
+   * example "HTTP/1.1 204"). Throws on any mismatch so the caller can treat the
+   * whole multi-destination probe as failed.
+   */
+  private fun probePlainHttpOverTunnel(
+    resolvedConfig: V2RayConfig,
+    targetHost: String,
+    requestPath: String,
+    expectedStatusPrefixes: List<String>,
+    timeoutMs: Int,
+    protector: ((Socket) -> Boolean)?,
+  ) {
+    openTunnel(
+      config = resolvedConfig,
+      targetHost = targetHost,
+      targetPort = 80,
+      timeoutMs = timeoutMs,
+      protector = protector,
+      usePrewarmedPool = false,
+    ).use { conn ->
+      val probeRequest =
+        "GET " + requestPath + " HTTP/1.1\r\n" +
+          "Host: " + targetHost + "\r\n" +
+          "User-Agent: Mozilla/5.0\r\n" +
+          "Connection: close\r\n\r\n"
+      conn.outputStream.write(probeRequest.toByteArray(Charsets.US_ASCII))
+      conn.outputStream.flush()
+      val responseBuf = ByteArrayOutputStream(256)
+      val chunk = ByteArray(256)
+      while (responseBuf.size() < 220) {
+        val n = conn.inputStream.read(chunk)
+        if (n <= 0) break
+        responseBuf.write(chunk, 0, n)
+        val textSoFar = responseBuf.toString("US-ASCII")
+        if (textSoFar.contains("\r\n\r\n")) {
+          break
+        }
+      }
+      val responseText = responseBuf.toString("US-ASCII")
+      if (expectedStatusPrefixes.none { responseText.startsWith(it) }) {
+        throw IOException("Invalid " + targetHost + " probe response: " + responseText.take(48))
+      }
+    }
+  }
+
+  /**
+   * TLS probe through [resolvedConfig]: TLS to [targetHost]:443, GET [requestPath],
+   * and require a status line starting with one of [expectedStatusPrefixes].
+   * Throws on any mismatch so the caller can treat the whole probe as failed.
+   */
+  private fun probeTlsHttpOverTunnel(
+    resolvedConfig: V2RayConfig,
+    targetHost: String,
+    requestPath: String,
+    expectedStatusPrefixes: List<String>,
+    timeoutMs: Int,
+    protector: ((Socket) -> Boolean)?,
+  ) {
+    openTunnel(
+      config = resolvedConfig,
+      targetHost = targetHost,
+      targetPort = 443,
+      timeoutMs = timeoutMs,
+      protector = protector,
+      usePrewarmedPool = false,
+    ).use { tunnel ->
+      val (tlsIn, tlsOut) =
+        GfwKnockerXrayCore.openSslEngineOverStreams(
+          sslContext = createSmartSslContext(targetHost, allowInsecureFallback = true),
+          rawIn = tunnel.inputStream,
+          rawOut = tunnel.outputStream,
+          sniHost = targetHost,
+          port = 443,
+        )
+      val req =
+        "GET " + requestPath + " HTTP/1.1\r\n" +
+          "Host: " + targetHost + "\r\n" +
+          "User-Agent: Mozilla/5.0\r\n" +
+          "Connection: close\r\n\r\n"
+      tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+      tlsOut.flush()
+      val buf = ByteArray(128)
+      val n = tlsIn.read(buf)
+      if (n <= 0) throw IOException("Empty HTTPS 443 response over tunnel")
+      val statusLine = String(buf, 0, n, Charsets.US_ASCII)
+      if (expectedStatusPrefixes.none { statusLine.startsWith(it) }) {
+        throw IOException("Unexpected HTTPS 443 status from " + targetHost + ": " + statusLine.take(32))
+      }
+    }
+  }
+
   fun measureRealProxyDelay(
     config: V2RayConfig,
     timeoutMs: Int = 2400,
@@ -669,6 +762,21 @@ object V2RayOutboundClient {
           }
         }
       latencyMs = (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+      // Second destination: the node must also reach Cloudflare over plain HTTP. Cloudflare answers plain HTTP with a 301 redirect to HTTPS, so a 2xx or 3xx response counts.
+      val remainingMs = timeoutMs - latencyMs
+      if (remainingMs <= 0L) return null
+      val secondElapsedMs =
+        measureNanoTime {
+          probePlainHttpOverTunnel(
+            resolvedConfig = resolvedConfig,
+            targetHost = "www.cloudflare.com",
+            requestPath = "/",
+            expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/1.1 3"),
+            timeoutMs = remainingMs.toInt().coerceAtLeast(1),
+            protector = protector,
+          )
+        } / 1_000_000L
+      latencyMs = (latencyMs + secondElapsedMs).coerceAtLeast(1L)
       latencyMs
     } catch (_: Exception) {
       null
@@ -726,7 +834,22 @@ object V2RayOutboundClient {
             }
           }
         }
-      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+            val firstMs = (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
+      // Second destination: the node must also reach Cloudflare over TLS.
+      val remainingMs = timeoutMs - firstMs
+      if (remainingMs <= 0L) return null
+      val secondElapsedMs =
+        measureNanoTime {
+          probeTlsHttpOverTunnel(
+            resolvedConfig = resolvedConfig,
+            targetHost = "www.cloudflare.com",
+            requestPath = "/",
+            expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/2 2"),
+            timeoutMs = remainingMs.toInt().coerceAtLeast(1),
+            protector = protector,
+          )
+        } / 1_000_000L
+      (firstMs + secondElapsedMs).coerceAtLeast(1L)
     } catch (_: Exception) {
       null
     }

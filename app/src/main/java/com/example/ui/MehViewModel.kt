@@ -6,6 +6,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.AppUpdateInfo
+import com.example.data.DeadServerStore
 import com.example.data.MehConnectionMethod
 import com.example.data.UpdateChecker
 import com.example.data.SoliSpiritRepository
@@ -207,7 +208,7 @@ class MehViewModel(
         )
       }
       if (restored.isNotEmpty()) {
-        cachedLastCandidates = restored
+        cachedLastCandidates = restored.filter { it.endpointKey !in DeadServerStore.deadKeys(context) }
         _uiState.update { current ->
           current.copy(lastConnectedConfig = restored.first())
         }
@@ -219,7 +220,12 @@ class MehViewModel(
     if (candidates.isEmpty()) return
     // Accumulate working servers across sessions (up to 20) instead of keeping only
     // the latest pool, so the next connect tries proven servers first.
-    val merged = (candidates + cachedLastCandidates).distinctBy { it.endpointKey }.take(20)
+    val deadKeys = DeadServerStore.deadKeys(context)
+    val merged =
+      (candidates + cachedLastCandidates)
+        .filter { it.endpointKey !in deadKeys }
+        .distinctBy { it.endpointKey }
+        .take(20)
     cachedLastCandidates = merged
     _uiState.update { current ->
       current.copy(lastConnectedConfig = merged.first())
@@ -309,12 +315,14 @@ class MehViewModel(
     if (_uiState.value.isActiveOrBusy) return
     val lastPrimary = _uiState.value.lastConnectedConfig ?: cachedLastCandidates.firstOrNull() ?: return
     val candidatesToUse =
-      if (cachedLastCandidates.isNotEmpty()) cachedLastCandidates else listOf(lastPrimary)
+      (if (cachedLastCandidates.isNotEmpty()) cachedLastCandidates else listOf(lastPrimary))
+        .filter { it.endpointKey !in DeadServerStore.deadKeys(context) }
 
     workflowJob?.cancel()
     workflowJob =
       viewModelScope.launch {
         try {
+          val deadKeys = DeadServerStore.deadKeys(context)
           MehTelemetry.logConnectAttempt()
 
           _uiState.update {
@@ -388,6 +396,7 @@ class MehViewModel(
     workflowJob =
       viewModelScope.launch {
         try {
+          val deadKeys = DeadServerStore.deadKeys(context)
           MehTelemetry.logConnectAttempt()
 
           // Step 1 (Priority #1): دریافت لیست سرور ها از rzashakeri/v2ray-configs
@@ -414,7 +423,8 @@ class MehViewModel(
           verifiedCandidates =
             repository.findFirstPassingFromSources(
               sources = SoliSpiritRepository.PRIMARY_RZASHAKERI_SOURCES,
-              prioritizedSavedNodes = cachedLastCandidates,
+              prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+            excludedEndpointKeys = deadKeys,
               poolSize = 5,
             ) { logLine ->
               appendLogLine(
@@ -436,7 +446,8 @@ class MehViewModel(
             verifiedCandidates =
               repository.findFirstPassingFromSources(
                 sources = SoliSpiritRepository.MHCFP_SOURCES,
-                prioritizedSavedNodes = cachedLastCandidates,
+                prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+            excludedEndpointKeys = deadKeys,
                 poolSize = 5,
               ) { logLine ->
                 appendLogLine(
@@ -464,7 +475,8 @@ class MehViewModel(
             verifiedCandidates =
               repository.findFirstPassingFromSources(
                 sources = SoliSpiritRepository.FALLBACK_SOURCES,
-                prioritizedSavedNodes = cachedLastCandidates,
+                prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+            excludedEndpointKeys = deadKeys,
                 poolSize = 5,
               ) { logLine ->
                 appendLogLine(
@@ -491,7 +503,7 @@ class MehViewModel(
 
           prepareAndStartVpn(
             context = context,
-            candidates = (verifiedCandidates + cachedLastCandidates).distinctBy { it.endpointKey },
+            candidates = (verifiedCandidates + cachedLastCandidates.filter { it.endpointKey !in DeadServerStore.deadKeys(context) }).distinctBy { it.endpointKey },
             onRequestVpnPermission = onRequestVpnPermission,
           )
         } catch (ce: CancellationException) {
@@ -621,6 +633,19 @@ class MehViewModel(
         liveLogLine = LOG_CONNECTING,
       )
     }
+  }
+
+  /**
+   * Manual "next server": asks the running service to switch to the next healthy
+   * node. Only while connected; the old node is NOT marked dead (user's choice).
+   */
+  fun switchToNextServer(context: Context) {
+    if (_uiState.value.phase != MehPhase.CONNECTED) return
+    val intent =
+      Intent(context, MehVpnService::class.java).apply {
+        action = MehVpnService.ACTION_SWITCH_SERVER
+      }
+    context.startService(intent)
   }
 
   private fun disconnectOrCancel(context: Context) {

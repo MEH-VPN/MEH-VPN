@@ -45,6 +45,8 @@ object MehDiag {
     val totalBytesUploaded: Long,
     val totalBytesDownloaded: Long,
     val lastTrafficTimestampMs: Long,
+  val totalRealBytesDownloaded: Long = 0,
+  val lastRealDownloadTimestampMs: Long = 0,
   )
 
   private val _dnsQueriesTotal = AtomicLong(0L)
@@ -89,6 +91,8 @@ object MehDiag {
   private val _totalBytesUploaded = AtomicLong(0L)
   private val _totalBytesDownloaded = AtomicLong(0L)
   private val _lastTrafficTimestampMs = AtomicLong(0L)
+  private val _lastRealDownloadTimestampMs = AtomicLong(0L)
+  private val _totalRealBytesDownloaded = AtomicLong(0L)
 
   fun recordDnsQueryStart() {
     _dnsQueriesTotal.incrementAndGet()
@@ -229,6 +233,30 @@ object MehDiag {
     }
   }
 
+  /**
+   * Real downstream payload through a TCP relay: first response bytes and relayed
+   * download bytes. DNS and UDP replies must NOT call this; they count only via
+   * [recordBytesDownloaded], so a trickle of DNS answers can never look like a
+   * working connection for the keep-alive watchdog.
+   */
+  fun recordRealDownloadBytes(bytes: Long) {
+    val safeAmount = bytes.coerceAtLeast(0L)
+    _totalBytesDownloaded.addAndGet(safeAmount)
+    if (safeAmount > 0L) {
+      _totalRealBytesDownloaded.addAndGet(safeAmount)
+      val nowMs = System.currentTimeMillis()
+      _lastRealDownloadTimestampMs.set(nowMs)
+      _lastTrafficTimestampMs.set(nowMs)
+    }
+  }
+
+  /** True when real (non-DNS) download bytes arrived within [withinMs]. */
+  fun hasRecentRealDownloadTraffic(withinMs: Long): Boolean {
+    val lastRealMs = _lastRealDownloadTimestampMs.get()
+    if (lastRealMs <= 0L) return false
+    return (System.currentTimeMillis() - lastRealMs) <= withinMs
+  }
+
   fun recordBytesDownloaded(bytes: Long) {
     if (bytes > 0L) {
       _totalBytesDownloaded.addAndGet(bytes)
@@ -279,6 +307,8 @@ object MehDiag {
       tlsPermissiveFallbackCount = _tlsPermissiveFallbackCount.get(),
       totalBytesUploaded = _totalBytesUploaded.get(),
       totalBytesDownloaded = _totalBytesDownloaded.get(),
+      totalRealBytesDownloaded = _totalRealBytesDownloaded.get(),
+      lastRealDownloadTimestampMs = _lastRealDownloadTimestampMs.get(),
       lastTrafficTimestampMs = _lastTrafficTimestampMs.get(),
     )
   }
@@ -326,6 +356,8 @@ object MehDiag {
     _tlsPermissiveFallbackCount.set(0L)
     _totalBytesUploaded.set(0L)
     _totalBytesDownloaded.set(0L)
+    _totalRealBytesDownloaded.set(0L)
+    _lastRealDownloadTimestampMs.set(0L)
     _lastTrafficTimestampMs.set(0L)
   }
 }

@@ -638,7 +638,7 @@ class LocalV2RayProxyServer(
                 throw SoftStreamFailure("V2Ray server ${candidate.address} closed stream before replying for $hostCandidate:$targetPort", stalled = false)
               }
               MehDiag.recordFirstByteReceived()
-              MehDiag.recordBytesDownloaded(replyLen.toLong())
+              MehDiag.recordRealDownloadBytes(replyLen.toLong())
               conn.setReadTimeout(IDLE_STREAM_TIMEOUT_MS)
               recordServerSuccess(idx, pool)
               return OpenedTunnelWithReply(
@@ -2072,7 +2072,7 @@ class LocalV2RayProxyServer(
         }
         clientOut.write(buf, 0, n)
         clientOut.flush()
-        MehDiag.recordBytesDownloaded(n.toLong())
+        MehDiag.recordRealDownloadBytes(n.toLong())
       }
     } catch (_: Exception) {
     } finally {

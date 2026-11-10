@@ -1108,12 +1108,13 @@ private suspend fun fetchFromSourceList(
     sources: List<SubscriptionSource>,
     prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
     poolSize: Int = 4,
+    excludedEndpointKeys: Set<String> = emptySet(),
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
       val savedFirst =
         findFastCandidatesWithFailoverPool(
-          configs = prioritizedSavedNodes,
+          configs = prioritizedSavedNodes.filter { it.endpointKey !in excludedEndpointKeys },
           poolSize = poolSize,
           waveSize = FAST_CONNECT_WAVE_SIZE,
           onLogUpdate = onLogUpdate,
@@ -1136,7 +1137,8 @@ private suspend fun fetchFromSourceList(
           }.flatten()
             .filter { V2RayOutboundClient.isSupportedByEngine(it) }
             .distinctBy { it.endpointKey }
-        if (batchConfigs.isEmpty()) continue
+        .filter { it.endpointKey !in excludedEndpointKeys }
+          if (batchConfigs.isEmpty()) continue
         onLogUpdate("${batchConfigs.size} سرور از دسته ${batchIdx + 1} دریافت شد")
         val found =
           findFastCandidatesWithFailoverPool(

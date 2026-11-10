@@ -15,6 +15,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.BuildConfig
 import com.example.MainActivity
+import com.example.data.DeadServerStore
 import com.example.data.SoliSpiritRepository
 import com.example.R
 import com.example.model.V2RayConfig
@@ -125,6 +126,10 @@ class MehVpnService : VpnService() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
+      ACTION_SWITCH_SERVER -> {
+        handleManualSwitchServer()
+        return START_STICKY
+      }
       ACTION_DISCONNECT -> {
         stopTunnel()
         return START_NOT_STICKY
@@ -311,6 +316,7 @@ class MehVpnService : VpnService() {
         )
 
       startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
+          verifyActiveNodeAfterConnect(proxyServer)
       startBackgroundNodeRefinement(proxyServer, proxyPort)
     } catch (e: Exception) {
       MehTelemetry.logError(
@@ -335,11 +341,97 @@ class MehVpnService : VpnService() {
    * Smart Keep-Alive & Automatic Node Failover Loop:
    * - Runs every 45 seconds (instead of 15s) to conserve battery and data.
    * - Skips the TLS probe completely when real download traffic has flowed in the last 30 seconds
-   *   (`MehDiag.hasRecentDownloadTraffic(30_000L)`).
+   *   (`MehDiag.hasRecentRealDownloadTraffic(30_000L)`).
    * - If 2 consecutive keep-alive probes fail on an idle connection, automatically rotates to the
    *   next healthy node in `serverPool` via `proxyServer.switchToNextHealthyNode("keep_alive_timeout")`.
    * - Sends active session heartbeat only once every ~10 minutes (13 ticks x 45s = 585s).
    */
+  /**
+   * Verifies [config] with the multi-destination capability check (Google and
+   * Cloudflare over TLS). Returns the round-trip latency, or null when the node
+   * cannot reach both destinations.
+   */
+  private fun verifyNodeCapability(config: V2RayConfig): Long? {
+    return V2RayOutboundClient.verifyHttpsAndDnsCapability(
+      config = config,
+      timeoutMs = 3500,
+      protector = { socket -> protectOutboundSocket(socket) },
+    )
+  }
+
+  /**
+   * Failover loop used by the keep-alive probe: starting from [failedCfg], switch
+   * to the next pool node, verify it, and repeat while verification fails, for up
+   * to pool-size attempts. The node we fail over away from is marked dead. Returns
+   * the verified node and its probe latency, or the current pool node and null
+   * when no pool node passed verification.
+   */
+  private fun failoverToNextVerifiedNode(
+    proxyServer: LocalV2RayProxyServer,
+    failedCfg: V2RayConfig,
+    reason: String,
+  ): Pair<V2RayConfig, Long?> {
+    var abandonedCfg = failedCfg
+    val poolSize = proxyServer.currentPool().size.coerceAtLeast(1)
+    var attempts = 0
+    while (attempts < poolSize) {
+      val nextCfg = proxyServer.switchToNextHealthyNode(reason)
+      attempts++
+      if (nextCfg.endpointKey == abandonedCfg.endpointKey) break
+      DeadServerStore.markDead(applicationContext, abandonedCfg.endpointKey)
+      val ping = verifyNodeCapability(nextCfg)
+      if (ping != null) {
+        return nextCfg to ping
+      }
+      abandonedCfg = nextCfg
+    }
+    return proxyServer.activeConfig to null
+  }
+
+  /**
+   * Manual "next server" (ACTION_SWITCH_SERVER): switch to the next healthy pool
+   * node and verify it. The old node is NOT marked dead: this is the user's
+   * choice, not a failure.
+   */
+  private fun handleManualSwitchServer() {
+    val proxyServer = localProxyServer ?: return
+    val switchedCfg = proxyServer.switchToNextHealthyNode("manual")
+    serviceScope.launch {
+      val ping = verifyNodeCapability(switchedCfg)
+      if (ping == null) {
+        android.util.Log.w(
+          "MehVpnService",
+          "Manual server switch: new node failed verification; leaving it in place",
+        )
+      }
+    }
+  }
+
+  /**
+   * Post-connect verification (once per tunnel start, async in serviceScope):
+   * verify the active node with the multi-destination check. On failure, mark it
+   * dead, switch to the next node and verify again, up to 3 attempts total. If
+   * all fail, LEAVE the current node in place: a shaky verification must never
+   * kill a working tunnel.
+   */
+  private fun verifyActiveNodeAfterConnect(proxyServer: LocalV2RayProxyServer) {
+    serviceScope.launch {
+      var attempts = 0
+      while (attempts < 3) {
+        val activeCfg = proxyServer.activeConfig
+        if (verifyNodeCapability(activeCfg) != null) return@launch
+        attempts++
+        if (attempts >= 3) break
+        DeadServerStore.markDead(applicationContext, activeCfg.endpointKey)
+        proxyServer.switchToNextHealthyNode("post_connect_verification")
+      }
+      android.util.Log.w(
+        "MehVpnService",
+        "Post-connect verification failed for 3 nodes; leaving current node in place",
+      )
+    }
+  }
+
   private fun startProtectedKeepAliveProbe(
     proxyServer: LocalV2RayProxyServer,
     serverName: String,
@@ -353,6 +445,8 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         var tickCount = 0
         var consecutiveFailures = 0
+      var lastTickDiag = MehDiag.snapshot()
+      var consecutiveStarvingTicks = 0
 
         // Counters are only useful if somebody can read them: `adb logcat -s MehDiag`.
         // Run logcat writer only in DEBUG builds to save battery and reduce CPU wakeups.
@@ -369,36 +463,68 @@ class MehVpnService : VpnService() {
           delay(KEEP_ALIVE_INTERVAL_MS)
           tickCount++
           var activeCfg = proxyServer.activeConfig
+        // Starving detection: the user/app tried to use the tunnel (DNS queries or
+        // TCP connect attempts grew since the last tick) but no real download bytes
+        // arrived. An idle phone with no attempts must never trigger failover.
+        val tickDiag = MehDiag.snapshot()
+        val attemptsGrew =
+          tickDiag.dnsQueriesTotal > lastTickDiag.dnsQueriesTotal ||
+            tickDiag.tcpConnectAttempts > lastTickDiag.tcpConnectAttempts
+        if (attemptsGrew && tickDiag.totalRealBytesDownloaded <= lastTickDiag.totalRealBytesDownloaded) {
+          consecutiveStarvingTicks++
+        } else {
+          consecutiveStarvingTicks = 0
+        }
+        lastTickDiag = tickDiag
 
-          if (MehDiag.hasRecentDownloadTraffic(ACTIVE_TRAFFIC_SKIP_WINDOW_MS)) {
+          if (MehDiag.hasRecentRealDownloadTraffic(ACTIVE_TRAFFIC_SKIP_WINDOW_MS)) {
             MehDiag.recordKeepAliveSkippedActiveTraffic()
+          consecutiveStarvingTicks = 0
             consecutiveFailures = 0
           } else {
             MehDiag.recordKeepAliveProbeRun()
+          // Two consecutive starving ticks count exactly like two failed probes:
+          // force this probe to fail so the failover below runs right away.
+          val starvingFailover = consecutiveStarvingTicks >= 2
+          if (starvingFailover) {
+            consecutiveStarvingTicks = 0
+            consecutiveFailures = CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER
+          }
             val probedPing =
               V2RayOutboundClient.verifyHttpsAndDnsCapability(
                 config = activeCfg,
                 timeoutMs = 3500,
                 protector = { socket -> protectOutboundSocket(socket) },
               )
-            if (probedPing != null) {
-              lastPing = probedPing
+            val effectivePing = if (starvingFailover) null else probedPing
+          if (effectivePing != null) {
+              lastPing = effectivePing
               consecutiveFailures = 0
             } else {
               consecutiveFailures++
               if (consecutiveFailures >= CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER) {
-                val switchedCfg = proxyServer.switchToNextHealthyNode("keep_alive_timeout")
+                val (switchedCfg, switchedPing) = failoverToNextVerifiedNode(proxyServer, activeCfg, "keep_alive_timeout")
                 if (switchedCfg.endpointKey != activeCfg.endpointKey) {
                   activeCfg = switchedCfg
                   consecutiveFailures = 0
-                  val verifySwitched =
-                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                  val verifySwitched = switchedPing ?: V2RayOutboundClient.verifyHttpsAndDnsCapability(
                       config = activeCfg,
                       timeoutMs = 3500,
                       protector = { socket -> protectOutboundSocket(socket) },
                     )
                   if (verifySwitched != null) {
                     lastPing = verifySwitched
+                } else {
+                  // Switched, but no pool node passed verification: trigger emergency refinement.
+                  launch {
+                    try {
+                      refineNodesOnce(proxyServer, proxyPort, force = true)
+                    } catch (_: Exception) {}
+                  }
+                  MehTelemetry.logError(
+                    stage = "keep_alive_probe",
+                    errorMessage = "No pool node passed verification after failover",
+                  )
                   }
                 } else {
                   // No alternative healthy node in pool: immediately trigger emergency background refinement
@@ -713,6 +839,7 @@ class MehVpnService : VpnService() {
   companion object {
     const val ACTION_CONNECT = "com.example.vpn.ACTION_CONNECT"
     const val ACTION_DISCONNECT = "com.example.vpn.ACTION_DISCONNECT"
+    const val ACTION_SWITCH_SERVER = "com.example.vpn.ACTION_SWITCH_SERVER"
 
     const val EXTRA_RAW_URI = "extra_raw_uri"
     const val EXTRA_RESOLVED_IP = "extra_resolved_ip"
