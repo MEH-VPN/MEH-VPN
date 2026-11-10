@@ -400,7 +400,7 @@ class MehVpnService : VpnService() {
       val ping = verifyNodeCapability(switchedCfg)
       if (ping == null) {
         android.util.Log.w(
-          TAG,
+          "MehVpnService",
           "Manual server switch: new node failed verification; leaving it in place",
         )
       }
@@ -426,7 +426,7 @@ class MehVpnService : VpnService() {
         proxyServer.switchToNextHealthyNode("post_connect_verification")
       }
       android.util.Log.w(
-        TAG,
+        "MehVpnService",
         "Post-connect verification failed for 3 nodes; leaving current node in place",
       )
     }
@@ -508,7 +508,6 @@ class MehVpnService : VpnService() {
                   activeCfg = switchedCfg
                   consecutiveFailures = 0
                   val verifySwitched = switchedPing ?: V2RayOutboundClient.verifyHttpsAndDnsCapability(
-                    V2RayOutboundClient.verifyHttpsAndDnsCapability(
                       config = activeCfg,
                       timeoutMs = 3500,
                       protector = { socket -> protectOutboundSocket(socket) },
