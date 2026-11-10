@@ -392,7 +392,8 @@ object V2RayConfigParser {
     val fragment = withoutScheme.substringAfter("#", "")
     val beforeFragment = withoutScheme.substringBefore("#")
     val queryPart = beforeFragment.substringAfter("?", "")
-    val mainPart = beforeFragment.substringBefore("?")
+    // SIP002 puts a "/" before the query ("host:port/?plugin=..."); drop it so host:port parses.
+    val mainPart = beforeFragment.substringBefore("?").trimEnd('/')
 
     val (userInfo, hostPort) =
       if (mainPart.contains("@")) {
@@ -419,6 +420,10 @@ object V2RayConfigParser {
     val (host, port) = parseHostAndPort(hostPort) ?: return null
     val qParams = parseQueryParams(queryPart)
     val plugin = qParams["plugin"].orEmpty()
+    // Only the simple-obfs "http" mode is implemented. Any other plugin (obfs=tls, v2ray-plugin
+    // with tls/ws/quic, shadow-tls, ...) wraps the stream in a transport we do not speak; parsing
+    // it as plain Shadowsocks yields a node that connects but never carries traffic.
+    if (plugin.isNotBlank() && !isSupportedShadowsocksPlugin(plugin)) return null
     val headerType = if (plugin.contains("obfs=http", ignoreCase = true)) "http" else "none"
     val obfsHost =
       Regex("obfs-host=([^;&]+)", RegexOption.IGNORE_CASE)
@@ -442,6 +447,17 @@ object V2RayConfigParser {
       headerType = headerType,
       rawUri = uriString,
     )
+  }
+
+  private fun isSupportedShadowsocksPlugin(plugin: String): Boolean {
+    val parts = plugin.split(";").map { it.trim() }.filter { it.isNotEmpty() }
+    val name = parts.firstOrNull()?.lowercase().orEmpty()
+    val nameless = parts.firstOrNull()?.startsWith("obfs=", ignoreCase = true) == true
+    if (name != "obfs-local" && name != "simple-obfs" && !nameless) return false
+    val mode =
+      parts.firstOrNull { it.startsWith("obfs=", ignoreCase = true) }
+        ?.substringAfter("=")?.trim()?.lowercase()
+    return mode == "http"
   }
 
   private fun parseHysteria2(uriString: String): V2RayConfig? {
