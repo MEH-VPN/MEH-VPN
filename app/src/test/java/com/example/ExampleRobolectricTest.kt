@@ -254,6 +254,27 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("node3.example.org", server.replaceServerPool(emptyList()).address)
     server.stop()
   }
+  @Test
+  fun appendToServerPool_keepsActiveNodeAndDeduplicates() {
+    fun cfg(n: Int) =
+    com.example.model.V2RayConfigParser.parseSingleUri(
+      "vless://11111111-2222-3333-4444-555555555555@node$n.example.org:443?encryption=none&security=tls&sni=node$n.example.org&type=ws&path=%2Fws#Node$n",
+      )!!
+    val server = com.example.vpn.LocalV2RayProxyServer(listOf(cfg(1), cfg(2)), protector = { true })
+    org.junit.Assert.assertEquals("node1.example.org", server.activeConfig.address)
+    val size = server.appendToServerPool(listOf(cfg(3), cfg(4), cfg(2), cfg(3)))
+    org.junit.Assert.assertEquals(4, size)
+    org.junit.Assert.assertEquals("node1.example.org", server.activeConfig.address)
+    // duplicates removed, new nodes appended after the current pool
+    org.junit.Assert.assertEquals(
+      listOf("node1.example.org", "node2.example.org", "node3.example.org", "node4.example.org"),
+      server.currentPool().map { it.address },
+      )
+    // an empty append changes nothing
+    org.junit.Assert.assertEquals(4, server.appendToServerPool(emptyList()))
+    org.junit.Assert.assertEquals("node1.example.org", server.activeConfig.address)
+    server.stop()
+  }
 
   @Test
   fun allNewProtocolsAndTransports_parseAndAreSupportedByEngine() {
