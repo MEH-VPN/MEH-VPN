@@ -403,8 +403,8 @@ object V2RayOutboundClient {
     }
     when (config.protocol) {
       V2RayProtocol.SHADOWSOCKS -> {
-        val cipher = config.cipher.ifBlank { config.authId.substringBefore(":") }
-        return VmessAndShadowsocksEngine.isSupportedShadowsocksCipher(cipher)
+        // Temporarily excluded (test). Delete this return to re-enable SS.
+        return false
       }
       V2RayProtocol.WIREGUARD -> {
         return config.authId.isNotBlank() && config.publicKey.isNotBlank()
