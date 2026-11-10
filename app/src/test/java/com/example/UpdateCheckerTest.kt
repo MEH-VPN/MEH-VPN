@@ -69,13 +69,21 @@ class UpdateCheckerTest {
     assertTrue(newerMajor > base)
     assertEquals(0, base.compareTo(same))
     assertTrue(older < base)
+    assertFalse(base > newerPatch)
   }
 
   @Test
-  fun isNewerVersionAvailable_returnsFalseForSameVersion() {
-    val current = SemanticVersion.parse("1.3.18")!!
-    val latest = SemanticVersion.parse("v1.3.18")!!
-    assertFalse(current < latest)
+  fun appUpdateInfo_defaultsAreValid() {
+    val info =
+      AppUpdateInfo(
+        latestVersionName = "1.3.14",
+      )
+    assertEquals("1.3.14", info.latestVersionName)
+    assertEquals(
+      "https://github.com/MEH-VPN/MEH-VPN/releases/latest/download/MEH-VPN-latest.apk",
+      info.downloadUrl,
+    )
+    assertEquals("https://t.me/MEH_VPN_channel", info.telegramUrl)
   }
 
   /**
@@ -113,18 +121,15 @@ class UpdateCheckerTest {
   @Test
   fun check_detectsUpdateWhenRunning1_3_17_andRemoteIs1_3_18() = runTest {
     val checker = UpdateChecker(httpClient = fakeClientForRemote1_3_18())
-    val update = checker.check("1.3.17", 10317)
-    assertNotNull(update)
-    assertEquals("1.3.18", update?.versionName)
-    assertEquals(10318, update?.versionCode)
-    assertEquals("https://github.com/MEH-VPN/MEH-VPN/releases/latest/download/MEH-VPN-latest.apk", update?.downloadUrl)
-    assertEquals("https://t.me/MEH_VPN_channel", update?.telegramUrl)
+    val update = checker.check(currentVersionRaw = "1.3.17")
+    assertNotNull("Expected update to be found for 1.3.17", update)
+    assertEquals("1.3.18", update?.latestVersionName)
   }
 
   @Test
   fun check_returnsNullWhenRunningLatestVersion() = runTest {
     val checker = UpdateChecker(httpClient = fakeClientForRemote1_3_18())
-    val update = checker.check("1.3.18", 10318)
-    assertNull(update)
+    val update = checker.check(currentVersionRaw = "1.3.18")
+    assertNull("Expected null when already running latest version 1.3.18", update)
   }
 }
