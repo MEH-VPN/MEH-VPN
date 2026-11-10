@@ -23,8 +23,12 @@ import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
 import engine.Engine
 import engine.Key
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
 import java.net.DatagramSocket
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -316,7 +320,7 @@ class MehVpnService : VpnService() {
         )
 
       startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
-          verifyActiveNodeAfterConnect(proxyServer)
+          verifyActiveNodeAfterConnect(proxyServer, proxyPort)
       startBackgroundNodeRefinement(proxyServer, proxyPort)
     } catch (e: Exception) {
       MehTelemetry.logError(
@@ -358,10 +362,41 @@ class MehVpnService : VpnService() {
       protector = { socket -> protectOutboundSocket(socket) },
     )
   }
+  // Real-path check: fetch http://www.google.com/generate_204 by hostname
+  // through the local SOCKS5 proxy on [proxyPort] (the tun2socks proxy).
+  // Hostname is passed unresolved, so the proxy must resolve it through the tunnel;
+  private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
+    if (proxyPort <= 0) return null
+    val startedNs = System.nanoTime()
+    var socket: Socket? = null
+    return try {
+      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+      socket = Socket(proxy)
+      socket.soTimeout = timeoutMs
+      socket.connect(InetSocketAddress.createUnresolved("www.google.com", 80), timeoutMs)
+      val request = "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
+      socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
+      socket.getOutputStream().flush()
+      val statusLine = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII)).readLine()
+      val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
+      if (code == 204) (System.nanoTime() - startedNs) / 1_000_000L else null
+    } catch (_: Exception) {
+      null
+    } finally {
+      try { socket?.close() } catch (_: Exception) {}
+    }
+  }
+
+  // Full node check: the node must pass the direct check AND the real-path check.
+  // The direct check alone cannot catch a node whose DNS path is broken.
+  private fun verifyNodeFully(config: V2RayConfig, proxyPort: Int): Long? {
+    verifyNodeCapability(config) ?: return null
+    return verifyRealPathViaProxy(proxyPort)
+  }
 
   /**
    * Failover loop used by the keep-alive probe: starting from [failedCfg], switch
-   * to the next pool node, verify it, and repeat while verification fails, for up
+   * to the next pool node, verify it with the full check, and repeat while verification fails, for up
    * to pool-size attempts. The node we fail over away from is marked dead. Returns
    * the verified node and its probe latency, or the current pool node and null
    * when no pool node passed verification.
@@ -370,6 +405,7 @@ class MehVpnService : VpnService() {
     proxyServer: LocalV2RayProxyServer,
     failedCfg: V2RayConfig,
     reason: String,
+    proxyPort: Int,
   ): Pair<V2RayConfig, Long?> {
     var abandonedCfg = failedCfg
     val poolSize = proxyServer.currentPool().size.coerceAtLeast(1)
@@ -379,7 +415,7 @@ class MehVpnService : VpnService() {
       attempts++
       if (nextCfg.endpointKey == abandonedCfg.endpointKey) break
       DeadServerStore.markDead(applicationContext, abandonedCfg.endpointKey)
-      val ping = verifyNodeCapability(nextCfg)
+      val ping = verifyNodeFully(nextCfg, proxyPort)
       if (ping != null) {
         return nextCfg to ping
       }
@@ -390,8 +426,8 @@ class MehVpnService : VpnService() {
 
   /**
    * Manual "next server" (ACTION_SWITCH_SERVER): switch to the next healthy pool
-   * node and verify it. The old node is NOT marked dead: this is the user's
-   * choice, not a failure.
+   * node and verify it through the real path; failing nodes are marked dead and retried.
+   * The old node is NOT marked dead: this is the user's choice, not a failure.
    * The switch is always visible: the session and the notification are updated
    * with the new node right away, and a 1-node pool triggers a fresh search.
    */
@@ -422,15 +458,26 @@ class MehVpnService : VpnService() {
     }
     updateSessionAndNotification(switchedCfg, switchedCfg.latencyMs)
     serviceScope.launch {
-      val ping = verifyNodeCapability(switchedCfg)
-      if (ping == null) {
-        android.util.Log.w(
-          "MehVpnService",
-          "Manual server switch: new node failed verification; leaving it in place",
-        )
-      } else {
-        updateSessionAndNotification(switchedCfg, ping)
+    var candidate = switchedCfg
+    var attempts = 0
+    while (attempts < 3) {
+      val realPing = verifyRealPathViaProxy(_tunnelSession.value.localProxyPort)
+      if (realPing != null) {
+        updateSessionAndNotification(candidate, realPing)
+        return@launch
       }
+      attempts++
+      if (attempts >= 3) break
+      DeadServerStore.markDead(applicationContext, candidate.endpointKey)
+      val nextCfg = proxyServer.switchToNextHealthyNode("manual_verification")
+      if (nextCfg.endpointKey == candidate.endpointKey) break
+      candidate = nextCfg
+      updateSessionAndNotification(candidate, candidate.latencyMs)
+    }
+    android.util.Log.w(
+      "MehVpnService",
+      "Manual server switch: no switched node passed real-path verification; leaving current node in place",
+  )
     }
   }
 
@@ -461,17 +508,17 @@ class MehVpnService : VpnService() {
   
     /**
    * Post-connect verification (once per tunnel start, async in serviceScope):
-   * verify the active node with the multi-destination check. On failure, mark it
+   * verify the active node with the full check (multi-destination + real-path). On failure, mark it
    * dead, switch to the next node and verify again, up to 3 attempts total. If
    * all fail, LEAVE the current node in place: a shaky verification must never
    * kill a working tunnel.
    */
-  private fun verifyActiveNodeAfterConnect(proxyServer: LocalV2RayProxyServer) {
+  private fun verifyActiveNodeAfterConnect(proxyServer: LocalV2RayProxyServer, proxyPort: Int) {
     serviceScope.launch {
       var attempts = 0
       while (attempts < 3) {
         val activeCfg = proxyServer.activeConfig
-        if (verifyNodeCapability(activeCfg) != null) return@launch
+        if (verifyNodeFully(activeCfg, proxyPort) != null) return@launch
         attempts++
         if (attempts >= 3) break
         DeadServerStore.markDead(applicationContext, activeCfg.endpointKey)
@@ -549,21 +596,19 @@ class MehVpnService : VpnService() {
                 protector = { socket -> protectOutboundSocket(socket) },
               )
             val effectivePing = if (starvingFailover) null else probedPing
-          if (effectivePing != null) {
-              lastPing = effectivePing
+            // The direct probe never tests DNS through the tunnel.
+            val confirmedPing = effectivePing ?: verifyRealPathViaProxy(proxyPort)
+          if (confirmedPing != null) {
+              lastPing = confirmedPing
               consecutiveFailures = 0
             } else {
               consecutiveFailures++
               if (consecutiveFailures >= CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER) {
-                val (switchedCfg, switchedPing) = failoverToNextVerifiedNode(proxyServer, activeCfg, "keep_alive_timeout")
+                val (switchedCfg, switchedPing) = failoverToNextVerifiedNode(proxyServer, activeCfg, "keep_alive_timeout", proxyPort)
                 if (switchedCfg.endpointKey != activeCfg.endpointKey) {
                   activeCfg = switchedCfg
                   consecutiveFailures = 0
-                  val verifySwitched = switchedPing ?: V2RayOutboundClient.verifyHttpsAndDnsCapability(
-                      config = activeCfg,
-                      timeoutMs = 3500,
-                      protector = { socket -> protectOutboundSocket(socket) },
-                    )
+                  val verifySwitched = switchedPing ?: verifyNodeFully(activeCfg, proxyPort)
                   if (verifySwitched != null) {
                     lastPing = verifySwitched
                 } else {

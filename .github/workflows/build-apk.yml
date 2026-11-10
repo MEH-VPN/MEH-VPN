@@ -86,7 +86,8 @@ jobs:
       - name: Package named release artifacts
         run: |
           mkdir -p dist
-          VERSION="${{ github.ref_name }}"
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then VERSION="${{ github.ref_name }}"; fi
           [ -z "$VERSION" ] && VERSION="v1.0.0"
           SAFE_VERSION=$(echo "$VERSION" | tr '/' '-')
           SRC_APK=$(ls app/build/outputs/apk/debug/*.apk | head -n 1)
