@@ -392,10 +392,35 @@ class MehVpnService : VpnService() {
    * Manual "next server" (ACTION_SWITCH_SERVER): switch to the next healthy pool
    * node and verify it. The old node is NOT marked dead: this is the user's
    * choice, not a failure.
+   * The switch is always visible: the session and the notification are updated
+   * with the new node right away, and a 1-node pool triggers a fresh search.
    */
   private fun handleManualSwitchServer() {
     val proxyServer = localProxyServer ?: return
+    val beforeCfg = proxyServer.activeConfig
     val switchedCfg = proxyServer.switchToNextHealthyNode("manual")
+    if (switchedCfg.endpointKey == beforeCfg.endpointKey) {
+      // Single-node pool: the button must not silently do nothing.
+      serviceScope.launch {
+        val found =
+          try {
+            refineNodesOnce(proxyServer, _tunnelSession.value.localProxyPort, force = true)
+          } catch (_: Exception) {
+            false
+          }
+        if (!found) {
+          android.util.Log.w(
+            "MehVpnService",
+            "Manual server switch: no fresh node found; keeping ${beforeCfg.address}",
+          )
+        } else {
+          val freshCfg = proxyServer.activeConfig
+          updateSessionAndNotification(freshCfg, freshCfg.latencyMs)
+        }
+      }
+      return
+    }
+    updateSessionAndNotification(switchedCfg, switchedCfg.latencyMs)
     serviceScope.launch {
       val ping = verifyNodeCapability(switchedCfg)
       if (ping == null) {
@@ -403,11 +428,38 @@ class MehVpnService : VpnService() {
           "MehVpnService",
           "Manual server switch: new node failed verification; leaving it in place",
         )
+      } else {
+        updateSessionAndNotification(switchedCfg, ping)
       }
     }
   }
 
+  
   /**
+   * Show the active node in the UI and the foreground notification right away:
+   * the session drives the app UI and the notification is what the user sees
+   * while the app is in the background. [pingMs] is in milliseconds.
+   */
+  private fun updateSessionAndNotification(config: V2RayConfig, pingMs: Long) {
+    val name = config.cleanTitle.ifBlank { config.address }
+    _tunnelSession.value =
+      _tunnelSession.value.copy(
+        isRunning = true,
+        serverName = name,
+        serverAddress = config.address,
+        serverPort = config.port,
+        protocolLabel = config.protocol.label,
+        currentPingMs = pingMs,
+        errorMessage = null,
+      )
+    try {
+      val nm = getSystemService(NotificationManager::class.java)
+      nm?.notify(NOTIFICATION_ID, buildForegroundNotification(name, pingMs))
+    } catch (_: Exception) {}
+  }
+  
+  
+    /**
    * Post-connect verification (once per tunnel start, async in serviceScope):
    * verify the active node with the multi-destination check. On failure, mark it
    * dead, switch to the next node and verify again, up to 3 attempts total. If

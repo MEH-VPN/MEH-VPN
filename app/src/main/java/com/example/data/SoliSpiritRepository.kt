@@ -994,7 +994,7 @@ private suspend fun fetchFromSourceList(
   /**
    * Fast first connect with immediate failover pool:
    * Finds the first node that passes the stage-1 204 probe AND a quick HTTPS/TLS check
-   * to serve as primary, plus includes up to [poolSize - 1] additional stage-1 passing nodes
+   * to serve as primary, plus up to [poolSize - 1] further stage-2 verified nodes
    * as backup candidates in the local proxy failover pool so the connection can instantly
    * survive packet loss or node drops before background refinement kicks in.
    */
@@ -1047,10 +1047,10 @@ private suspend fun fetchFromSourceList(
           continue
         }
                 // Fastest passers of this wave: quick TLS checks in parallel (not one by one),
-        // then connect to the fastest verified one right away.
-        val verifiedCandidate =
+        // the pool holds only stage-2 verified nodes, fastest first.
+        val verifiedCandidates =
           coroutineScope {
-            stage1Passed.take(3)
+            stage1Passed.take(poolSize)
               .map { candidate ->
                 async {
                   val httpsLatency =
@@ -1063,15 +1063,10 @@ private suspend fun fetchFromSourceList(
               }
               .awaitAll()
               .filterNotNull()
-              .firstOrNull()
           }
-        if (verifiedCandidate != null) {
-          onLogUpdate("بهترین سرور انتخاب شد (پینگ ${verifiedCandidate.latencyMs}ms)")
-          val backups =
-            stage1Passed
-              .filter { it.endpointKey != verifiedCandidate.endpointKey }
-              .take(poolSize - 1)
-          return@withContext listOf(verifiedCandidate) + backups
+        if (verifiedCandidates.isNotEmpty()) {
+          onLogUpdate("بهترین سرور انتخاب شد (پینگ ${verifiedCandidates.first().latencyMs}ms)")
+          return@withContext verifiedCandidates
         }
         onLogUpdate("موج ${waveIdx + 1}: عبور از تست اولیه ولی تایید TLS نشد")
       }
@@ -1101,8 +1096,8 @@ private suspend fun fetchFromSourceList(
   /**
    * Pipelined fast connect: fetches sources in batches of 4 and probes each batch the
    * moment it arrives, instead of downloading the whole tier first. Saved healthy nodes
-   * are tested before any download. Returns the first passing node plus up to
-   * [poolSize - 1] backups from the same wave, or empty when no batch yields a server.
+   * are tested before any download and stay first in the pool; the search keeps going
+   * until the pool holds [poolSize] verified nodes, or no batch yields a server.
    */
   suspend fun findFirstPassingFromSources(
     sources: List<SubscriptionSource>,
@@ -1112,19 +1107,21 @@ private suspend fun fetchFromSourceList(
     onLogUpdate: (String) -> Unit,
   ): List<V2RayConfig> =
     withContext(ioDispatcher) {
-      val savedFirst =
+        // Fill the pool: saved nodes stay first, but keep searching the tiers until it is full.
+      val pool =
         findFastCandidatesWithFailoverPool(
           configs = prioritizedSavedNodes.filter { it.endpointKey !in excludedEndpointKeys },
           poolSize = poolSize,
           waveSize = FAST_CONNECT_WAVE_SIZE,
           onLogUpdate = onLogUpdate,
-        )
-      if (savedFirst.isNotEmpty()) return@withContext savedFirst
+        ).toMutableList()
+      val seenKeys = pool.map { it.endpointKey }.toMutableSet()
 
             // No per-tier test budget on the connect path: the search keeps going through
       // every batch until a server passes (or the sources run out). Stopping early
       // is what used to turn the circle red while untested servers remained.
       for ((batchIdx, batch) in sources.chunked(4).withIndex()) {
+        if (pool.size >= poolSize) break
         coroutineContext.ensureActive()
         onLogUpdate("دریافت دسته ${batchIdx + 1} از ساب‌ها ...")
         val batchConfigs =
@@ -1147,9 +1144,12 @@ private suspend fun fetchFromSourceList(
             waveSize = FAST_CONNECT_WAVE_SIZE,
             onLogUpdate = onLogUpdate,
           )
-        if (found.isNotEmpty()) return@withContext found
+        for (candidate in found) {
+          if (pool.size >= poolSize) break
+          if (seenKeys.add(candidate.endpointKey)) pool.add(candidate)
+        }
       }
-      emptyList()
+      pool
     }
 
 fun measureNodeSpeed(
