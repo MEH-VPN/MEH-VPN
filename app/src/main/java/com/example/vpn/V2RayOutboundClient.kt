@@ -616,11 +616,11 @@ object V2RayOutboundClient {
 
   /**
    * Stage 1 Fast Probe: Opens V2Ray tunnels to connectivitycheck.gstatic.com:80 and www.cloudflare.com:80;
-   * and verifies HTTP/1.1 204 from Google and HTTP/1.1 2xx from Cloudflare.
+   * and verifies HTTP/1.1 204 from Google and HTTP/1.1 2xx (or a 3xx redirect to HTTPS) from Cloudflare.
    */
   /**
    * Plain-HTTP probe through [resolvedConfig]: GET [requestPath] on [targetHost]:80 and
-   * require the response status line to start with [expectedStatusPrefix] (for
+   * require the response status line to start with one of [expectedStatusPrefixes] (for
    * example "HTTP/1.1 204"). Throws on any mismatch so the caller can treat the
    * whole multi-destination probe as failed.
    */
@@ -628,7 +628,7 @@ object V2RayOutboundClient {
     resolvedConfig: V2RayConfig,
     targetHost: String,
     requestPath: String,
-    expectedStatusPrefix: String,
+    expectedStatusPrefixes: List<String>,
     timeoutMs: Int,
     protector: ((Socket) -> Boolean)?,
   ) {
@@ -659,7 +659,7 @@ object V2RayOutboundClient {
         }
       }
       val responseText = responseBuf.toString("US-ASCII")
-      if (!responseText.startsWith(expectedStatusPrefix)) {
+      if (expectedStatusPrefixes.none { responseText.startsWith(it) }) {
         throw IOException("Invalid " + targetHost + " probe response: " + responseText.take(48))
       }
     }
@@ -762,7 +762,7 @@ object V2RayOutboundClient {
           }
         }
       latencyMs = (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
-      // Second destination: the node must also reach Cloudflare over plain HTTP.
+      // Second destination: the node must also reach Cloudflare over plain HTTP. Cloudflare answers plain HTTP with a 301 redirect to HTTPS, so a 2xx or 3xx response counts.
       val remainingMs = timeoutMs - latencyMs
       if (remainingMs <= 0L) return null
       val secondElapsedMs =
@@ -771,7 +771,7 @@ object V2RayOutboundClient {
             resolvedConfig = resolvedConfig,
             targetHost = "www.cloudflare.com",
             requestPath = "/",
-            expectedStatusPrefix = "HTTP/1.1 2",
+            expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/1.1 3"),
             timeoutMs = remainingMs.toInt().coerceAtLeast(1),
             protector = protector,
           )
