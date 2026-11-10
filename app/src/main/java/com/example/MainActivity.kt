@@ -167,7 +167,8 @@ class MainActivity : ComponentActivity() {
               },
             )
           },
-          onConnectLastServer = {
+          onNextServer = { mehViewModel.switchToNextServer(context) },
+      onConnectLastServer = {
             mehViewModel.onConnectWithLastServerClicked(
               context = context,
               onRequestVpnPermission = { prepareIntent ->
@@ -186,6 +187,7 @@ fun MehMinimalScreen(
   uiState: MehUiState,
   onPowerToggle: () -> Unit,
   onConnectLastServer: () -> Unit = {},
+  onNextServer: () -> Unit = {},
   onUpdateClick: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
@@ -269,7 +271,18 @@ fun MehMinimalScreen(
           onClick = onPowerToggle,
         )
 
-        // 2, 3 & 4. Fixed bottom region for Main Stage Status, Line-by-Line Sub-Logs, and optional Last Server button
+        AnimatedVisibility(
+      visible = uiState.phase == MehPhase.CONNECTED,
+      enter = fadeIn(tween(220)) + expandVertically(tween(220)),
+      exit = fadeOut(tween(160)) + shrinkVertically(tween(180)),
+    ) {
+      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(modifier = Modifier.height(12.dp))
+        NextServerPill(onClick = onNextServer)
+      }
+    }
+
+    // 2, 3 & 4. Fixed bottom region for Main Stage Status, Line-by-Line Sub-Logs, and optional Last Server button
         Box(
           modifier =
             Modifier.weight(1f)
@@ -321,6 +334,59 @@ fun MehMinimalScreen(
           }
         }
       }
+    }
+  }
+}
+
+@Composable
+@Composable
+private fun NextServerPill(
+  onClick: () -> Unit,
+) {
+  val haptic = LocalHapticFeedback.current
+  val buttonLabel = stringResource(R.string.next_server)
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Row(
+      modifier =
+        Modifier.defaultMinSize(minHeight = 48.dp)
+          .clip(RoundedCornerShape(24.dp))
+          .background(ObsidianSurface.copy(alpha = 0.85f))
+          .border(
+            width = 1.dp,
+            color = TextMuted.copy(alpha = 0.32f),
+            shape = RoundedCornerShape(24.dp),
+          )
+          .semantics {
+            role = Role.Button
+            contentDescription = buttonLabel
+          }
+          .clickable(
+            onClick = {
+              haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+              onClick()
+            }
+          )
+          .padding(horizontal = 18.dp, vertical = 10.dp)
+          .testTag("next_server_button"),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.Center,
+    ) {
+      Icon(
+        painter = painterResource(R.drawable.ic_history_rounded),
+        contentDescription = null,
+        tint = NeonEmeraldGlow.copy(alpha = 0.85f),
+        modifier = Modifier.size(18.dp),
+      )
+      Spacer(modifier = Modifier.width(8.dp))
+      Text(
+        text = buttonLabel,
+        style = MaterialTheme.typography.bodyMedium,
+        fontFamily = VazirmatnFontFamily,
+        fontWeight = FontWeight.Medium,
+        color = TextSecondary,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+      )
     }
   }
 }
