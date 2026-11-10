@@ -63,6 +63,7 @@ class MehVpnService : VpnService() {
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
   private var refineJob: Job? = null
+  private var topUpPoolJob: Job? = null
 
   private val nodeRepository by lazy { SoliSpiritRepository() }
   @Volatile private var cachedSubscriptionConfigs: List<V2RayConfig> = emptyList()
@@ -322,6 +323,7 @@ class MehVpnService : VpnService() {
       startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
           verifyActiveNodeAfterConnect(proxyServer, proxyPort)
       startBackgroundNodeRefinement(proxyServer, proxyPort)
+      startPoolTopUpAfterConnect(proxyServer)
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
@@ -706,6 +708,48 @@ class MehVpnService : VpnService() {
       }
   }
 
+  // Background pool top-up: the connect path stops at the first tier that yields a node, so a
+  // thin tier-1 list leaves a 1-node pool and a dead "next server" button. Once the tunnel is
+  // up, this fills the live pool from the remaining tiers (tier 2 mhcfp, then tier 3 fallback)
+  // with stage-2-verified nodes, appended (never switching the active node) until the pool
+  // reaches POOL_TOP_UP_TARGET_SIZE. Runs once per tunnel start.
+  private fun startPoolTopUpAfterConnect(proxyServer: LocalV2RayProxyServer) {
+    topUpPoolJob?.cancel()
+    topUpPoolJob =
+    serviceScope.launch {
+      delay(POOL_TOP_UP_DELAY_MS)
+      val currentPool = proxyServer.currentPool()
+      val needed = POOL_TOP_UP_TARGET_SIZE - currentPool.size
+      if (needed <= 0) return@launch
+      val deadKeys = DeadServerStore.deadKeys(applicationContext)
+      val excluded = currentPool.map { it.endpointKey }.toSet() + deadKeys
+      val found =
+      try {
+        nodeRepository.findFirstPassingFromSources(
+          sources = SoliSpiritRepository.MHCFP_SOURCES + SoliSpiritRepository.FALLBACK_SOURCES,
+          poolSize = needed,
+          excludedEndpointKeys = excluded,
+          ) { _ ->}
+      } catch (ce: CancellationException) {
+        throw ce
+      } catch (_: Exception) {
+        emptyList()
+      }
+      if (found.isEmpty()) {
+        android.util.Log.w(
+          "MehVpnService",
+          "Pool top-up: no verified node found in tiers 2/3",
+          )
+        return@launch
+      }
+      val newSize = proxyServer.appendToServerPool(found)
+      android.util.Log.i(
+        "MehVpnService",
+        "Pool top-up: found ${found.size} verified node(s) in tiers 2/3; pool is now $newSize",
+        )
+    }
+  }
+  
   /** Returns true when the proxy pool was replaced with a better node. */
   private suspend fun refineNodesOnce(
     proxyServer: LocalV2RayProxyServer,
@@ -832,6 +876,8 @@ class MehVpnService : VpnService() {
     keepAliveJob = null
     refineJob?.cancel()
     refineJob = null
+    topUpPoolJob?.cancel()
+    topUpPoolJob = null
     stopNativeTun2Socks()
     localProxyServer?.stop()
     localProxyServer = null
@@ -872,6 +918,7 @@ class MehVpnService : VpnService() {
     vpnInterface = null
     unregisterPhysicalNetworkTracker()
     _tunnelSession.value = VpnTunnelSession(isRunning = false)
+    topUpPoolJob?.cancel()
     serviceScope.cancel()
     super.onDestroy()
   }
@@ -972,6 +1019,10 @@ class MehVpnService : VpnService() {
     private const val REFINE_POOL_SIZE = 6
     private const val REFINE_CONCURRENCY = 6
     private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
+    // Background pool top-up: target pool size (same as the connect path's poolSize = 5).
+    private const val POOL_TOP_UP_TARGET_SIZE = 5
+    // Start the pool top-up this long after the tunnel is up, so post-connect verification settles first.
+    private const val POOL_TOP_UP_DELAY_MS = 10_000L
 
     /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
