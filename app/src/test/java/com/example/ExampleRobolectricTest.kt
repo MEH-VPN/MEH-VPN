@@ -314,8 +314,6 @@ class ExampleRobolectricTest {
     val uris =
       listOf(
         vmessUri,
-        ssUri,
-        ss2022Uri,
         realityVisionUri,
         tcpHttpObfsUri,
         grpcUri,
@@ -336,6 +334,12 @@ class ExampleRobolectricTest {
         "Expected engine support for ${parsed!!.protocol} (${parsed.network}/${parsed.security}): $uri",
         com.example.vpn.V2RayOutboundClient.isSupportedByEngine(parsed),
       )
+    }
+    // Shadowsocks is temporarily excluded (test).
+    for (ss in listOf(ssUri, ss2022Uri)) {
+      val parsed = com.example.model.V2RayConfigParser.parseSingleUri(ss)
+      org.junit.Assert.assertNotNull("Failed to parse URI: $ss", parsed)
+      org.junit.Assert.assertFalse("Shadowsocks is temporarily excluded: $ss", com.example.vpn.V2RayOutboundClient.isSupportedByEngine(parsed!!))
     }
 
     // Verify ChaCha20-Poly1305 & X25519 & TCP HTTP Obfuscation primitives

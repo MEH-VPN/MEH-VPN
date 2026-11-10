@@ -208,9 +208,11 @@ class MehViewModel(
         )
       }
       if (restored.isNotEmpty()) {
-        cachedLastCandidates = restored.filter { it.endpointKey !in DeadServerStore.deadKeys(context) }
+        // Test: never restore a cached Shadowsocks node.
+        val supported = restored.filter { V2RayOutboundClient.isSupportedByEngine(it) }
+        cachedLastCandidates = supported.filter { it.endpointKey !in DeadServerStore.deadKeys(context) }
         _uiState.update { current ->
-          current.copy(lastConnectedConfig = restored.first())
+          current.copy(lastConnectedConfig = supported.firstOrNull())
         }
       }
     } catch (_: Throwable) {}
