@@ -339,7 +339,6 @@ fun MehMinimalScreen(
 }
 
 @Composable
-@Composable
 private fun NextServerPill(
   onClick: () -> Unit,
 ) {
