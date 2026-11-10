@@ -4,6 +4,13 @@ import com.example.data.AppUpdateInfo
 import com.example.data.SemanticVersion
 import com.example.data.UpdateChecker
 import kotlinx.coroutines.test.runTest
+import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -79,9 +86,41 @@ class UpdateCheckerTest {
     assertEquals("https://t.me/MEH_VPN_channel", info.telegramUrl)
   }
 
+  /**
+   * Fake HTTP client that answers the three update sources with canned
+   * responses for a fixed "remote latest" of 1.3.18, so the check() tests
+   * never touch the live network and never go stale when a new version ships.
+   */
+  private fun fakeClientForRemote1_3_18(): OkHttpClient {
+    val interceptor = Interceptor { chain ->
+      val url = chain.request().url.toString()
+      val headers = Headers.Builder()
+      val (code, body) = when {
+        url.contains("data.jsdelivr.com") ->
+          200 to """{"versions":["v1.3.18"]}"""
+        url.contains("releases/latest") -> {
+          headers.add("Location", "https://github.com/MEH-VPN/MEH-VPN/releases/tag/v1.3.18")
+          302 to ""
+        }
+        url.contains("version.json") ->
+          200 to """{"latest_version_name":"1.3.18","latest_version_code":10318,"download_url":"https://github.com/MEH-VPN/MEH-VPN/releases/latest/download/MEH-VPN-latest.apk","telegram_url":"https://t.me/MEH_VPN_channel"}"""
+        else -> 404 to ""
+      }
+      Response.Builder()
+        .request(chain.request())
+        .protocol(Protocol.HTTP_1_1)
+        .code(code)
+        .message("OK")
+        .headers(headers.build())
+        .body(body.toResponseBody("application/json".toMediaType()))
+        .build()
+    }
+    return OkHttpClient.Builder().addInterceptor(interceptor).build()
+  }
+
   @Test
   fun check_detectsUpdateWhenRunning1_3_17_andRemoteIs1_3_18() = runTest {
-    val checker = UpdateChecker()
+    val checker = UpdateChecker(httpClient = fakeClientForRemote1_3_18())
     val update = checker.check(currentVersionRaw = "1.3.17")
     assertNotNull("Expected update to be found for 1.3.17", update)
     assertEquals("1.3.18", update?.latestVersionName)
@@ -89,7 +128,7 @@ class UpdateCheckerTest {
 
   @Test
   fun check_returnsNullWhenRunningLatestVersion() = runTest {
-    val checker = UpdateChecker()
+    val checker = UpdateChecker(httpClient = fakeClientForRemote1_3_18())
     val update = checker.check(currentVersionRaw = "1.3.18")
     assertNull("Expected null when already running latest version 1.3.18", update)
   }
