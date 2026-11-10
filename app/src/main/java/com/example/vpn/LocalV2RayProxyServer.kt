@@ -483,6 +483,30 @@ class LocalV2RayProxyServer(
     return newPool[0]
   }
 
+  // Appends verified nodes to the END of the pool without touching the active node or
+  // interrupting the tunnel (background pool top-up). Returns the new pool size.
+  fun appendToServerPool(newConfigs: List<V2RayConfig>): Int {
+    if (newConfigs.isEmpty()) return serverPool.size
+    var addedCount = 0
+    synchronized(poolLock) {
+      val current = serverPool
+      val existingKeys = current.map { it.endpointKey }.toSet()
+      val additions =
+      newConfigs.filter { it.endpointKey !in existingKeys }.distinctBy { it.endpointKey }
+      if (additions.isNotEmpty()) {
+        serverPool = current + additions
+        addedCount = additions.size
+      }
+    }
+    if (addedCount > 0) {
+      android.util.Log.i(
+        "LocalV2RayProxyServer",
+        "Pool top-up: appended $addedCount node(s); pool is now ${serverPool.size}",
+        )
+    }
+    return serverPool.size
+  }
+  
   private fun recordServerSuccess(idx: Int, pool: List<V2RayConfig>) {
     if (pool !== serverPool) return // pool was replaced mid-stream; idx is meaningless now
     consecutiveFailures[idx]?.set(0)
