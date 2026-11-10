@@ -540,6 +540,18 @@ class SoliSpiritRepository(
     private const val FAST_CONNECT_WAVE_SIZE = 160
     private const val FAST_CONNECT_PROBE_TIMEOUT_MS = 1500
     private const val MAX_CONFIGS_PER_SOURCE = 1000
+
+    /** Round 5: scan at least this long before connecting. */
+    const val BEST_SCAN_MIN_DURATION_MS: Long = 60_000L
+
+    /** Round 5: a verified node faster than this ends the scan at once. */
+    const val BEST_SCAN_EARLY_STOP_PING_MS: Long = 1000L
+
+    /** Round 5: size of the verified pool the scan returns, fastest first. */
+    const val BEST_SCAN_POOL_SIZE: Int = 5
+
+    /** Round 5: stage-2 checks per wave, fastest stage-1 results first. */
+    private const val BEST_SCAN_VERIFY_PER_WAVE = 12
   }
 
   /**
@@ -1152,7 +1164,209 @@ private suspend fun fetchFromSourceList(
       pool
     }
 
-fun measureNodeSpeed(
+/**
+     * Ranks stage-2-verified nodes fastest first, deduplicated by endpoint. When
+     * the same endpoint was verified more than once, the fastest measurement wins.
+     */
+    fun rankVerifiedByPing(
+        verified: List<V2RayConfig>,
+        poolSize: Int = BEST_SCAN_POOL_SIZE,
+    ): List<V2RayConfig> =
+        verified
+            .sortedBy { it.latencyMs }
+            .distinctBy { it.endpointKey }
+            .take(poolSize.coerceAtLeast(1))
+
+    /**
+     * Round 5: best-server scan. Unlike [findFirstPassingFromSources], which connects
+     * to the first server that passes, this scans at full fast-connect power
+     * (128 concurrent probes, 160-node waves, 1500 ms stage-1 timeout) for at least
+     * [minScanDurationMs] across ALL tiers, never stopping at the first tier that
+     * yields a node, and returns the fastest verified nodes first.
+     *
+     * Saved working nodes are still tried first, inside the scan. A node counts as
+     * verified only when it passes stage 1 (TCP probe, the node latency in
+     * [V2RayConfig.latencyMs]) and stage 2 (the HTTPS/DNS capability check).
+     * Shadowsocks nodes stay excluded through [V2RayOutboundClient.isSupportedByEngine].
+     *
+     * The scan stops early only when a verified node is faster than [earlyStopPingMs].
+     * After [minScanDurationMs] it returns the best verified nodes found so far; when
+     * nothing has passed by then it keeps scanning the remaining tiers until something
+     * passes (never give up). When every tier is exhausted without a single verified
+     * node, the empty list is returned and the caller reports the failure as before.
+     *
+     * Live progress (tested count, verified count, best ping so far) is reported
+     * through [onLogUpdate] so the screen never looks stuck on the testing phase.
+     * Cancellation is honoured the same way as the rest of the pipeline, so
+     * disconnect/cancel during connect still works.
+     */
+    suspend fun scanBestCandidatesAcrossAllTiers(
+        prioritizedSavedNodes: List<V2RayConfig> = emptyList(),
+        poolSize: Int = BEST_SCAN_POOL_SIZE,
+        minScanDurationMs: Long = BEST_SCAN_MIN_DURATION_MS,
+        earlyStopPingMs: Long = BEST_SCAN_EARLY_STOP_PING_MS,
+        excludedEndpointKeys: Set<String> = emptySet(),
+        onLogUpdate: (String) -> Unit,
+    ): List<V2RayConfig> = withContext(ioDispatcher) {
+        val scanStartedAt = System.currentTimeMillis()
+        val verified = mutableListOf<V2RayConfig>()
+        var testedCount = 0
+        var lastProgressLogAt = 0L
+
+        fun elapsedMs(): Long = System.currentTimeMillis() - scanStartedAt
+
+        fun bestPingMs(): Long? = verified.minOfOrNull { it.latencyMs }
+
+        fun logProgress(force: Boolean) {
+            val now = elapsedMs()
+            if (!force && now - lastProgressLogAt < 2_000L) return
+            lastProgressLogAt = now
+            val best = bestPingMs()
+            val bestText =
+                if (best == null) "هنوز سروری تایید نشده"
+                else "بهترین پینگ " + best + "ms"
+            onLogUpdate(
+                "تست سرور ها: " + testedCount + " تست شد، " + verified.size +
+                    " تایید شد، " + bestText + " (" + (now / 1_000L) + "ث)",
+            )
+        }
+
+        fun noteVerified(candidates: List<V2RayConfig>) {
+            for (candidate in candidates) {
+                if (candidate.endpointKey in excludedEndpointKeys) continue
+                val existing = verified.firstOrNull { it.endpointKey == candidate.endpointKey }
+                if (existing == null) {
+                    verified.add(candidate)
+                } else if (candidate.latencyMs < existing.latencyMs) {
+                    verified.remove(existing)
+                    verified.add(candidate)
+                }
+            }
+            verified.sortBy { it.latencyMs }
+        }
+
+        fun deadlineReached(): Boolean =
+            elapsedMs() >= minScanDurationMs && verified.isNotEmpty()
+
+        fun earlyStopReached(): Boolean =
+            bestPingMs()?.let { it < earlyStopPingMs } == true
+
+        // Tests one chunk of configs in fast-connect waves. Returns true when the
+        // scan must stop: early stop, or the minimum scan time is over and at
+        // least one node already passed. Returns false to keep scanning.
+        suspend fun scanConfigs(configs: List<V2RayConfig>): Boolean {
+            val testable: (V2RayConfig) -> Boolean = {
+                V2RayOutboundClient.isSupportedByEngine(it) &&
+                    it.protocol != V2RayProtocol.HYSTERIA2 &&
+                    it.protocol != V2RayProtocol.TUIC &&
+                    it.protocol != V2RayProtocol.WIREGUARD
+            }
+            val supported = configs.filter(testable)
+            val semaphore = Semaphore(FAST_CONNECT_CONCURRENCY)
+            for (wave in supported.chunked(FAST_CONNECT_WAVE_SIZE)) {
+                coroutineContext.ensureActive()
+                if (deadlineReached()) return true
+                val stageOnePassed =
+                    coroutineScope {
+                        wave
+                            .map { config ->
+                                async {
+                                    semaphore.withPermit {
+                                        coroutineContext.ensureActive()
+                                        measureNodeSpeed(
+                                            config,
+                                            timeoutMs = FAST_CONNECT_PROBE_TIMEOUT_MS,
+                                        )
+                                    }
+                                }
+                            }
+                            .awaitAll()
+                            .filterNotNull()
+                            .sortedBy { it.latencyMs }
+                    }
+                testedCount += wave.size
+                logProgress(force = false)
+                if (stageOnePassed.isEmpty()) continue
+                // Fastest passers of this wave: quick TLS checks in parallel (not
+                // one by one); only stage-2 verified nodes join the pool.
+                val verifiedInWave =
+                    coroutineScope {
+                        stageOnePassed.take(BEST_SCAN_VERIFY_PER_WAVE)
+                            .map { candidate ->
+                                async {
+                                    val httpsLatency =
+                                        V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                                            config = candidate,
+                                            timeoutMs = 3000,
+                                        )
+                                    if (httpsLatency != null) candidate else null
+                                }
+                            }
+                            .awaitAll()
+                            .filterNotNull()
+                    }
+                noteVerified(verifiedInWave)
+                logProgress(force = verifiedInWave.isNotEmpty())
+                if (earlyStopReached()) {
+                    onLogUpdate(
+                        "سرور سریع پیدا شد (پینگ " + (bestPingMs() ?: 0L) +
+                            "ms) — اتصال فوری",
+                    )
+                    return true
+                }
+                if (deadlineReached()) return true
+            }
+            return deadlineReached()
+        }
+
+        onLogUpdate("شروع اسکن بهترین سرور: حداقل 60 ثانیه بررسی همه مخزن‌ها")
+
+        // Saved working nodes are tried first, inside the scan.
+        val savedSupported =
+            prioritizedSavedNodes.filter { V2RayOutboundClient.isSupportedByEngine(it) }
+        if (savedSupported.isNotEmpty() && scanConfigs(savedSupported)) {
+            return@withContext rankVerifiedByPing(verified, poolSize)
+        }
+
+        val tiers =
+            listOf(
+                "اولویت اول" to PRIMARY_RZASHAKERI_SOURCES,
+                "اولویت دوم" to MHCFP_SOURCES,
+                "اولویت سوم" to FALLBACK_SOURCES,
+            )
+        for ((tierLabel, tierSources) in tiers) {
+            for ((batchIndex, batch) in tierSources.chunked(4).withIndex()) {
+                coroutineContext.ensureActive()
+                if (deadlineReached()) break
+                logProgress(force = true)
+                val batchConfigs =
+                    coroutineScope {
+                        batch
+                            .map { source ->
+                                async { fetchSingleSource(source) }
+                            }
+                            .awaitAll()
+                    }.flatten()
+                        .filter { V2RayOutboundClient.isSupportedByEngine(it) }
+                        .distinctBy { it.endpointKey }
+                        .filter { config ->
+                            val verifiedKeys = verified.map { it.endpointKey }.toSet()
+                            config.endpointKey !in excludedEndpointKeys &&
+                                config.endpointKey !in verifiedKeys
+                        }
+                if (batchConfigs.isEmpty()) continue
+                onLogUpdate(
+                    "استخراج و بررسی اتصالات از مخزن " + tierLabel +
+                        " (دسته " + (batchIndex + 1) + "، " + batchConfigs.size + " سرور)",
+                )
+                if (scanConfigs(batchConfigs)) break
+            }
+            if (deadlineReached() || earlyStopReached()) break
+        }
+        return@withContext rankVerifiedByPing(verified, poolSize)
+    }
+
+    fun measureNodeSpeed(
   config: V2RayConfig,
   timeoutMs: Int = 2600,
 ): V2RayConfig? {
