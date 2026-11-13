@@ -36,11 +36,27 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+enum class VpnLogLevel {
+  SYSTEM,
+  SOURCE,
+  SCAN,
+  SUCCESS,
+  ERROR,
+}
+
+data class VpnRealtimeLog(
+  val message: String,
+  val level: VpnLogLevel = VpnLogLevel.SYSTEM,
+)
 
 data class VpnTunnelSession(
   val isRunning: Boolean = false,
@@ -70,8 +86,8 @@ class MehVpnService : VpnService() {
   private var topUpPoolJob: Job? = null
 
   private val nodeRepository by lazy { SoliSpiritRepository() }
-  @Volatile private var cachedSubscriptionConfigs: List<V2RayConfig> = emptyList()
-  @Volatile private var cachedSubscriptionAtMs: Long = 0L
+  @Volatile private var refineBatchIndex: Int = 0
+  private val allSubBatches by lazy { SoliSpiritRepository.SOLISPIRIT_SOURCES.chunked(4) }
 
   @Volatile private var underlyingPhysicalNetwork: Network? = null
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -290,6 +306,11 @@ class MehVpnService : VpnService() {
           localProxyPort = localSocksPort,
           errorMessage = null,
         )
+
+      emitRealtimeLog(
+        "متصل به $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
+        VpnLogLevel.SUCCESS,
+      )
 
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
       verifyActiveNodeAfterConnect()
@@ -521,6 +542,7 @@ class MehVpnService : VpnService() {
     }
 
     val switchedCfg = switchToNextHealthyNode("manual") ?: return
+    emitRealtimeLog("تعویض دستی به سرور: ${switchedCfg.cleanTitle}", VpnLogLevel.SYSTEM)
     updateSessionAndNotification(switchedCfg, switchedCfg.latencyMs.coerceAtLeast(1L))
     serviceScope.launch {
       var candidate = switchedCfg
@@ -528,6 +550,10 @@ class MehVpnService : VpnService() {
       while (attempts < 3) {
         val realPing = verifyRealPathViaProxy(localSocksPort)
         if (realPing != null) {
+          emitRealtimeLog(
+            "سرور جدید متصل شد: ${candidate.cleanTitle} (پینگ ${realPing}ms)",
+            VpnLogLevel.SUCCESS,
+          )
           updateSessionAndNotification(candidate, realPing)
           return@launch
         }
@@ -567,6 +593,10 @@ class MehVpnService : VpnService() {
       val realPing = verifyRealPathViaProxy(localSocksPort)
       if (realPing != null) {
         updateSessionAndNotification(activeCfg, realPing)
+        emitRealtimeLog(
+          "اتصال تایید شد: ${activeCfg.cleanTitle} (پینگ واقعی ${realPing}ms)",
+          VpnLogLevel.SUCCESS,
+        )
         return@launch
       }
       var attempts = 0
@@ -580,6 +610,10 @@ class MehVpnService : VpnService() {
         val nextPing = verifyRealPathViaProxy(localSocksPort)
         if (nextPing != null) {
           updateSessionAndNotification(current, nextPing)
+          emitRealtimeLog(
+            "تغییر به سرور پایدارتر: ${current.cleanTitle} (پینگ ${nextPing}ms)",
+            VpnLogLevel.SUCCESS,
+          )
           return@launch
         }
       }
@@ -641,6 +675,11 @@ class MehVpnService : VpnService() {
                 if (switchedCfg.endpointKey != activeCfg.endpointKey) {
                   activeCfg = switchedCfg
                   consecutiveFailures = 0
+                  emitRealtimeLog(
+                    "افت یا قطع نود قبلی؛ انتقال خودکار به ${switchedCfg.cleanTitle}" +
+                      if (switchedPing != null) " (${switchedPing}ms)" else "",
+                    VpnLogLevel.SYSTEM,
+                  )
                   if (switchedPing != null) {
                     lastPing = switchedPing
                   } else {
@@ -693,14 +732,17 @@ class MehVpnService : VpnService() {
 
   private fun startBackgroundNodeRefinement() {
     refineJob?.cancel()
+    refineBatchIndex = 0
     refineJob =
       serviceScope.launch {
         delay(REFINE_FIRST_DELAY_MS)
         var lastSwitchAtMs = 0L
         while (isActive) {
+          var switched = false
           try {
             if (System.currentTimeMillis() - lastSwitchAtMs >= REFINE_MIN_SWITCH_GAP_MS) {
-              if (refineNodesOnce()) {
+              switched = refineNodesOnce()
+              if (switched) {
                 lastSwitchAtMs = System.currentTimeMillis()
               }
             }
@@ -709,7 +751,15 @@ class MehVpnService : VpnService() {
           } catch (t: Throwable) {
             android.util.Log.w("MehRefine", "refinement cycle failed: ${t.javaClass.simpleName}")
           }
-          delay(if (isPhysicalNetworkMetered()) REFINE_INTERVAL_METERED_MS else REFINE_INTERVAL_MS)
+          val activePing = _tunnelSession.value.currentPingMs
+          val nextDelay =
+            when {
+              isPhysicalNetworkMetered() -> REFINE_INTERVAL_METERED_MS
+              activePing <= 0L || activePing > 300L -> REFINE_INTERVAL_FAST_HUNT_MS
+              activePing > 150L -> REFINE_INTERVAL_MODERATE_MS
+              else -> REFINE_INTERVAL_MS
+            }
+          delay(if (switched) nextDelay.coerceAtLeast(20_000L) else nextDelay)
         }
       }
   }
@@ -745,10 +795,41 @@ class MehVpnService : VpnService() {
   private suspend fun refineNodesOnce(force: Boolean = false): Boolean {
     val active = currentActiveConfig() ?: return false
     val others = currentPoolSnapshot().filter { it.endpointKey != active.endpointKey }
+    val deadKeys = DeadServerStore.deadKeys(applicationContext)
+    val batches = allSubBatches
+    if (batches.isEmpty() && others.isEmpty()) return false
 
-    val subscription = loadSubscriptionConfigsCached()
-    val challengers = subscription.filter { it.endpointKey != active.endpointKey }
+    val batchIdx = if (batches.isNotEmpty()) (refineBatchIndex++ % batches.size) else 0
+    val batch = batches.getOrNull(batchIdx).orEmpty()
+    val sourceLabel = batch.firstOrNull()?.repoLabel ?: "ساب‌ها"
+    emitRealtimeLog(
+      "جستجوی سرور سریع‌تر در پس‌زمینه ($sourceLabel • دسته ${batchIdx + 1}/${batches.size.coerceAtLeast(1)}) ...",
+      VpnLogLevel.SOURCE,
+    )
+
+    val batchConfigs =
+      if (batch.isNotEmpty()) {
+        try {
+          nodeRepository.fetchBatchSupportedConfigs(
+            sources = batch,
+            excludedEndpointKeys = deadKeys + setOf(active.endpointKey),
+          )
+        } catch (ce: CancellationException) {
+          throw ce
+        } catch (_: Exception) {
+          emptyList()
+        }
+      } else {
+        emptyList()
+      }
+
+    val challengers = batchConfigs.filter { it.endpointKey != active.endpointKey }
     if (challengers.isEmpty() && others.isEmpty()) return false
+
+    emitRealtimeLog(
+      "تست سرعت ${challengers.size} کانفیگ جدید در پس‌زمینه ...",
+      VpnLogLevel.SCAN,
+    )
 
     val currentScored =
       nodeRepository
@@ -766,22 +847,34 @@ class MehVpnService : VpnService() {
         configs = challengers,
         maxCount = REFINE_POOL_SIZE,
         prioritizedSavedNodes = others,
-        maxWaves = 1,
+        maxWaves = 2,
         concurrency = REFINE_CONCURRENCY,
-        verifyConcurrency = 2,
+        verifyConcurrency = 3,
       ) { _ -> }
     val best = fresh.firstOrNull() ?: return false
     if (best.endpointKey == active.endpointKey) return false
 
-    val isBetter =
-      if (currentScored == null) {
-        force || verifyRealPathViaProxy(localSocksPort) == null
-      } else {
-        force ||
-          (best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
-            best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE)
+    val currentPing = currentScored?.latencyMs ?: _tunnelSession.value.currentPingMs.coerceAtLeast(1L)
+    val isClearlyFaster =
+      when {
+        currentScored == null -> force || verifyRealPathViaProxy(localSocksPort) == null
+        force -> true
+        best.latencyMs <= (currentPing * 0.82).toLong() -> true
+        best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
+          best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE -> true
+        else -> false
       }
-    if (!isBetter) return false
+    if (!isClearlyFaster) {
+      if (fresh.size > 1) {
+        appendToServerPool(fresh.filter { it.endpointKey != active.endpointKey })
+      }
+      return false
+    }
+
+    emitRealtimeLog(
+      "کانفیگ سریع‌تر پیدا شد: ${best.cleanTitle} (${best.protocol.label} • پینگ ${best.latencyMs}ms)",
+      VpnLogLevel.SUCCESS,
+    )
 
     val newPool =
       (fresh.take(REFINE_POOL_SIZE - 1) +
@@ -791,29 +884,11 @@ class MehVpnService : VpnService() {
         .take(REFINE_POOL_SIZE)
     val newActive = replaceServerPool(newPool) ?: return false
     updateSessionAndNotification(newActive, best.latencyMs.coerceAtLeast(1L))
+    emitRealtimeLog(
+      "اتصال به سرور سریع‌تر تغییر یافت: ${newActive.cleanTitle} (${best.latencyMs}ms)",
+      VpnLogLevel.SUCCESS,
+    )
     return true
-  }
-
-  private suspend fun loadSubscriptionConfigsCached(): List<V2RayConfig> {
-    val now = System.currentTimeMillis()
-    val cached = cachedSubscriptionConfigs
-    if (cached.isNotEmpty() && now - cachedSubscriptionAtMs < REFINE_CONFIG_CACHE_TTL_MS) {
-      return cached
-    }
-    val fetched =
-      try {
-        nodeRepository.fetchAllTierConfigs()
-      } catch (ce: CancellationException) {
-        throw ce
-      } catch (_: Exception) {
-        emptyList()
-      }
-    if (fetched.isNotEmpty()) {
-      cachedSubscriptionConfigs = fetched
-      cachedSubscriptionAtMs = now
-      return fetched
-    }
-    return cached
   }
 
   private fun isPhysicalNetworkMetered(): Boolean {
@@ -961,17 +1036,18 @@ class MehVpnService : VpnService() {
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
-    private const val REFINE_FIRST_DELAY_MS = 20_000L
-    private const val REFINE_INTERVAL_MS = 10 * 60_000L
-    private const val REFINE_INTERVAL_METERED_MS = 20 * 60_000L
-    private const val REFINE_MIN_SWITCH_GAP_MS = 8 * 60_000L
-    private const val REFINE_SCORE_FACTOR = 1.35
-    private const val REFINE_LATENCY_TOLERANCE = 1.25
+    private const val REFINE_FIRST_DELAY_MS = 3_000L
+    private const val REFINE_INTERVAL_FAST_HUNT_MS = 25_000L
+    private const val REFINE_INTERVAL_MODERATE_MS = 90_000L
+    private const val REFINE_INTERVAL_MS = 5 * 60_000L
+    private const val REFINE_INTERVAL_METERED_MS = 10 * 60_000L
+    private const val REFINE_MIN_SWITCH_GAP_MS = 12_000L
+    private const val REFINE_SCORE_FACTOR = 1.20
+    private const val REFINE_LATENCY_TOLERANCE = 1.15
     private const val REFINE_POOL_SIZE = 6
-    private const val REFINE_CONCURRENCY = 6
-    private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
+    private const val REFINE_CONCURRENCY = 16
     private const val POOL_TOP_UP_TARGET_SIZE = 5
-    private const val POOL_TOP_UP_DELAY_MS = 10_000L
+    private const val POOL_TOP_UP_DELAY_MS = 15_000L
 
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
@@ -981,5 +1057,12 @@ class MehVpnService : VpnService() {
 
     private val _tunnelSession = MutableStateFlow(VpnTunnelSession())
     val tunnelSession: StateFlow<VpnTunnelSession> = _tunnelSession.asStateFlow()
+
+    private val _realtimeLogs = MutableSharedFlow<VpnRealtimeLog>(extraBufferCapacity = 64)
+    val realtimeLogs: SharedFlow<VpnRealtimeLog> = _realtimeLogs.asSharedFlow()
+
+    fun emitRealtimeLog(message: String, level: VpnLogLevel = VpnLogLevel.SYSTEM) {
+      _realtimeLogs.tryEmit(VpnRealtimeLog(message = message, level = level))
+    }
   }
 }

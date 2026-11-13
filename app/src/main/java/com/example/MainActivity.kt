@@ -708,17 +708,20 @@ private fun MinimalLogList(
     ) {
       logs.forEachIndexed { index, entry ->
         val isLatest = index == logs.lastIndex
+        val baseColor =
+          when (entry.level) {
+            com.example.ui.HackerLogLevel.SUCCESS -> NeonEmeraldGlow
+            com.example.ui.HackerLogLevel.ERROR -> CrimsonAlert
+            com.example.ui.HackerLogLevel.SOURCE -> CyberCyan
+            com.example.ui.HackerLogLevel.SCAN -> AmberPulse
+            com.example.ui.HackerLogLevel.SYSTEM -> TextSecondary
+          }
         Text(
           text = entry.message,
           style = MaterialTheme.typography.bodyMedium,
           fontFamily = VazirmatnFontFamily,
           fontWeight = if (isLatest) FontWeight.Medium else FontWeight.Normal,
-          color =
-            if (isLatest) {
-              TextSecondary.copy(alpha = 0.9f)
-            } else {
-              TextMuted.copy(alpha = 0.65f)
-            },
+          color = baseColor.copy(alpha = if (isLatest) 0.95f else 0.65f),
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
           textAlign = TextAlign.Center,

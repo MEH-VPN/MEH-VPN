@@ -1293,10 +1293,13 @@ private suspend fun fetchFromSourceList(
                 testedCount += wave.size
                 logProgress(force = false)
                 if (stageOnePassed.isEmpty()) continue
-                // Fastest passers of this wave: run HTTPS check + real download throughput concurrently
-                // so throttled/choked nodes are filtered out and only fast servers win.
-                val verifiedInWave =
-                    coroutineScope {
+                // Fastest passers of this wave: run HTTPS check + real download throughput concurrently.
+                // When instant-first-connect mode is active (minScanDurationMs <= 0L), connect as soon
+                // as the first verified node under earlyStopPingMs passes instead of waiting for all 12.
+                val wavePassers = java.util.Collections.synchronizedList(mutableListOf<V2RayConfig>())
+                val earlyWinnerSignal = kotlinx.coroutines.CompletableDeferred<V2RayConfig>()
+                coroutineScope {
+                    val verifyJobs =
                         stageOnePassed.take(BEST_SCAN_VERIFY_PER_WAVE)
                             .map { candidate ->
                                 async {
@@ -1322,21 +1325,47 @@ private suspend fun fetchFromSourceList(
                                     val score =
                                         (10_000.0 / realPing.toDouble()) +
                                             (throughputKbps.coerceAtMost(2500.0) * 0.85)
-                                    candidate.copy(
-                                        latencyMs = realPing,
-                                        speedScore = score,
+                                    val verifiedCfg =
+                                        candidate.copy(
+                                            latencyMs = realPing,
+                                            speedScore = score,
+                                        )
+                                    wavePassers.add(verifiedCfg)
+                                    onLogUpdate(
+                                        "کانفیگ تایید شد: ${verifiedCfg.cleanTitle} (${verifiedCfg.protocol.label} • پینگ ${realPing}ms)",
                                     )
+                                    if (minScanDurationMs <= 0L && realPing < earlyStopPingMs) {
+                                        earlyWinnerSignal.complete(verifiedCfg)
+                                    }
+                                    verifiedCfg
                                 }
                             }
-                            .awaitAll()
-                            .filterNotNull()
+
+                    if (minScanDurationMs <= 0L) {
+                        val allDoneJob = async {
+                            verifyJobs.awaitAll()
+                        }
+                        kotlinx.coroutines.selects.select<Unit> {
+                            earlyWinnerSignal.onAwait {
+                                // Brief grace window so any parallel sibling that already finished joins the pool.
+                                kotlinx.coroutines.delay(180L)
+                            }
+                            allDoneJob.onAwait { }
+                        }
+                        verifyJobs.forEach { it.cancel() }
+                        allDoneJob.cancel()
+                    } else {
+                        verifyJobs.awaitAll()
                     }
+                }
+                val verifiedInWave = wavePassers.toList()
                 noteVerified(verifiedInWave)
                 logProgress(force = verifiedInWave.isNotEmpty())
                 if (earlyStopReached()) {
                     onLogUpdate(
-                        "سرور سریع پیدا شد (پینگ " + (bestPingMs() ?: 0L) +
-                            "ms) — اتصال فوری",
+                        "اتصال به اولین کانفیگ زیر ${earlyStopPingMs}ms: " +
+                            (verified.firstOrNull()?.cleanTitle ?: "سرور") +
+                            " (${bestPingMs() ?: 0L}ms)",
                     )
                     return true
                 }
@@ -1345,7 +1374,13 @@ private suspend fun fetchFromSourceList(
             return deadlineReached()
         }
 
-        onLogUpdate("شروع اسکن بهترین سرور: بررسی مخزن‌ها (${minScanDurationMs / 1000L} ثانیه)")
+        onLogUpdate(
+            if (minScanDurationMs <= 0L) {
+                "جستجوی سریع اولین کانفیگ زیر ${earlyStopPingMs}ms ..."
+            } else {
+                "شروع اسکن بهترین سرور: بررسی مخزن‌ها (${minScanDurationMs / 1000L} ثانیه)"
+            },
+        )
 
         // Saved working nodes are tried first, inside the scan.
         val savedSupported =
@@ -1365,24 +1400,10 @@ private suspend fun fetchFromSourceList(
                 coroutineContext.ensureActive()
                 if (deadlineReached()) break
                 logProgress(force = true)
-                val batchConfigs =
-                    coroutineScope {
-                        batch
-                            .map { source ->
-                                async { fetchSingleSource(source) }
-                            }
-                            .awaitAll()
-                    }.flatten()
-                        .filter { V2RayOutboundClient.isSupportedByEngine(it) }
-                        .distinctBy { it.endpointKey }
-                        .filter { config ->
-                            val verifiedKeys = verified.map { it.endpointKey }.toSet()
-                            config.endpointKey !in excludedEndpointKeys &&
-                                config.endpointKey !in verifiedKeys
-                        }
+                val batchConfigs = fetchBatchSupportedConfigs(batch, excludedEndpointKeys, verified)
                 if (batchConfigs.isEmpty()) continue
                 onLogUpdate(
-                    "استخراج و بررسی اتصالات از مخزن " + tierLabel +
+                    "دریافت و تست مخزن " + tierLabel +
                         " (دسته " + (batchIndex + 1) + "، " + batchConfigs.size + " سرور)",
                 )
                 if (scanConfigs(batchConfigs)) break
@@ -1390,6 +1411,25 @@ private suspend fun fetchFromSourceList(
             if (deadlineReached() || earlyStopReached()) break
         }
         return@withContext rankVerifiedByPing(verified, poolSize)
+    }
+
+    suspend fun fetchBatchSupportedConfigs(
+        sources: List<SubscriptionSource>,
+        excludedEndpointKeys: Set<String> = emptySet(),
+        alreadyVerified: List<V2RayConfig> = emptyList(),
+    ): List<V2RayConfig> = withContext(ioDispatcher) {
+        val verifiedKeys = alreadyVerified.map { it.endpointKey }.toSet()
+        coroutineScope {
+            sources
+                .map { source -> async { fetchSingleSource(source) } }
+                .awaitAll()
+        }.flatten()
+            .filter { V2RayOutboundClient.isSupportedByEngine(it) }
+            .distinctBy { it.endpointKey }
+            .filter { config ->
+                config.endpointKey !in excludedEndpointKeys &&
+                    config.endpointKey !in verifiedKeys
+            }
     }
 
     fun measureNodeSpeed(

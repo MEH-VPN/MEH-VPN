@@ -458,16 +458,8 @@ object GfwKnockerXrayCore {
     if (config.protocol == V2RayProtocol.SERVERLESS && !includeTunInbound) {
       val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
       val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
-      val remarks =
-        when {
-          config.fragmentProfile.contains("aether", ignoreCase = true) -> "CluvexStudio/Aether SNI-Split"
-          config.fragmentProfile.contains("whitedns", ignoreCase = true) -> "WhiteDNS Direct Clean-IP"
-          isFragA -> "Serverless-v52-fragA (@patterniha)"
-          else -> "Serverless-v52-fragB (@patterniha)"
-        }
       return """
         {
-          "remarks": "$remarks",
           "log": { "loglevel": "warning" },
           "dns": {
             "hosts": { "cloudflare-dns.com": "challenges.cloudflare.com" },
@@ -498,7 +490,7 @@ object GfwKnockerXrayCore {
                     { "type": "fragment", "settings": { "packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11" } }
                   ]
                 },
-                "sockopt": { "tcpNoDelay": true, "dialerProxy": "fragment" }
+                "sockopt": { "dialerProxy": "fragment" }
               }
             }
           ]
@@ -548,7 +540,7 @@ object GfwKnockerXrayCore {
         """.trimIndent()
     }
 
-    val proxyOutboundJson = buildXrayProxyOutboundJson(config, includeTunInbound)
+    val proxyOutboundJson = buildXrayProxyOutboundJson(config)
     val tunDnsRule =
       if (includeTunInbound) {
         """
@@ -564,10 +556,8 @@ object GfwKnockerXrayCore {
         ""
       }
 
-    val escRemarks = escapeJson("${config.cleanTitle} [MEH-XrayCore]")
     return """
       {
-        "remarks": "$escRemarks",
         "log": {
           "loglevel": "warning"
         },
@@ -576,23 +566,7 @@ object GfwKnockerXrayCore {
           "queryStrategy": "UseIPv4",
           "servers": [
             "8.8.8.8",
-            "1.1.1.1",
-            {
-              "address": "localhost",
-              "domains": [
-                "domain:.ir",
-                "domain:shaparak.ir",
-                "domain:digikala.com",
-                "domain:snapp.ir",
-                "domain:divar.ir",
-                "domain:torob.com",
-                "domain:aparat.com",
-                "domain:rubika.ir",
-                "domain:telewebion.com",
-                "domain:bale.ai",
-                "domain:eitaa.com"
-              ]
-            }
+            "1.1.1.1"
           ]
         },
         "inbounds": [
@@ -609,11 +583,6 @@ object GfwKnockerXrayCore {
                 "packets": "tlshello",
                 "length": "10-25",
                 "interval": "2-5"
-              }
-            },
-            "streamSettings": {
-              "sockopt": {
-                "tcpNoDelay": true
               }
             }
           },
@@ -686,10 +655,7 @@ object GfwKnockerXrayCore {
   private fun jsonStrArray(values: List<String>): String =
     values.joinToString(", ", prefix = "[", postfix = "]") { jsonStr(it) }
 
-  private fun buildXrayProxyOutboundJson(
-    config: V2RayConfig,
-    includeTunInbound: Boolean,
-  ): String {
+  private fun buildXrayProxyOutboundJson(config: V2RayConfig): String {
     val dialAddress = config.resolvedIp.ifBlank { config.address }
     val sni = config.sni.ifBlank { config.hostHeader }.ifBlank { config.address }.trim()
     val host = config.hostHeader.ifBlank { sni }.ifBlank { config.address }.trim()
@@ -718,11 +684,6 @@ object GfwKnockerXrayCore {
               "length": "10-25",
               "interval": "1-3"
             }
-          },
-          "streamSettings": {
-            "sockopt": {
-              "tcpNoDelay": true
-            }
           }
         }
       """.trimIndent()
@@ -734,9 +695,9 @@ object GfwKnockerXrayCore {
           if (it.isNotEmpty()) ", \"alpn\": ${jsonStrArray(it)}" else ""
         }
       val sniField = if (sni.isNotEmpty()) "\"serverName\": ${jsonStr(sni)}, " else ""
-      val udpMasksField =
+      val finalMaskField =
         if (config.obfs.equals("salamander", ignoreCase = true) && config.obfsPassword.isNotBlank()) {
-          """, "udpmasks": [{"type": "salamander", "settings": {"password": ${jsonStr(config.obfsPassword)}}}]"""
+          """, "finalmask": { "udp": [{ "type": "salamander", "settings": { "password": ${jsonStr(config.obfsPassword)} } }] }"""
         } else {
           ""
         }
@@ -758,8 +719,8 @@ object GfwKnockerXrayCore {
             "hysteriaSettings": {
               "version": 2,
               "auth": ${jsonStr(config.authId)},
-              "udpIdleTimeout": 60$udpMasksField
-            }
+              "udpIdleTimeout": 60
+            }$finalMaskField
           }
         }
       """.trimIndent()
@@ -827,7 +788,13 @@ object GfwKnockerXrayCore {
         V2RayProtocol.VLESS,
         V2RayProtocol.MVLESS,
         V2RayProtocol.JVLESS -> {
-          val flowField = if (config.flow.isNotBlank()) """, "flow": ${jsonStr(config.flow)}""" else ""
+          val validFlow =
+            if (normalizedNet == "tcp" && config.flow.startsWith("xtls-rprx-vision", ignoreCase = true)) {
+              config.flow.trim()
+            } else {
+              ""
+            }
+          val flowField = if (validFlow.isNotEmpty()) """, "flow": ${jsonStr(validFlow)}""" else ""
           val settings =
             """
             {
@@ -907,7 +874,12 @@ object GfwKnockerXrayCore {
       }
 
     val streamBlocks = mutableListOf<String>()
-    val effectiveSec = if (sec == "reality") "reality" else if (sec == "tls") "tls" else "none"
+    val effectiveSec =
+      when {
+        sec == "reality" && config.pbk.isNotBlank() -> "reality"
+        sec == "tls" || (sec == "reality" && config.sni.isNotBlank()) -> "tls"
+        else -> "none"
+      }
     streamBlocks += "\"network\": ${jsonStr(normalizedNet)}"
     streamBlocks += "\"security\": ${jsonStr(effectiveSec)}"
 
@@ -928,12 +900,13 @@ object GfwKnockerXrayCore {
         }
         """.trimIndent()
     } else if (effectiveSec == "reality") {
+      val realitySni = sni.ifBlank { "www.microsoft.com" }
       streamBlocks +=
         """
         "realitySettings": {
           "show": false,
           "fingerprint": "chrome",
-          "serverName": ${jsonStr(sni)},
+          "serverName": ${jsonStr(realitySni)},
           "publicKey": ${jsonStr(config.pbk)},
           "shortId": ${jsonStr(config.shortId)},
           "spiderX": ${jsonStr(config.spiderX.ifBlank { "/" })}
@@ -998,9 +971,10 @@ object GfwKnockerXrayCore {
       }
     }
 
-    val useFragment = !includeTunInbound || (sec == "tls" && normalizedNet != "kcp")
-    val dialerProxyLine = if (useFragment) """"dialerProxy": "fragment", """ else ""
-    streamBlocks += """"sockopt": { ${dialerProxyLine}"tcpNoDelay": true }"""
+    val useFragment = effectiveSec == "tls" && normalizedNet != "kcp"
+    if (useFragment) {
+      streamBlocks += """"sockopt": { "dialerProxy": "fragment" }"""
+    }
 
     return """
       {

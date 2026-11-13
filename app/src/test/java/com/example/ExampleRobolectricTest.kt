@@ -389,6 +389,14 @@ class ExampleRobolectricTest {
         tunMtu = 1400,
         localSocksPort = 20808,
       )
+    org.junit.Assert.assertFalse(
+      "Strict Xray JSON parser rejects unknown field 'remarks'",
+      jsonStr.contains("\"remarks\""),
+    )
+    org.junit.Assert.assertFalse(
+      "Strict Xray JSON parser rejects unknown field 'tcpNoDelay'",
+      jsonStr.contains("\"tcpNoDelay\""),
+    )
     val root = org.json.JSONObject(jsonStr)
     val inbounds = root.getJSONArray("inbounds")
     org.junit.Assert.assertEquals(2, inbounds.length())
@@ -418,14 +426,15 @@ class ExampleRobolectricTest {
       com.example.model.V2RayConfigParser.parseSingleUri(
         "vless://11111111-2222-3333-4444-555555555555@rel.example.org:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&pbk=$realityPubKey&sid=ab12&type=tcp#Reality"
       )!!
-    val realityJson =
-      org.json.JSONObject(
-        com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
-          config = realityCfg,
-          includeTunInbound = true,
-          localSocksPort = 20809,
-        ),
+    val realityRawJson =
+      com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+        config = realityCfg,
+        includeTunInbound = true,
+        localSocksPort = 20809,
       )
+    org.junit.Assert.assertFalse(realityRawJson.contains("\"remarks\""))
+    org.junit.Assert.assertFalse(realityRawJson.contains("\"tcpNoDelay\""))
+    val realityJson = org.json.JSONObject(realityRawJson)
     val realityProxy = realityJson.getJSONArray("outbounds").getJSONObject(0)
     org.junit.Assert.assertEquals(
       "reality",
@@ -443,5 +452,9 @@ class ExampleRobolectricTest {
     )
     assertTrue(com.example.vpn.NativeXrayEngine.supportsNativeXray(vlessWsTls))
     assertTrue(com.example.vpn.NativeXrayEngine.allocateLocalPort() in 1024..65535)
+    com.example.vpn.MehVpnService.emitRealtimeLog(
+      "کانفیگ سریع‌تر پیدا شد",
+      com.example.vpn.VpnLogLevel.SUCCESS,
+    )
   }
 }

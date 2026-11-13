@@ -84,7 +84,7 @@ class MehViewModel(
     const val LOG_TESTING = "تست سرور ها"
     const val LOG_CONNECTING = "در حال اتصال"
     const val LOG_CONNECTED = "متصل"
-    private const val MAX_LOG_LINES = 5
+    private const val MAX_LOG_LINES = 6
 
     private const val PREFS_LAST_SERVER = "meh_last_server_prefs"
     private const val KEY_SAVED_CANDIDATES_JSON = "saved_candidates_json"
@@ -105,6 +105,20 @@ class MehViewModel(
     checkForUpdates()
 
     viewModelScope.launch {
+      MehVpnService.realtimeLogs.collect { event ->
+        val mappedLevel =
+          when (event.level) {
+            com.example.vpn.VpnLogLevel.SUCCESS -> HackerLogLevel.SUCCESS
+            com.example.vpn.VpnLogLevel.ERROR -> HackerLogLevel.ERROR
+            com.example.vpn.VpnLogLevel.SOURCE -> HackerLogLevel.SOURCE
+            com.example.vpn.VpnLogLevel.SCAN -> HackerLogLevel.SCAN
+            com.example.vpn.VpnLogLevel.SYSTEM -> HackerLogLevel.SYSTEM
+          }
+        appendLogLine(message = event.message, level = mappedLevel)
+      }
+    }
+
+    viewModelScope.launch {
       MehVpnService.tunnelSession.collect { session ->
         if (session.isRunning) {
           val wasAlreadyConnected = _uiState.value.phase == MehPhase.CONNECTED
@@ -122,15 +136,17 @@ class MehViewModel(
               serverName = srvName,
               latencyMs = session.currentPingMs,
             )
-            appendLogLine(
-              message = "متصل به ${session.protocolLabel} (پینگ ${session.currentPingMs}ms)",
-              level = HackerLogLevel.SUCCESS,
-            )
           }
+          val connectedHeadline =
+            if (session.serverName.isNotBlank() && session.currentPingMs > 0L) {
+              "$LOG_CONNECTED • ${session.serverName} (${session.currentPingMs}ms)"
+            } else {
+              LOG_CONNECTED
+            }
           _uiState.update { current ->
             current.copy(
               phase = MehPhase.CONNECTED,
-              liveLogLine = LOG_CONNECTED,
+              liveLogLine = connectedHeadline,
               lastConnectedConfig = current.selectedConfig ?: current.lastConnectedConfig,
             )
           }
@@ -418,20 +434,27 @@ class MehViewModel(
           }
           delay(120L)
 
-          // Scan tiers with a strict <350ms early-stop threshold (or up to 25s best-of-scan)
-                    // so slow ~1000ms servers don't stop discovery prematurely.
-                    verifiedCandidates =
-                        repository.scanBestCandidatesAcrossAllTiers(
-                            prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
-                            minScanDurationMs = 25_000L,
-                            earlyStopPingMs = 350L,
-                            excludedEndpointKeys = deadKeys,
-                        ) { logLine ->
-                            appendLogLine(
-                                message = logLine,
-                                level = HackerLogLevel.SCAN,
-                            )
-                        }
+          // Connect immediately to the first verified config under 1000ms (no 60s blocking wait);
+          // background refinement keeps scanning subscriptions for faster servers afterward.
+          verifiedCandidates =
+            repository.scanBestCandidatesAcrossAllTiers(
+              prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+              minScanDurationMs = 0L,
+              earlyStopPingMs = 1000L,
+              excludedEndpointKeys = deadKeys,
+            ) { logLine ->
+              val logLevel =
+                when {
+                  logLine.contains("تایید شد") || logLine.contains("اتصال به اولین") ->
+                    HackerLogLevel.SUCCESS
+                  logLine.contains("دریافت") || logLine.contains("مخزن") -> HackerLogLevel.SOURCE
+                  else -> HackerLogLevel.SCAN
+                }
+              appendLogLine(
+                message = logLine,
+                level = logLevel,
+              )
+            }
 
           if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(
