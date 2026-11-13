@@ -866,7 +866,8 @@ private suspend fun fetchFromSourceList(
                       }
 
                       val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
-                      val throughputKbps = bandwidthJob.await() ?: 45.0
+                      val throughputKbps = bandwidthJob.await() ?: return@withTimeoutOrNull null
+                      if (throughputKbps < 25.0) return@withTimeoutOrNull null
                       val twitterLatency = twitterJob.await()
                       val instagramLatency = instagramJob.await()
                       val tgLatency = tgJob.await()
@@ -1316,15 +1317,30 @@ private suspend fun fetchFromSourceList(
                                             targetBytes = 16_384,
                                         )
                                     }
+                                    val instagramJob = async {
+                                        V2RayOutboundClient.verifyInstagramCapability(
+                                            config = candidate,
+                                            timeoutMs = 3000,
+                                        )
+                                    }
                                     val httpsLatency = httpsJob.await() ?: return@async null
-                                    val throughputKbps = bandwidthJob.await() ?: 0.0
-                                    if (throughputKbps > 0.0 && throughputKbps < 12.0) {
+                                    val throughputKbps = bandwidthJob.await() ?: return@async null
+                                    if (throughputKbps < 25.0) {
                                         return@async null
                                     }
-                                    val realPing = ((candidate.latencyMs + httpsLatency) / 2L).coerceAtLeast(1L)
+                                    val instagramLatency = instagramJob.await()
+                                    val combinedPing =
+                                        if (instagramLatency != null) {
+                                            (candidate.latencyMs + httpsLatency + instagramLatency) / 3L
+                                        } else {
+                                            (candidate.latencyMs + httpsLatency) / 2L
+                                        }
+                                    val realPing = combinedPing.coerceAtLeast(1L)
+                                    val instaBonus = if (instagramLatency != null) 250.0 else 0.0
                                     val score =
                                         (10_000.0 / realPing.toDouble()) +
-                                            (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                                            (throughputKbps.coerceAtMost(2500.0) * 0.85) +
+                                            instaBonus
                                     val verifiedCfg =
                                         candidate.copy(
                                             latencyMs = realPing,
@@ -1334,7 +1350,7 @@ private suspend fun fetchFromSourceList(
                                     onLogUpdate(
                                         "کانفیگ تایید شد: ${verifiedCfg.cleanTitle} (${verifiedCfg.protocol.label} • پینگ ${realPing}ms)",
                                     )
-                                    if (minScanDurationMs <= 0L && realPing < earlyStopPingMs) {
+                                    if (minScanDurationMs <= 0L && realPing < earlyStopPingMs && instagramLatency != null) {
                                         earlyWinnerSignal.complete(verifiedCfg)
                                     }
                                     verifiedCfg

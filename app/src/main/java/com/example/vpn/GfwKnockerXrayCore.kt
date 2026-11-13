@@ -561,13 +561,6 @@ object GfwKnockerXrayCore {
             "port": "53",
             "outboundTag": "dns-out"
           },
-          {
-            "type": "field",
-            "inboundTag": ["tun-in"],
-            "network": "udp",
-            "port": "443",
-            "outboundTag": "block"
-          },
         """.trimIndent()
       } else {
         ""
@@ -581,11 +574,12 @@ object GfwKnockerXrayCore {
         "dns": {
           "tag": "dns-internal",
           "queryStrategy": "UseIPv4",
+          "enableParallelQuery": true,
           "servers": [
             "tcp://8.8.8.8",
             "https://8.8.8.8/dns-query",
             "tcp://1.1.1.1",
-            "8.8.8.8"
+            "https://1.1.1.1/dns-query"
           ]
         },
         "inbounds": [
@@ -621,7 +615,10 @@ object GfwKnockerXrayCore {
           },
           {
             "tag": "dns-out",
-            "protocol": "dns"
+            "protocol": "dns",
+            "settings": {
+              "nonIPQuery": "reject"
+            }
           },
           {
             "tag": "block",

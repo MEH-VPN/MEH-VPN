@@ -244,7 +244,8 @@ class MehVpnService : VpnService() {
         poolCursor.set(0)
       }
 
-      // Establish full-device Android TUN interface (0.0.0.0/0 and ::/0) excluding our own app.
+      // Establish IPv4-only device TUN interface (0.0.0.0/0) excluding our own app so apps
+      // (like Instagram) do not stall on broken IPv6 routes over IPv4-only proxy servers.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
@@ -253,11 +254,6 @@ class MehVpnService : VpnService() {
           .addRoute("0.0.0.0", 0)
           .addDnsServer("8.8.8.8")
           .addDnsServer("1.1.1.1")
-
-      try {
-        builder.addAddress("fd00::10:10:14:2", 64)
-        builder.addRoute("::", 0)
-      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -539,9 +535,104 @@ class MehVpnService : VpnService() {
 
   private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
     if (proxyPort <= 0) return null
-    val httpsPing = verifyHttpsViaProxy(proxyPort, timeoutMs)
-    if (httpsPing != null) return httpsPing
-    return verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
+    val httpsPing =
+      verifyHttpsViaProxy(proxyPort, timeoutMs)
+        ?: verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
+        ?: return null
+    if (!verifyDnsViaProxy(proxyPort, timeoutMs.coerceAtMost(2800))) {
+      return null
+    }
+    return httpsPing
+  }
+
+  /**
+   * Verifies that Xray's `dns-internal` upstreams (`tcp://8.8.8.8` or `https://8.8.8.8/dns-query`)
+   * actually return DNS answers through the active proxy outbound, so apps relying on domain
+   * resolution (Instagram, Chrome, etc.) do not stall after Telegram connects by raw IP.
+   */
+  private fun verifyDnsViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
+    if (verifyTcpDnsQueryViaProxy(proxyPort, timeoutMs)) return true
+    return verifyDohQueryViaProxy(proxyPort, timeoutMs)
+  }
+
+  private fun verifyTcpDnsQueryViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
+    var socket: Socket? = null
+    return try {
+      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+      socket = Socket(proxy)
+      socket.soTimeout = timeoutMs
+      socket.connect(InetSocketAddress.createUnresolved("8.8.8.8", 53), timeoutMs)
+      // Standard DNS A query for instagram.com
+      val dnsPayload =
+        byteArrayOf(
+          0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x09, 'i'.code.toByte(), 'n'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
+          'a'.code.toByte(), 'g'.code.toByte(), 'r'.code.toByte(), 'a'.code.toByte(), 'm'.code.toByte(),
+          0x03, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(),
+          0x00, 0x00, 0x01, 0x00, 0x01,
+        )
+      val out = socket.getOutputStream()
+      out.write(
+        byteArrayOf(
+          ((dnsPayload.size ushr 8) and 0xFF).toByte(),
+          (dnsPayload.size and 0xFF).toByte(),
+        )
+      )
+      out.write(dnsPayload)
+      out.flush()
+      val input = socket.getInputStream()
+      val lenHi = input.read()
+      val lenLo = input.read()
+      if (lenHi < 0 || lenLo < 0) return false
+      val respLen = (lenHi shl 8) or lenLo
+      if (respLen < 12) return false
+      val resp = ByteArray(respLen.coerceAtMost(512))
+      var readTotal = 0
+      while (readTotal < resp.size) {
+        val n = input.read(resp, readTotal, resp.size - readTotal)
+        if (n <= 0) break
+        readTotal += n
+      }
+      if (readTotal < 12) return false
+      val rcode = resp[3].toInt() and 0x0F
+      val answerCount = ((resp[6].toInt() and 0xFF) shl 8) or (resp[7].toInt() and 0xFF)
+      rcode == 0 && answerCount >= 1
+    } catch (_: Exception) {
+      false
+    } finally {
+      try { socket?.close() } catch (_: Exception) {}
+    }
+  }
+
+  private fun verifyDohQueryViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
+    var socket: Socket? = null
+    return try {
+      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+      socket = Socket(proxy)
+      socket.soTimeout = timeoutMs
+      socket.connect(InetSocketAddress.createUnresolved("8.8.8.8", 443), timeoutMs)
+      val (tlsIn, tlsOut) =
+        GfwKnockerXrayCore.openSslEngineOverStreams(
+          sslContext = javax.net.ssl.SSLContext.getDefault(),
+          rawIn = socket.getInputStream(),
+          rawOut = socket.getOutputStream(),
+          sniHost = "dns.google",
+          port = 443,
+          alpnProtocols = arrayOf("http/1.1"),
+        )
+      val req =
+        "GET /resolve?name=instagram.com&type=A HTTP/1.1\r\n" +
+          "Host: dns.google\r\n" +
+          "Connection: close\r\n\r\n"
+      tlsOut.write(req.toByteArray(Charsets.US_ASCII))
+      tlsOut.flush()
+      val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
+      statusLine?.startsWith("HTTP/1.1 200") == true || statusLine?.startsWith("HTTP/2 200") == true
+    } catch (_: Exception) {
+      false
+    } finally {
+      try { socket?.close() } catch (_: Exception) {}
+    }
   }
 
   private fun verifyHttpsViaProxy(proxyPort: Int, timeoutMs: Int): Long? {

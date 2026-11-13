@@ -428,8 +428,16 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("cdn.example.org", stream.getJSONObject("wsSettings").getString("host"))
     org.junit.Assert.assertFalse(stream.has("sockopt"))
 
-    val dnsServers = root.getJSONObject("dns").getJSONArray("servers")
+    val dnsObj = root.getJSONObject("dns")
+    org.junit.Assert.assertTrue(dnsObj.getBoolean("enableParallelQuery"))
+    val dnsServers = dnsObj.getJSONArray("servers")
     org.junit.Assert.assertEquals("tcp://8.8.8.8", dnsServers.getString(0))
+    val dnsOutbound = outbounds.getJSONObject(3)
+    org.junit.Assert.assertEquals("dns-out", dnsOutbound.getString("tag"))
+    org.junit.Assert.assertEquals(
+      "reject",
+      dnsOutbound.getJSONObject("settings").getString("nonIPQuery"),
+    )
 
     val fragJson =
       org.json.JSONObject(
