@@ -722,7 +722,7 @@ private fun MinimalLogList(
           fontFamily = VazirmatnFontFamily,
           fontWeight = if (isLatest) FontWeight.Medium else FontWeight.Normal,
           color = baseColor.copy(alpha = if (isLatest) 0.95f else 0.65f),
-          maxLines = 1,
+          maxLines = if (entry.level == com.example.ui.HackerLogLevel.ERROR) 4 else 1,
           overflow = TextOverflow.Ellipsis,
           textAlign = TextAlign.Center,
         )

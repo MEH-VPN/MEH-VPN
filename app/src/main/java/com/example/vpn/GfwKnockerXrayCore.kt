@@ -458,31 +458,35 @@ object GfwKnockerXrayCore {
     if (config.protocol == V2RayProtocol.SERVERLESS && !includeTunInbound) {
       val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
       val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
+      val socksInboundBlock =
+        if (localSocksPort > 0) {
+          """
+          "inbounds": [
+            {
+              "tag": "socks-in",
+              "port": $localSocksPort,
+              "listen": "127.0.0.1",
+              "protocol": "socks",
+              "settings": { "auth": "noauth", "udp": true, "userLevel": 8 }
+            }
+          ],
+          """.trimIndent()
+        } else {
+          ""
+        }
       return """
         {
           "log": { "loglevel": "warning" },
           "dns": {
             "hosts": { "cloudflare-dns.com": "challenges.cloudflare.com" },
-            "servers": [
-              {
-                "tag": "no-filter-dns",
-                "address": "https://cloudflare-dns.com/dns-query",
-                "timeoutMs": 12000
-              }
-            ]
+            "servers": ["8.8.8.8", "1.1.1.1"]
           },
+          $socksInboundBlock
           "outbounds": [
             {
-              "tag": "tcp-fragment-tls",
+              "tag": "proxy",
               "protocol": "freedom",
-              "settings": {
-                "domainStrategy": "ForceIP",
-                "fragment": {
-                  "packets": "tlshello",
-                  "length": "10-30",
-                  "interval": "1-2"
-                }
-              },
+              "settings": {},
               "streamSettings": {
                 "finalmask": {
                   "tcp": [
@@ -490,7 +494,7 @@ object GfwKnockerXrayCore {
                     { "type": "fragment", "settings": { "packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11" } }
                   ]
                 },
-                "sockopt": { "dialerProxy": "fragment" }
+                "sockopt": { "domainStrategy": "ForceIP" }
               }
             }
           ]
@@ -508,6 +512,10 @@ object GfwKnockerXrayCore {
           "settings": {
             "name": "tun0",
             "mtu": ${tunMtu.coerceIn(1280, 1500)},
+            "gateway": [
+              "10.10.14.1/24",
+              "fd00::10:10:14:1/64"
+            ],
             "userLevel": 8
           },
           "sniffing": {
@@ -578,19 +586,26 @@ object GfwKnockerXrayCore {
             "tag": "fragment",
             "protocol": "freedom",
             "settings": {
-              "domainStrategy": "UseIPv4",
               "fragment": {
                 "packets": "tlshello",
                 "length": "10-25",
                 "interval": "2-5"
+              }
+            },
+            "streamSettings": {
+              "sockopt": {
+                "domainStrategy": "UseIPv4"
               }
             }
           },
           {
             "tag": "direct",
             "protocol": "freedom",
-            "settings": {
-              "domainStrategy": "UseIPv4"
+            "settings": {},
+            "streamSettings": {
+              "sockopt": {
+                "domainStrategy": "UseIPv4"
+              }
             }
           },
           {
@@ -628,7 +643,7 @@ object GfwKnockerXrayCore {
             {
               "type": "field",
               "domain": [
-                "domain:.ir",
+                "domain:ir",
                 "domain:shaparak.ir",
                 "domain:digikala.com",
                 "domain:snapp.ir",
@@ -678,11 +693,15 @@ object GfwKnockerXrayCore {
           "tag": "proxy",
           "protocol": "freedom",
           "settings": {
-            "domainStrategy": "ForceIP",
             "fragment": {
               "packets": "tlshello",
               "length": "10-25",
               "interval": "1-3"
+            }
+          },
+          "streamSettings": {
+            "sockopt": {
+              "domainStrategy": "ForceIP"
             }
           }
         }
@@ -751,7 +770,8 @@ object GfwKnockerXrayCore {
                 "allowedIPs": ["0.0.0.0/0", "::/0"]
               }
             ],
-            "mtu": 1380$reservedField
+            "mtu": 1380,
+            "noKernelTun": true$reservedField
           }
         }
       """.trimIndent()
@@ -854,6 +874,7 @@ object GfwKnockerXrayCore {
         }
 
         V2RayProtocol.SHADOWSOCKS -> {
+          val normalizedCipher = config.cipher.trim().lowercase().ifBlank { "chacha20-ietf-poly1305" }
           val settings =
             """
             {
@@ -861,7 +882,7 @@ object GfwKnockerXrayCore {
                 {
                   "address": ${jsonStr(dialAddress)},
                   "port": ${config.port},
-                  "method": ${jsonStr(config.cipher.ifBlank { "chacha20-ietf-poly1305" })},
+                  "method": ${jsonStr(normalizedCipher)},
                   "password": ${jsonStr(config.authId)}
                 }
               ]
@@ -901,15 +922,16 @@ object GfwKnockerXrayCore {
         """.trimIndent()
     } else if (effectiveSec == "reality") {
       val realitySni = sni.ifBlank { "www.microsoft.com" }
+      val normalizedSpiderX = config.spiderX.trim().ifBlank { "/" }.let { if (it.startsWith("/")) it else "/$it" }
       streamBlocks +=
         """
         "realitySettings": {
           "show": false,
           "fingerprint": "chrome",
           "serverName": ${jsonStr(realitySni)},
-          "publicKey": ${jsonStr(config.pbk)},
-          "shortId": ${jsonStr(config.shortId)},
-          "spiderX": ${jsonStr(config.spiderX.ifBlank { "/" })}
+          "publicKey": ${jsonStr(config.pbk.trim())},
+          "shortId": ${jsonStr(config.shortId.trim())},
+          "spiderX": ${jsonStr(normalizedSpiderX)}
         }
         """.trimIndent()
     }

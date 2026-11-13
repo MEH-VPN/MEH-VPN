@@ -400,7 +400,12 @@ class ExampleRobolectricTest {
     val root = org.json.JSONObject(jsonStr)
     val inbounds = root.getJSONArray("inbounds")
     org.junit.Assert.assertEquals(2, inbounds.length())
-    org.junit.Assert.assertEquals("tun", inbounds.getJSONObject(0).getString("protocol"))
+    val tunInbound = inbounds.getJSONObject(0)
+    org.junit.Assert.assertEquals("tun", tunInbound.getString("protocol"))
+    val tunGateway = tunInbound.getJSONObject("settings").getJSONArray("gateway")
+    org.junit.Assert.assertEquals(2, tunGateway.length())
+    org.junit.Assert.assertEquals("10.10.14.1/24", tunGateway.getString(0))
+    org.junit.Assert.assertEquals("fd00::10:10:14:1/64", tunGateway.getString(1))
     org.junit.Assert.assertEquals("socks", inbounds.getJSONObject(1).getString("protocol"))
     org.junit.Assert.assertEquals(20808, inbounds.getJSONObject(1).getInt("port"))
 
@@ -417,8 +422,16 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("chrome", stream.getJSONObject("tlsSettings").getString("fingerprint"))
     org.junit.Assert.assertEquals("fragment", stream.getJSONObject("sockopt").getString("dialerProxy"))
 
+    val fragmentOutbound = outbounds.getJSONObject(1)
+    org.junit.Assert.assertFalse(fragmentOutbound.getJSONObject("settings").has("domainStrategy"))
+    org.junit.Assert.assertEquals(
+      "UseIPv4",
+      fragmentOutbound.getJSONObject("streamSettings").getJSONObject("sockopt").getString("domainStrategy"),
+    )
+
     val rules = root.getJSONObject("routing").getJSONArray("rules")
-    assertTrue(rules.toString().contains("domain:.ir"))
+    assertTrue(rules.toString().contains("domain:ir"))
+    org.junit.Assert.assertFalse(rules.toString().contains("domain:.ir"))
 
     val realityPubKey =
       java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })
@@ -449,6 +462,53 @@ class ExampleRobolectricTest {
         .getJSONArray("users")
         .getJSONObject(0)
         .getString("flow"),
+    )
+
+    val wgPrivB64 =
+      java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 11).toByte() })
+    val wgPubB64 =
+      java.util.Base64.getEncoder().encodeToString(ByteArray(32) { (it + 21).toByte() })
+    val wgCfg =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "wg://$wgPrivB64@162.159.192.1:2408?publicKey=$wgPubB64&address=172.16.0.2/32&mtu=1280#WARP"
+      )!!
+    val wgJson =
+      org.json.JSONObject(
+        com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+          config = wgCfg,
+          includeTunInbound = true,
+          localSocksPort = 20810,
+        )
+      )
+    assertTrue(
+      wgJson
+        .getJSONArray("outbounds")
+        .getJSONObject(0)
+        .getJSONObject("settings")
+        .getBoolean("noKernelTun")
+    )
+    val serverlessCfg =
+      com.example.model.V2RayConfig(
+        id = "serverless_frag_a",
+        protocol = com.example.model.V2RayProtocol.SERVERLESS,
+        remarks = "Serverless",
+        address = "1.1.1.1",
+        port = 443,
+        authId = "",
+        rawUri = "serverless://frag_a",
+        fragmentProfile = "frag_a",
+      )
+    val serverlessJson =
+      org.json.JSONObject(
+        com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+          config = serverlessCfg,
+          includeTunInbound = false,
+          localSocksPort = 20811,
+        )
+      )
+    org.junit.Assert.assertEquals(
+      "proxy",
+      serverlessJson.getJSONArray("outbounds").getJSONObject(0).getString("tag"),
     )
     assertTrue(com.example.vpn.NativeXrayEngine.supportsNativeXray(vlessWsTls))
     assertTrue(com.example.vpn.NativeXrayEngine.allocateLocalPort() in 1024..65535)
