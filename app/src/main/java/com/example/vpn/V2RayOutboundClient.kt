@@ -725,7 +725,6 @@ object V2RayOutboundClient {
     val resolvedConfig = config.copy(resolvedIp = resolvedIp)
 
     return try {
-      var latencyMs = -1L
       val elapsedNanos =
         measureNanoTime {
           openTunnel(
@@ -761,32 +760,16 @@ object V2RayOutboundClient {
             }
           }
         }
-      latencyMs = (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
-      // Second destination: the node must also reach Cloudflare over plain HTTP. Cloudflare answers plain HTTP with a 301 redirect to HTTPS, so a 2xx or 3xx response counts.
-      val remainingMs = timeoutMs - latencyMs
-      if (remainingMs <= 0L) return null
-      val secondElapsedMs =
-        measureNanoTime {
-          probePlainHttpOverTunnel(
-            resolvedConfig = resolvedConfig,
-            targetHost = "www.cloudflare.com",
-            requestPath = "/",
-            expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/1.1 3"),
-            timeoutMs = remainingMs.toInt().coerceAtLeast(1),
-            protector = protector,
-          )
-        } / 1_000_000L
-      latencyMs = (latencyMs + secondElapsedMs).coerceAtLeast(1L)
-      latencyMs
+      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
     } catch (_: Exception) {
       null
     }
   }
 
   /**
-   * Stage 2 Strict Verification: Opens a SECOND independent V2Ray tunnel to `www.google.com:443`,
-   * performs a real end-to-end TLS handshake with `www.google.com` INSIDE the V2Ray tunnel using
-   * `SSLEngine` with strict-first certificate validation, and verifies `GET /generate_204 -> HTTP/1.1 204`.
+   * Stage 2 Strict Verification: Concurrently verifies `www.google.com:443` (TLS + /generate_204)
+   * and `www.cloudflare.com:443` over the tunnel, returning the true HTTPS RTT (never inflated by
+   * summing sequential cold handshakes).
    */
   fun verifyHttpsAndDnsCapability(
     config: V2RayConfig,
@@ -799,6 +782,23 @@ object V2RayOutboundClient {
     val resolvedConfig = config.copy(resolvedIp = resolvedIp)
 
     return try {
+      val cloudflareFuture =
+        dnsExecutor.submit<Boolean> {
+          try {
+            probeTlsHttpOverTunnel(
+              resolvedConfig = resolvedConfig,
+              targetHost = "www.cloudflare.com",
+              requestPath = "/",
+              expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/2 2", "HTTP/1.1 3", "HTTP/2 3"),
+              timeoutMs = timeoutMs,
+              protector = protector,
+            )
+            true
+          } catch (_: Exception) {
+            false
+          }
+        }
+
       val elapsedNanos =
         measureNanoTime {
           openTunnel(
@@ -834,22 +834,14 @@ object V2RayOutboundClient {
             }
           }
         }
-            val firstMs = (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
-      // Second destination: the node must also reach Cloudflare over TLS.
-      val remainingMs = timeoutMs - firstMs
-      if (remainingMs <= 0L) return null
-      val secondElapsedMs =
-        measureNanoTime {
-          probeTlsHttpOverTunnel(
-            resolvedConfig = resolvedConfig,
-            targetHost = "www.cloudflare.com",
-            requestPath = "/",
-            expectedStatusPrefixes = listOf("HTTP/1.1 2", "HTTP/2 2"),
-            timeoutMs = remainingMs.toInt().coerceAtLeast(1),
-            protector = protector,
-          )
-        } / 1_000_000L
-      (firstMs + secondElapsedMs).coerceAtLeast(1L)
+      val cfOk =
+        try {
+          cloudflareFuture.get(timeoutMs.toLong().coerceAtLeast(500L), TimeUnit.MILLISECONDS)
+        } catch (_: Exception) {
+          false
+        }
+      if (!cfOk) return null
+      (elapsedNanos / 1_000_000L).coerceAtLeast(1L)
     } catch (_: Exception) {
       null
     }

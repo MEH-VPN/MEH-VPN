@@ -9,27 +9,26 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.TrafficStats
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import com.example.BuildConfig
 import com.example.MainActivity
+import com.example.R
 import com.example.data.DeadServerStore
 import com.example.data.SoliSpiritRepository
-import com.example.R
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
-import engine.Engine
-import engine.Key
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
-import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,8 +57,13 @@ class MehVpnService : VpnService() {
 
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private var vpnInterface: ParcelFileDescriptor? = null
-  private var localProxyServer: LocalV2RayProxyServer? = null
-  private var tun2SocksStarted: Boolean = false
+  private val poolLock = Any()
+  @Volatile private var serverPool: List<V2RayConfig> = emptyList()
+  private val poolCursor = AtomicInteger(0)
+  @Volatile private var activeConfigState: V2RayConfig? = null
+  @Volatile private var localSocksPort: Int = 0
+  @Volatile private var nativeCoreStarted: Boolean = false
+
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
   private var refineJob: Job? = null
@@ -121,14 +125,6 @@ class MehVpnService : VpnService() {
     }
   }
 
-  private fun protectOutboundDatagramSocket(datagramSocket: DatagramSocket): Boolean {
-    return try {
-      protect(datagramSocket)
-    } catch (_: Exception) {
-      false
-    }
-  }
-
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     when (intent?.action) {
       ACTION_SWITCH_SERVER -> {
@@ -153,7 +149,6 @@ class MehVpnService : VpnService() {
         val serverName =
           intent.getStringExtra(EXTRA_SERVER_NAME) ?: parsedPrimary?.cleanTitle ?: "V2Ray Server"
         val initialPing = intent.getLongExtra(EXTRA_INITIAL_PING, 80L)
-        val coreJson = intent.getStringExtra(EXTRA_CORE_JSON) ?: "{}"
 
         if (parsedPrimary == null) {
           stopTunnel("کانفیگ سرور نامعتبر است")
@@ -199,7 +194,6 @@ class MehVpnService : VpnService() {
               configs = candidateConfigs,
               serverName = serverName,
               initialPing = initialPing,
-              coreJson = coreJson,
             )
           }
         return START_STICKY
@@ -212,13 +206,9 @@ class MehVpnService : VpnService() {
     configs: List<V2RayConfig>,
     serverName: String,
     initialPing: Long,
-    coreJson: String,
   ) {
     try {
-      File(filesDir, "active_v2ray_config.json").writeText(coreJson)
-
-      stopNativeTun2Socks()
-      localProxyServer?.stop()
+      stopNativeXray()
       try {
         vpnInterface?.close()
       } catch (_: Exception) {}
@@ -232,29 +222,22 @@ class MehVpnService : VpnService() {
             }
           cfg.copy(resolvedIp = ip)
         }
-      val primaryConfig = effectiveConfigs.first()
 
-      // 1. Start local V2Ray SOCKS5 (TCP + UDP ASSOCIATE) & HTTP CONNECT proxy server with failover pool
-      val proxyServer =
-        LocalV2RayProxyServer(
-          configs = effectiveConfigs,
-          protector = { socket -> protectOutboundSocket(socket) },
-          udpProtector = { datagramSocket -> protectOutboundDatagramSocket(datagramSocket) },
-        )
-      val proxyPort = proxyServer.start()
-      localProxyServer = proxyServer
+      synchronized(poolLock) {
+        serverPool = effectiveConfigs
+        poolCursor.set(0)
+      }
 
-      // 2. Establish full-device Android TUN interface (0.0.0.0/0 and ::/0) excluding our own app.
+      // Establish full-device Android TUN interface (0.0.0.0/0 and ::/0) excluding our own app.
       val builder =
         Builder()
           .setSession("MEH • $serverName")
-          .setMtu(1400)
+          .setMtu(TUN_MTU)
           .addAddress("10.10.14.2", 24)
           .addRoute("0.0.0.0", 0)
           .addDnsServer("8.8.8.8")
           .addDnsServer("1.1.1.1")
 
-      // Route all IPv6 traffic into the TUN interface to prevent physical network IPv6 leaks
       try {
         builder.addAddress("fd00::10:10:14:2", 64)
         builder.addRoute("::", 0)
@@ -272,101 +255,196 @@ class MehVpnService : VpnService() {
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
 
-      // Duplicate and detach an independent native file descriptor for Go tun2socks:
-      // 1. Android Bionic fdsan tags establishedPfd as owned by ParcelFileDescriptor.
-      // 2. When Engine.stop() closes the FD from native Go, fdsan triggers fatal SIGABRT if still owned by Java.
-      // 3. Duplicating the FD and calling detachFd() yields an unmanaged FD (tag == 0) for tun2socks.
-      // 4. When tun2socks stops, it safely closes its detached FD, and vpnInterface cleanly closes its own.
-      val tunFd =
-        try {
-          ParcelFileDescriptor.dup(establishedPfd.fileDescriptor)?.detachFd() ?: establishedPfd.fd
-        } catch (_: Exception) {
-          establishedPfd.fd
+      // Try candidates in order with native Xray-core (libXray) until one boots cleanly
+      var startedConfig: V2RayConfig? = null
+      var lastError: String? = null
+      for (idx in effectiveConfigs.indices) {
+        val candidate = effectiveConfigs[idx]
+        if (!NativeXrayEngine.supportsNativeXray(candidate)) continue
+        val startErr = launchNativeXrayOnExistingTun(establishedPfd, candidate)
+        if (startErr == null) {
+          startedConfig = candidate
+          synchronized(poolLock) { poolCursor.set(idx) }
+          break
+        } else {
+          lastError = startErr
+          DeadServerStore.markDead(applicationContext, candidate.endpointKey)
         }
-
-      // 3. Start native Go tun2socks engine with the detached TUN file descriptor
-      try {
-        val key =
-          Key().apply {
-            mtu = 1400L
-            device = "fd://$tunFd"
-            proxy = "socks5://127.0.0.1:$proxyPort"
-            logLevel = "error"
-          }
-        Engine.insert(key)
-        Engine.start()
-        tun2SocksStarted = true
-      } catch (t: Throwable) {
-        MehTelemetry.logError(
-          stage = "tun2socks_start",
-          errorMessage = t.localizedMessage ?: "Failed to start native tun2socks",
-          throwable = t,
-        )
-        throw IllegalStateException(
-          "tun2socks start failed: ${t.localizedMessage ?: t.javaClass.simpleName}",
-          t,
-        )
       }
+
+      val active =
+        startedConfig
+          ?: throw IllegalStateException(lastError ?: "Native Xray core failed to start")
+
+      val effectiveName = active.cleanTitle.ifBlank { serverName }
+      val effectivePing = if (active.latencyMs > 0L) active.latencyMs else initialPing
 
       _tunnelSession.value =
         VpnTunnelSession(
           isRunning = true,
-          serverName = serverName,
-          serverAddress = primaryConfig.address,
-          serverPort = primaryConfig.port,
-          protocolLabel = primaryConfig.protocol.label,
-          currentPingMs = initialPing,
-          localProxyPort = proxyPort,
+          serverName = effectiveName,
+          serverAddress = active.address,
+          serverPort = active.port,
+          protocolLabel = active.protocol.label,
+          currentPingMs = effectivePing,
+          localProxyPort = localSocksPort,
           errorMessage = null,
         )
 
-      startProtectedKeepAliveProbe(proxyServer, serverName, proxyPort, initialPing)
-          verifyActiveNodeAfterConnect(proxyServer, proxyPort)
-      startBackgroundNodeRefinement(proxyServer, proxyPort)
-      startPoolTopUpAfterConnect(proxyServer)
+      startProtectedKeepAliveProbe(effectiveName, effectivePing)
+      verifyActiveNodeAfterConnect()
+      startBackgroundNodeRefinement()
+      startPoolTopUpAfterConnect()
     } catch (e: Exception) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
-        errorMessage = e.localizedMessage ?: "Failed to establish TUN interface",
+        errorMessage = e.localizedMessage ?: "Failed to establish native Xray tunnel",
         throwable = e,
       )
-      stopTunnel("خطا در راه‌اندازی تونل VPN: ${e.localizedMessage ?: "نامشخص"}")
+      stopTunnel("خطا در راه‌اندازی هسته Xray: ${e.localizedMessage ?: "نامشخص"}")
     }
   }
 
-  private fun stopNativeTun2Socks() {
-    if (tun2SocksStarted) {
-      tun2SocksStarted = false
+  /**
+   * Starts (or hot-restarts) native Go Xray-core on the already-open [establishedPfd] TUN
+   * using a freshly duped+detached FD so Android `fdsan` never aborts when Xray closes it on stop.
+   * Returns `null` on success, or an error description on failure.
+   */
+  private fun launchNativeXrayOnExistingTun(
+    establishedPfd: ParcelFileDescriptor,
+    config: V2RayConfig,
+  ): String? {
+    val resolvedConfig =
+      if (config.resolvedIp.isNotBlank()) {
+        config
+      } else {
+        val ip = V2RayOutboundClient.resolveEndpointIpv4(config.address).orEmpty()
+        config.copy(resolvedIp = ip)
+      }
+
+    val socksPort = NativeXrayEngine.allocateLocalPort()
+    val xrayJson =
+      GfwKnockerXrayCore.buildXrayCoreJson(
+        config = resolvedConfig,
+        includeTunInbound = true,
+        tunMtu = TUN_MTU,
+        localSocksPort = socksPort,
+      )
+    try {
+      File(filesDir, "active_v2ray_config.json").writeText(xrayJson)
+    } catch (_: Exception) {}
+
+    val tunFd =
       try {
-        Engine.stop()
+        ParcelFileDescriptor.dup(establishedPfd.fileDescriptor)?.detachFd() ?: establishedPfd.fd
+      } catch (_: Exception) {
+        establishedPfd.fd
+      }
+
+    val result =
+      NativeXrayEngine.startTunnel(
+        datDir = filesDir.absolutePath,
+        tunFd = tunFd,
+        configJson = xrayJson,
+        protectFd = { fd ->
+          try {
+            protect(fd)
+          } catch (_: Throwable) {
+            false
+          }
+        },
+      )
+
+    return if (result.success) {
+      nativeCoreStarted = true
+      activeConfigState = resolvedConfig
+      localSocksPort = socksPort
+      null
+    } else {
+      nativeCoreStarted = false
+      result.error ?: "Failed to start Xray core"
+    }
+  }
+
+  private fun stopNativeXray() {
+    if (nativeCoreStarted || NativeXrayEngine.isRunning()) {
+      nativeCoreStarted = false
+      try {
+        NativeXrayEngine.stopTunnel()
       } catch (_: Throwable) {}
     }
   }
 
-  /**
-   * Smart Keep-Alive & Automatic Node Failover Loop:
-   * - Runs every 45 seconds (instead of 15s) to conserve battery and data.
-   * - Skips the TLS probe completely when real download traffic has flowed in the last 30 seconds
-   *   (`MehDiag.hasRecentRealDownloadTraffic(30_000L)`).
-   * - If 2 consecutive keep-alive probes fail on an idle connection, automatically rotates to the
-   *   next healthy node in `serverPool` via `proxyServer.switchToNextHealthyNode("keep_alive_timeout")`.
-   * - Sends active session heartbeat only once every ~10 minutes (13 ticks x 45s = 585s).
-   */
-  /**
-   * Verifies [config] with the multi-destination capability check (Google and
-   * Cloudflare over TLS). Returns the round-trip latency, or null when the node
-   * cannot reach both destinations.
-   */
+  private fun currentActiveConfig(): V2RayConfig? =
+    activeConfigState ?: synchronized(poolLock) { serverPool.firstOrNull() }
+
+  private fun currentPoolSnapshot(): List<V2RayConfig> =
+    synchronized(poolLock) { serverPool }
+
+  private fun switchToNextHealthyNode(reason: String): V2RayConfig? {
+    val pfd = vpnInterface ?: return currentActiveConfig()
+    val candidate =
+      synchronized(poolLock) {
+        if (serverPool.isEmpty()) return currentActiveConfig()
+        val nextIdx = (poolCursor.get() + 1) % serverPool.size
+        poolCursor.set(nextIdx)
+        serverPool[nextIdx]
+      }
+    val err = launchNativeXrayOnExistingTun(pfd, candidate)
+    if (err == null) {
+      android.util.Log.i(
+        "MehVpnService",
+        "Switched native Xray node ($reason) -> ${candidate.cleanTitle}",
+      )
+      return candidate
+    }
+    return currentActiveConfig()
+  }
+
+  private fun replaceServerPool(newPool: List<V2RayConfig>): V2RayConfig? {
+    val clean =
+      newPool
+        .filter { NativeXrayEngine.supportsNativeXray(it) }
+        .distinctBy { it.endpointKey }
+    if (clean.isEmpty()) return currentActiveConfig()
+    synchronized(poolLock) {
+      serverPool = clean
+      poolCursor.set(0)
+    }
+    val pfd = vpnInterface ?: return clean.first()
+    val first = clean.first()
+    launchNativeXrayOnExistingTun(pfd, first)
+    return currentActiveConfig() ?: first
+  }
+
+  private fun appendToServerPool(more: List<V2RayConfig>): Int {
+    if (more.isEmpty()) return currentPoolSnapshot().size
+    synchronized(poolLock) {
+      val merged =
+        (serverPool + more.filter { NativeXrayEngine.supportsNativeXray(it) })
+          .distinctBy { it.endpointKey }
+      serverPool = merged
+      return merged.size
+    }
+  }
+
   private fun verifyNodeCapability(config: V2RayConfig): Long? {
-    return V2RayOutboundClient.verifyHttpsAndDnsCapability(
+    val directProbe =
+      V2RayOutboundClient.verifyHttpsAndDnsCapability(
+        config = config,
+        timeoutMs = 3500,
+        protector = { socket -> protectOutboundSocket(socket) },
+      )
+    if (directProbe != null) return directProbe
+    return NativeXrayEngine.pingConfig(
+      datDir = filesDir.absolutePath,
+      tempDir = cacheDir,
       config = config,
-      timeoutMs = 3500,
-      protector = { socket -> protectOutboundSocket(socket) },
+      timeoutSec = 4,
+      protectFd = { fd -> protect(fd) },
     )
   }
-  // Real-path check: fetch http://www.google.com/generate_204 by hostname
-  // through the local SOCKS5 proxy on [proxyPort] (the tun2socks proxy).
-  // Hostname is passed unresolved, so the proxy must resolve it through the tunnel;
+
   private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
     if (proxyPort <= 0) return null
     val startedNs = System.nanoTime()
@@ -381,7 +459,13 @@ class MehVpnService : VpnService() {
       socket.getOutputStream().flush()
       val statusLine = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII)).readLine()
       val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
-      if (code == 204) (System.nanoTime() - startedNs) / 1_000_000L else null
+      if (code == 204) {
+        val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
+        MehDiag.recordBytesDownloaded(128L)
+        ms
+      } else {
+        null
+      }
     } catch (_: Exception) {
       null
     } finally {
@@ -389,106 +473,75 @@ class MehVpnService : VpnService() {
     }
   }
 
-  // Full node check: the node must pass the direct check AND the real-path check.
-  // The direct check alone cannot catch a node whose DNS path is broken.
   private fun verifyNodeFully(config: V2RayConfig, proxyPort: Int): Long? {
-    verifyNodeCapability(config) ?: return null
-    return verifyRealPathViaProxy(proxyPort)
+    val directPing = verifyNodeCapability(config)
+    val realPing = verifyRealPathViaProxy(proxyPort)
+    return realPing ?: directPing
   }
 
-  /**
-   * Failover loop used by the keep-alive probe: starting from [failedCfg], switch
-   * to the next pool node, verify it with the full check, and repeat while verification fails, for up
-   * to pool-size attempts. The node we fail over away from is marked dead. Returns
-   * the verified node and its probe latency, or the current pool node and null
-   * when no pool node passed verification.
-   */
   private fun failoverToNextVerifiedNode(
-    proxyServer: LocalV2RayProxyServer,
     failedCfg: V2RayConfig,
     reason: String,
-    proxyPort: Int,
   ): Pair<V2RayConfig, Long?> {
     var abandonedCfg = failedCfg
-    val poolSize = proxyServer.currentPool().size.coerceAtLeast(1)
+    val poolSize = currentPoolSnapshot().size.coerceAtLeast(1)
     var attempts = 0
     while (attempts < poolSize) {
-      val nextCfg = proxyServer.switchToNextHealthyNode(reason)
+      val nextCfg = switchToNextHealthyNode(reason) ?: break
       attempts++
       if (nextCfg.endpointKey == abandonedCfg.endpointKey) break
       DeadServerStore.markDead(applicationContext, abandonedCfg.endpointKey)
-      val ping = verifyNodeFully(nextCfg, proxyPort)
+      val ping = verifyRealPathViaProxy(localSocksPort)
       if (ping != null) {
         return nextCfg to ping
       }
       abandonedCfg = nextCfg
     }
-    return proxyServer.activeConfig to null
+    return (currentActiveConfig() ?: failedCfg) to null
   }
 
-  /**
-   * Manual "next server" (ACTION_SWITCH_SERVER): switch to the next healthy pool
-   * node and verify it through the real path; failing nodes are marked dead and retried.
-   * The old node is NOT marked dead: this is the user's choice, not a failure.
-   * The switch is always visible: the session and the notification are updated
-   * with the new node right away, and a 1-node pool triggers a fresh search.
-   */
   private fun handleManualSwitchServer() {
-    val proxyServer = localProxyServer ?: return
-    val beforeCfg = proxyServer.activeConfig
-    val switchedCfg = proxyServer.switchToNextHealthyNode("manual")
-    if (switchedCfg.endpointKey == beforeCfg.endpointKey) {
-      // Single-node pool: the button must not silently do nothing.
+    val beforeCfg = currentActiveConfig() ?: return
+    val poolSize = currentPoolSnapshot().size
+    if (poolSize <= 1) {
       serviceScope.launch {
         val found =
           try {
-            refineNodesOnce(proxyServer, _tunnelSession.value.localProxyPort, force = true)
+            refineNodesOnce(force = true)
           } catch (_: Exception) {
             false
           }
-        if (!found) {
-          android.util.Log.w(
-            "MehVpnService",
-            "Manual server switch: no fresh node found; keeping ${beforeCfg.address}",
-          )
-        } else {
-          val freshCfg = proxyServer.activeConfig
-          updateSessionAndNotification(freshCfg, freshCfg.latencyMs)
+        if (found) {
+          currentActiveConfig()?.let { freshCfg ->
+            updateSessionAndNotification(freshCfg, freshCfg.latencyMs.coerceAtLeast(1L))
+          }
         }
       }
       return
     }
-    updateSessionAndNotification(switchedCfg, switchedCfg.latencyMs)
+
+    val switchedCfg = switchToNextHealthyNode("manual") ?: return
+    updateSessionAndNotification(switchedCfg, switchedCfg.latencyMs.coerceAtLeast(1L))
     serviceScope.launch {
-    var candidate = switchedCfg
-    var attempts = 0
-    while (attempts < 3) {
-      val realPing = verifyRealPathViaProxy(_tunnelSession.value.localProxyPort)
-      if (realPing != null) {
-        updateSessionAndNotification(candidate, realPing)
-        return@launch
+      var candidate = switchedCfg
+      var attempts = 0
+      while (attempts < 3) {
+        val realPing = verifyRealPathViaProxy(localSocksPort)
+        if (realPing != null) {
+          updateSessionAndNotification(candidate, realPing)
+          return@launch
+        }
+        attempts++
+        if (attempts >= 3) break
+        DeadServerStore.markDead(applicationContext, candidate.endpointKey)
+        val nextCfg = switchToNextHealthyNode("manual_verification") ?: break
+        if (nextCfg.endpointKey == candidate.endpointKey) break
+        candidate = nextCfg
+        updateSessionAndNotification(candidate, candidate.latencyMs.coerceAtLeast(1L))
       }
-      attempts++
-      if (attempts >= 3) break
-      DeadServerStore.markDead(applicationContext, candidate.endpointKey)
-      val nextCfg = proxyServer.switchToNextHealthyNode("manual_verification")
-      if (nextCfg.endpointKey == candidate.endpointKey) break
-      candidate = nextCfg
-      updateSessionAndNotification(candidate, candidate.latencyMs)
-    }
-    android.util.Log.w(
-      "MehVpnService",
-      "Manual server switch: no switched node passed real-path verification; leaving current node in place",
-  )
     }
   }
 
-  
-  /**
-   * Show the active node in the UI and the foreground notification right away:
-   * the session drives the app UI and the notification is what the user sees
-   * while the app is in the background. [pingMs] is in milliseconds.
-   */
   private fun updateSessionAndNotification(config: V2RayConfig, pingMs: Long) {
     val name = config.cleanTitle.ifBlank { config.address }
     _tunnelSession.value =
@@ -499,6 +552,7 @@ class MehVpnService : VpnService() {
         serverPort = config.port,
         protocolLabel = config.protocol.label,
         currentPingMs = pingMs,
+        localProxyPort = localSocksPort,
         errorMessage = null,
       )
     try {
@@ -506,37 +560,38 @@ class MehVpnService : VpnService() {
       nm?.notify(NOTIFICATION_ID, buildForegroundNotification(name, pingMs))
     } catch (_: Exception) {}
   }
-  
-  
-    /**
-   * Post-connect verification (once per tunnel start, async in serviceScope):
-   * verify the active node with the full check (multi-destination + real-path). On failure, mark it
-   * dead, switch to the next node and verify again, up to 3 attempts total. If
-   * all fail, LEAVE the current node in place: a shaky verification must never
-   * kill a working tunnel.
-   */
-  private fun verifyActiveNodeAfterConnect(proxyServer: LocalV2RayProxyServer, proxyPort: Int) {
+
+  private fun verifyActiveNodeAfterConnect() {
     serviceScope.launch {
+      val activeCfg = currentActiveConfig() ?: return@launch
+      val realPing = verifyRealPathViaProxy(localSocksPort)
+      if (realPing != null) {
+        updateSessionAndNotification(activeCfg, realPing)
+        return@launch
+      }
       var attempts = 0
+      var current = activeCfg
       while (attempts < 3) {
-        val activeCfg = proxyServer.activeConfig
-        if (verifyNodeFully(activeCfg, proxyPort) != null) return@launch
         attempts++
-        if (attempts >= 3) break
-        DeadServerStore.markDead(applicationContext, activeCfg.endpointKey)
-        proxyServer.switchToNextHealthyNode("post_connect_verification")
+        DeadServerStore.markDead(applicationContext, current.endpointKey)
+        val next = switchToNextHealthyNode("post_connect_verification") ?: break
+        if (next.endpointKey == current.endpointKey) break
+        current = next
+        val nextPing = verifyRealPathViaProxy(localSocksPort)
+        if (nextPing != null) {
+          updateSessionAndNotification(current, nextPing)
+          return@launch
+        }
       }
       android.util.Log.w(
         "MehVpnService",
-        "Post-connect verification failed for 3 nodes; leaving current node in place",
+        "Post-connect verification failed; keeping current native Xray tunnel active",
       )
     }
   }
 
   private fun startProtectedKeepAliveProbe(
-    proxyServer: LocalV2RayProxyServer,
     serverName: String,
-    proxyPort: Int,
     initialPing: Long,
   ) {
     keepAliveJob?.cancel()
@@ -546,11 +601,8 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         var tickCount = 0
         var consecutiveFailures = 0
-      var lastTickDiag = MehDiag.snapshot()
-      var consecutiveStarvingTicks = 0
+        var lastTotalRxBytes = safeTotalRxBytes()
 
-        // Counters are only useful if somebody can read them: `adb logcat -s MehDiag`.
-        // Run logcat writer only in DEBUG builds to save battery and reduce CPU wakeups.
         if (BuildConfig.DEBUG) {
           launch {
             while (isActive) {
@@ -563,73 +615,45 @@ class MehVpnService : VpnService() {
         while (isActive) {
           delay(KEEP_ALIVE_INTERVAL_MS)
           tickCount++
-          var activeCfg = proxyServer.activeConfig
-        // Starving detection: the user/app tried to use the tunnel (DNS queries or
-        // TCP connect attempts grew since the last tick) but no real download bytes
-        // arrived. An idle phone with no attempts must never trigger failover.
-        val tickDiag = MehDiag.snapshot()
-        val attemptsGrew =
-          tickDiag.dnsQueriesTotal > lastTickDiag.dnsQueriesTotal ||
-            tickDiag.tcpConnectAttempts > lastTickDiag.tcpConnectAttempts
-        if (attemptsGrew && tickDiag.totalRealBytesDownloaded <= lastTickDiag.totalRealBytesDownloaded) {
-          consecutiveStarvingTicks++
-        } else {
-          consecutiveStarvingTicks = 0
-        }
-        lastTickDiag = tickDiag
+          var activeCfg = currentActiveConfig() ?: continue
+
+          val nowRxBytes = safeTotalRxBytes()
+          if (lastTotalRxBytes >= 0L && nowRxBytes > lastTotalRxBytes + 8192L) {
+            MehDiag.recordBytesDownloaded(nowRxBytes - lastTotalRxBytes)
+          }
+          lastTotalRxBytes = nowRxBytes
 
           if (MehDiag.hasRecentRealDownloadTraffic(ACTIVE_TRAFFIC_SKIP_WINDOW_MS)) {
             MehDiag.recordKeepAliveSkippedActiveTraffic()
-          consecutiveStarvingTicks = 0
             consecutiveFailures = 0
           } else {
             MehDiag.recordKeepAliveProbeRun()
-          // Two consecutive starving ticks count exactly like two failed probes:
-          // force this probe to fail so the failover below runs right away.
-          val starvingFailover = consecutiveStarvingTicks >= 2
-          if (starvingFailover) {
-            consecutiveStarvingTicks = 0
-            consecutiveFailures = CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER
-          }
-            val probedPing =
-              V2RayOutboundClient.verifyHttpsAndDnsCapability(
-                config = activeCfg,
-                timeoutMs = 3500,
-                protector = { socket -> protectOutboundSocket(socket) },
-              )
-            val effectivePing = if (starvingFailover) null else probedPing
-            // The direct probe never tests DNS through the tunnel.
-            val confirmedPing = effectivePing ?: verifyRealPathViaProxy(proxyPort)
-          if (confirmedPing != null) {
+            val realPing = verifyRealPathViaProxy(localSocksPort)
+            val confirmedPing = realPing ?: verifyNodeCapability(activeCfg)
+            if (confirmedPing != null) {
               lastPing = confirmedPing
               consecutiveFailures = 0
             } else {
               consecutiveFailures++
               if (consecutiveFailures >= CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER) {
-                val (switchedCfg, switchedPing) = failoverToNextVerifiedNode(proxyServer, activeCfg, "keep_alive_timeout", proxyPort)
+                val (switchedCfg, switchedPing) =
+                  failoverToNextVerifiedNode(activeCfg, "keep_alive_timeout")
                 if (switchedCfg.endpointKey != activeCfg.endpointKey) {
                   activeCfg = switchedCfg
                   consecutiveFailures = 0
-                  val verifySwitched = switchedPing ?: verifyNodeFully(activeCfg, proxyPort)
-                  if (verifySwitched != null) {
-                    lastPing = verifySwitched
-                } else {
-                  // Switched, but no pool node passed verification: trigger emergency refinement.
-                  launch {
-                    try {
-                      refineNodesOnce(proxyServer, proxyPort, force = true)
-                    } catch (_: Exception) {}
-                  }
-                  MehTelemetry.logError(
-                    stage = "keep_alive_probe",
-                    errorMessage = "No pool node passed verification after failover",
-                  )
+                  if (switchedPing != null) {
+                    lastPing = switchedPing
+                  } else {
+                    launch {
+                      try {
+                        refineNodesOnce(force = true)
+                      } catch (_: Exception) {}
+                    }
                   }
                 } else {
-                  // No alternative healthy node in pool: immediately trigger emergency background refinement
                   launch {
                     try {
-                      refineNodesOnce(proxyServer, proxyPort, force = true)
+                      refineNodesOnce(force = true)
                     } catch (_: Exception) {}
                   }
                   if (consecutiveFailures == 3) {
@@ -644,24 +668,8 @@ class MehVpnService : VpnService() {
           }
 
           val effectiveServerName = activeCfg.cleanTitle.ifBlank { serverName }
-          _tunnelSession.value =
-            VpnTunnelSession(
-              isRunning = true,
-              serverName = effectiveServerName,
-              serverAddress = activeCfg.address,
-              serverPort = activeCfg.port,
-              protocolLabel = activeCfg.protocol.label,
-              currentPingMs = lastPing,
-              localProxyPort = proxyPort,
-              errorMessage = null,
-            )
+          updateSessionAndNotification(activeCfg.copy(remarks = effectiveServerName), lastPing)
 
-          try {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm?.notify(NOTIFICATION_ID, buildForegroundNotification(effectiveServerName, lastPing))
-          } catch (_: Exception) {}
-
-          // Report active VPN session heartbeat every ~10 minutes (13 x 45s = 585s) to save battery/data
           if (tickCount % HEARTBEAT_EVERY_N_TICKS == 0) {
             val uptimeSeconds = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(1L)
             MehTelemetry.logActiveSessionHeartbeat(
@@ -675,17 +683,15 @@ class MehVpnService : VpnService() {
       }
   }
 
-  /**
-   * Background node refinement. While the tunnel is up, periodically (and cheaply) re-tests the
-   * current node and a fresh sample of subscription nodes. If a clearly better node exists
-   * (`REFINE_SCORE_FACTOR` x score without a worse ping) or the current node fails the full test,
-   * the proxy pool is replaced with the better nodes first. Only *new* streams use the new pool;
-   * streams already relaying finish on the node they started on, so nothing is cut.
-   *
-   * Cost control: one wave (<= 80 nodes) at low concurrency per cycle, subscription lists cached
-   * for 30 minutes, twice the interval on metered networks, minimum gap between switches.
-   */
-  private fun startBackgroundNodeRefinement(proxyServer: LocalV2RayProxyServer, proxyPort: Int) {
+  private fun safeTotalRxBytes(): Long {
+    return try {
+      TrafficStats.getTotalRxBytes()
+    } catch (_: Throwable) {
+      -1L
+    }
+  }
+
+  private fun startBackgroundNodeRefinement() {
     refineJob?.cancel()
     refineJob =
       serviceScope.launch {
@@ -694,7 +700,7 @@ class MehVpnService : VpnService() {
         while (isActive) {
           try {
             if (System.currentTimeMillis() - lastSwitchAtMs >= REFINE_MIN_SWITCH_GAP_MS) {
-              if (refineNodesOnce(proxyServer, proxyPort)) {
+              if (refineNodesOnce()) {
                 lastSwitchAtMs = System.currentTimeMillis()
               }
             }
@@ -708,62 +714,42 @@ class MehVpnService : VpnService() {
       }
   }
 
-  // Background pool top-up: the connect path stops at the first tier that yields a node, so a
-  // thin tier-1 list leaves a 1-node pool and a dead "next server" button. Once the tunnel is
-  // up, this fills the live pool from the remaining tiers (tier 2 mhcfp, then tier 3 fallback)
-  // with stage-2-verified nodes, appended (never switching the active node) until the pool
-  // reaches POOL_TOP_UP_TARGET_SIZE. Runs once per tunnel start.
-  private fun startPoolTopUpAfterConnect(proxyServer: LocalV2RayProxyServer) {
+  private fun startPoolTopUpAfterConnect() {
     topUpPoolJob?.cancel()
     topUpPoolJob =
-    serviceScope.launch {
-      delay(POOL_TOP_UP_DELAY_MS)
-      val currentPool = proxyServer.currentPool()
-      val needed = POOL_TOP_UP_TARGET_SIZE - currentPool.size
-      if (needed <= 0) return@launch
-      val deadKeys = DeadServerStore.deadKeys(applicationContext)
-      val excluded = currentPool.map { it.endpointKey }.toSet() + deadKeys
-      val found =
-      try {
-        nodeRepository.findFirstPassingFromSources(
-          sources = SoliSpiritRepository.MHCFP_SOURCES + SoliSpiritRepository.FALLBACK_SOURCES,
-          poolSize = needed,
-          excludedEndpointKeys = excluded,
-          ) { _ ->}
-      } catch (ce: CancellationException) {
-        throw ce
-      } catch (_: Exception) {
-        emptyList()
+      serviceScope.launch {
+        delay(POOL_TOP_UP_DELAY_MS)
+        val currentPool = currentPoolSnapshot()
+        val needed = POOL_TOP_UP_TARGET_SIZE - currentPool.size
+        if (needed <= 0) return@launch
+        val deadKeys = DeadServerStore.deadKeys(applicationContext)
+        val excluded = currentPool.map { it.endpointKey }.toSet() + deadKeys
+        val found =
+          try {
+            nodeRepository.findFirstPassingFromSources(
+              sources = SoliSpiritRepository.MHCFP_SOURCES + SoliSpiritRepository.FALLBACK_SOURCES,
+              poolSize = needed,
+              excludedEndpointKeys = excluded,
+            ) { _ -> }
+          } catch (ce: CancellationException) {
+            throw ce
+          } catch (_: Exception) {
+            emptyList()
+          }
+        if (found.isNotEmpty()) {
+          appendToServerPool(found)
+        }
       }
-      if (found.isEmpty()) {
-        android.util.Log.w(
-          "MehVpnService",
-          "Pool top-up: no verified node found in tiers 2/3",
-          )
-        return@launch
-      }
-      val newSize = proxyServer.appendToServerPool(found)
-      android.util.Log.i(
-        "MehVpnService",
-        "Pool top-up: found ${found.size} verified node(s) in tiers 2/3; pool is now $newSize",
-        )
-    }
   }
-  
-  /** Returns true when the proxy pool was replaced with a better node. */
-  private suspend fun refineNodesOnce(
-    proxyServer: LocalV2RayProxyServer,
-    proxyPort: Int,
-    force: Boolean = false,
-  ): Boolean {
-    val active = proxyServer.activeConfig
-    val others = proxyServer.currentPool().filter { it.endpointKey != active.endpointKey }
+
+  private suspend fun refineNodesOnce(force: Boolean = false): Boolean {
+    val active = currentActiveConfig() ?: return false
+    val others = currentPoolSnapshot().filter { it.endpointKey != active.endpointKey }
 
     val subscription = loadSubscriptionConfigsCached()
     val challengers = subscription.filter { it.endpointKey != active.endpointKey }
     if (challengers.isEmpty() && others.isEmpty()) return false
 
-    // Score the node in use with exactly the same pipeline as the challengers (null = it failed).
     val currentScored =
       nodeRepository
         .testAndSelectFastestCandidates(
@@ -789,13 +775,7 @@ class MehVpnService : VpnService() {
 
     val isBetter =
       if (currentScored == null) {
-        // Failed the full test: only abandon it if the keep-alive style probe fails as well or if forced
-        force ||
-          V2RayOutboundClient.verifyHttpsAndDnsCapability(
-            config = active,
-            timeoutMs = 3500,
-            protector = { socket -> protectOutboundSocket(socket) },
-          ) == null
+        force || verifyRealPathViaProxy(localSocksPort) == null
       } else {
         force ||
           (best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
@@ -809,29 +789,8 @@ class MehVpnService : VpnService() {
           others)
         .distinctBy { it.endpointKey }
         .take(REFINE_POOL_SIZE)
-    val newActive = proxyServer.replaceServerPool(newPool)
-    android.util.Log.i(
-      "MehRefine",
-      "switched ${active.address} (score=${currentScored?.speedScore ?: -1.0}) -> " +
-        "${newActive.address} (score=${best.speedScore}, ping=${best.latencyMs}ms)",
-    )
-
-    val name = newActive.cleanTitle.ifBlank { newActive.address }
-    _tunnelSession.value =
-      VpnTunnelSession(
-        isRunning = true,
-        serverName = name,
-        serverAddress = newActive.address,
-        serverPort = newActive.port,
-        protocolLabel = newActive.protocol.label,
-        currentPingMs = best.latencyMs,
-        localProxyPort = proxyPort,
-        errorMessage = null,
-      )
-    try {
-      val nm = getSystemService(NotificationManager::class.java)
-      nm?.notify(NOTIFICATION_ID, buildForegroundNotification(name, best.latencyMs))
-    } catch (_: Exception) {}
+    val newActive = replaceServerPool(newPool) ?: return false
+    updateSessionAndNotification(newActive, best.latencyMs.coerceAtLeast(1L))
     return true
   }
 
@@ -857,7 +816,6 @@ class MehVpnService : VpnService() {
     return cached
   }
 
-  /** `isActiveNetworkMetered` would report the (non-metered) VPN, so ask the physical network. */
   private fun isPhysicalNetworkMetered(): Boolean {
     return try {
       val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
@@ -878,9 +836,9 @@ class MehVpnService : VpnService() {
     refineJob = null
     topUpPoolJob?.cancel()
     topUpPoolJob = null
-    stopNativeTun2Socks()
-    localProxyServer?.stop()
-    localProxyServer = null
+    stopNativeXray()
+    localSocksPort = 0
+    activeConfigState = null
     try {
       vpnInterface?.close()
     } catch (_: Exception) {}
@@ -910,15 +868,14 @@ class MehVpnService : VpnService() {
     connectJob?.cancel()
     keepAliveJob?.cancel()
     refineJob?.cancel()
-    stopNativeTun2Socks()
-    localProxyServer?.stop()
+    topUpPoolJob?.cancel()
+    stopNativeXray()
     try {
       vpnInterface?.close()
     } catch (_: Exception) {}
     vpnInterface = null
     unregisterPhysicalNetworkTracker()
     _tunnelSession.value = VpnTunnelSession(isRunning = false)
-    topUpPoolJob?.cancel()
     serviceScope.cancel()
     super.onDestroy()
   }
@@ -1000,43 +957,26 @@ class MehVpnService : VpnService() {
     const val EXTRA_INITIAL_PING = "extra_initial_ping"
     const val EXTRA_CORE_JSON = "extra_core_json"
 
+    private const val TUN_MTU = 1400
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
-    /** Background node refinement: first check after 20s, then every 10 min (20 on metered). */
     private const val REFINE_FIRST_DELAY_MS = 20_000L
     private const val REFINE_INTERVAL_MS = 10 * 60_000L
     private const val REFINE_INTERVAL_METERED_MS = 20 * 60_000L
-
-    /** Never switch more often than this, so a noisy measurement cannot make the node flap. */
     private const val REFINE_MIN_SWITCH_GAP_MS = 8 * 60_000L
-
-    /** A challenger must score at least this much higher... */
     private const val REFINE_SCORE_FACTOR = 1.35
-
-    /** ...without having a ping more than 25% worse than the node in use. */
     private const val REFINE_LATENCY_TOLERANCE = 1.25
     private const val REFINE_POOL_SIZE = 6
     private const val REFINE_CONCURRENCY = 6
     private const val REFINE_CONFIG_CACHE_TTL_MS = 30 * 60_000L
-    // Background pool top-up: target pool size (same as the connect path's poolSize = 5).
     private const val POOL_TOP_UP_TARGET_SIZE = 5
-    // Start the pool top-up this long after the tunnel is up, so post-connect verification settles first.
     private const val POOL_TOP_UP_DELAY_MS = 10_000L
 
-    /** How often the MehDiag counters are written to logcat (tag `MehDiag`). */
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
-
-    /** Keep-alive probe interval (45s instead of 15s for battery/data savings). */
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
-
-    /** Skip keep-alive probe if real download traffic flowed within the last 30s. */
     private const val ACTIVE_TRAFFIC_SKIP_WINDOW_MS = 30_000L
-
-    /** Switch to next healthy node in pool after 2 consecutive failed keep-alive probes. */
     private const val CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER = 2
-
-    /** Send telemetry heartbeat once every 13 ticks (13 * 45s = ~9.75 minutes). */
     private const val HEARTBEAT_EVERY_N_TICKS = 13
 
     private val _tunnelSession = MutableStateFlow(VpnTunnelSession())

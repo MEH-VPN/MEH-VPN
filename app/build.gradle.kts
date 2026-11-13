@@ -120,7 +120,10 @@ dependencies {
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
-  implementation(libs.tun2socks)
+  // Replaced by native Xray-core (libxray) with built-in proxy/tun to avoid libgojni.so symbol collisions
+  // implementation(libs.tun2socks)
+  implementation(libs.libxray)
+  // implementation(libs.hevtunnel)
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)

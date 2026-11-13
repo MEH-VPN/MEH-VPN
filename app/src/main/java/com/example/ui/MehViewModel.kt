@@ -418,11 +418,13 @@ class MehViewModel(
           }
           delay(120L)
 
-          // Round 5: scan every tier for at least 60 seconds and connect to the
-                    // fastest verified node instead of the first one that passes.
+          // Scan tiers with a strict <350ms early-stop threshold (or up to 25s best-of-scan)
+                    // so slow ~1000ms servers don't stop discovery prematurely.
                     verifiedCandidates =
                         repository.scanBestCandidatesAcrossAllTiers(
                             prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
+                            minScanDurationMs = 25_000L,
+                            earlyStopPingMs = 350L,
                             excludedEndpointKeys = deadKeys,
                         ) { logLine ->
                             appendLogLine(

@@ -874,28 +874,34 @@ private suspend fun fetchFromSourceList(
                       val passedBothSocial = twitterLatency != null && instagramLatency != null
                       val passedAtLeastOneSocial = twitterLatency != null || instagramLatency != null
 
-                      val rawEffectiveLatency =
+                      val measuredLatencyMs =
                         when {
                           passedBothSocial && tgLatency != null ->
                             (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!! + tgLatency) / 5L
                           passedBothSocial ->
-                            ((candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!!) / 4L) + 40L
+                            (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!!) / 4L
                           passedAtLeastOneSocial -> {
                             val soc = twitterLatency ?: instagramLatency ?: httpsLatency
-                            ((candidate.latencyMs + httpsLatency + soc) / 3L) + 200L
+                            (candidate.latencyMs + httpsLatency + soc) / 3L
                           }
                           tgLatency != null ->
-                            ((candidate.latencyMs + httpsLatency + tgLatency) / 3L) + 800L
+                            (candidate.latencyMs + httpsLatency + tgLatency) / 3L
                           else ->
-                            ((candidate.latencyMs + httpsLatency) / 2L) + 1000L
-                        }
+                            (candidate.latencyMs + httpsLatency) / 2L
+                        }.coerceAtLeast(1L)
 
-                      // Penalize choked/throttled nodes (< 15 KB/s) and reward high-throughput nodes
-                      val bandwidthPenaltyMs = if (throughputKbps < 15.0) 350L else 0L
-                      val effectiveLatency = (rawEffectiveLatency + bandwidthPenaltyMs).coerceAtLeast(1L)
+                      val socialBonus =
+                        when {
+                          passedBothSocial && tgLatency != null -> 120.0
+                          passedBothSocial -> 90.0
+                          passedAtLeastOneSocial -> 40.0
+                          else -> 0.0
+                        }
+                      val effectiveLatency = measuredLatencyMs
+                      val bandwidthScore =
+                        if (throughputKbps < 15.0) -50.0 else (throughputKbps.coerceAtMost(2500.0) * 0.85)
                       val compositeScore =
-                        (10_000.0 / effectiveLatency.toDouble()) +
-                          (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                        (10_000.0 / effectiveLatency.toDouble()) + bandwidthScore + socialBonus
 
                       val tier =
                         when {
@@ -1287,19 +1293,39 @@ private suspend fun fetchFromSourceList(
                 testedCount += wave.size
                 logProgress(force = false)
                 if (stageOnePassed.isEmpty()) continue
-                // Fastest passers of this wave: quick TLS checks in parallel (not
-                // one by one); only stage-2 verified nodes join the pool.
+                // Fastest passers of this wave: run HTTPS check + real download throughput concurrently
+                // so throttled/choked nodes are filtered out and only fast servers win.
                 val verifiedInWave =
                     coroutineScope {
                         stageOnePassed.take(BEST_SCAN_VERIFY_PER_WAVE)
                             .map { candidate ->
                                 async {
-                                    val httpsLatency =
+                                    val httpsJob = async {
                                         V2RayOutboundClient.verifyHttpsAndDnsCapability(
                                             config = candidate,
                                             timeoutMs = 3000,
                                         )
-                                    if (httpsLatency != null) candidate else null
+                                    }
+                                    val bandwidthJob = async {
+                                        V2RayOutboundClient.measureSmallDownloadThroughputKbps(
+                                            config = candidate,
+                                            timeoutMs = 2600,
+                                            targetBytes = 16_384,
+                                        )
+                                    }
+                                    val httpsLatency = httpsJob.await() ?: return@async null
+                                    val throughputKbps = bandwidthJob.await() ?: 0.0
+                                    if (throughputKbps > 0.0 && throughputKbps < 12.0) {
+                                        return@async null
+                                    }
+                                    val realPing = ((candidate.latencyMs + httpsLatency) / 2L).coerceAtLeast(1L)
+                                    val score =
+                                        (10_000.0 / realPing.toDouble()) +
+                                            (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                                    candidate.copy(
+                                        latencyMs = realPing,
+                                        speedScore = score,
+                                    )
                                 }
                             }
                             .awaitAll()
@@ -1319,7 +1345,7 @@ private suspend fun fetchFromSourceList(
             return deadlineReached()
         }
 
-        onLogUpdate("شروع اسکن بهترین سرور: حداقل 60 ثانیه بررسی همه مخزن‌ها")
+        onLogUpdate("شروع اسکن بهترین سرور: بررسی مخزن‌ها (${minScanDurationMs / 1000L} ثانیه)")
 
         // Saved working nodes are tried first, inside the scan.
         val savedSupported =

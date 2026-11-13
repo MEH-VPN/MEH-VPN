@@ -5,11 +5,13 @@
 -keepattributes SourceFile,LineNumberTable
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# Keep Go mobile / gomobile / tun2socks JNI bindings and classes
+# Keep Go mobile / gomobile / libXray JNI bindings and classes
 -keep class go.** { *; }
+-keep class libXray.** { *; }
 -keep class engine.** { *; }
 -keep class tun2socks.** { *; }
 -dontwarn go.**
+-dontwarn libXray.**
 -dontwarn engine.**
 -dontwarn tun2socks.**
 

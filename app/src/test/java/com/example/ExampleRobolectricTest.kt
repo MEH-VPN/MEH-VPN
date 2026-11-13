@@ -374,4 +374,74 @@ class ExampleRobolectricTest {
     val pub = com.example.vpn.X25519Pure.scalarMultBase(key32)
     org.junit.Assert.assertEquals(32, pub.size)
   }
+
+  @Test
+  fun nativeXrayCoreConfig_buildsValidTunFragmentAndMultiProtocolJson() {
+    val vlessWsTls =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@cdn.example.org:443?encryption=none&security=tls&sni=cdn.example.org&type=ws&host=cdn.example.org&path=%2Fws#VLESS-WS"
+      )!!.copy(resolvedIp = "104.16.10.20")
+
+    val jsonStr =
+      com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+        config = vlessWsTls,
+        includeTunInbound = true,
+        tunMtu = 1400,
+        localSocksPort = 20808,
+      )
+    val root = org.json.JSONObject(jsonStr)
+    val inbounds = root.getJSONArray("inbounds")
+    org.junit.Assert.assertEquals(2, inbounds.length())
+    org.junit.Assert.assertEquals("tun", inbounds.getJSONObject(0).getString("protocol"))
+    org.junit.Assert.assertEquals("socks", inbounds.getJSONObject(1).getString("protocol"))
+    org.junit.Assert.assertEquals(20808, inbounds.getJSONObject(1).getInt("port"))
+
+    val outbounds = root.getJSONArray("outbounds")
+    val proxy = outbounds.getJSONObject(0)
+    org.junit.Assert.assertEquals("vless", proxy.getString("protocol"))
+    org.junit.Assert.assertEquals(
+      "104.16.10.20",
+      proxy.getJSONObject("settings").getJSONArray("vnext").getJSONObject(0).getString("address"),
+    )
+    val stream = proxy.getJSONObject("streamSettings")
+    org.junit.Assert.assertEquals("ws", stream.getString("network"))
+    org.junit.Assert.assertEquals("tls", stream.getString("security"))
+    org.junit.Assert.assertEquals("chrome", stream.getJSONObject("tlsSettings").getString("fingerprint"))
+    org.junit.Assert.assertEquals("fragment", stream.getJSONObject("sockopt").getString("dialerProxy"))
+
+    val rules = root.getJSONObject("routing").getJSONArray("rules")
+    assertTrue(rules.toString().contains("domain:.ir"))
+
+    val realityPubKey =
+      java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })
+    val realityCfg =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@rel.example.org:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&pbk=$realityPubKey&sid=ab12&type=tcp#Reality"
+      )!!
+    val realityJson =
+      org.json.JSONObject(
+        com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+          config = realityCfg,
+          includeTunInbound = true,
+          localSocksPort = 20809,
+        ),
+      )
+    val realityProxy = realityJson.getJSONArray("outbounds").getJSONObject(0)
+    org.junit.Assert.assertEquals(
+      "reality",
+      realityProxy.getJSONObject("streamSettings").getString("security"),
+    )
+    org.junit.Assert.assertEquals(
+      "xtls-rprx-vision",
+      realityProxy
+        .getJSONObject("settings")
+        .getJSONArray("vnext")
+        .getJSONObject(0)
+        .getJSONArray("users")
+        .getJSONObject(0)
+        .getString("flow"),
+    )
+    assertTrue(com.example.vpn.NativeXrayEngine.supportsNativeXray(vlessWsTls))
+    assertTrue(com.example.vpn.NativeXrayEngine.allocateLocalPort() in 1024..65535)
+  }
 }

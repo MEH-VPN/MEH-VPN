@@ -449,8 +449,13 @@ object GfwKnockerXrayCore {
     }
   }
 
-  fun buildXrayCoreJson(config: V2RayConfig): String {
-    if (config.protocol == V2RayProtocol.SERVERLESS) {
+  fun buildXrayCoreJson(
+    config: V2RayConfig,
+    includeTunInbound: Boolean = false,
+    tunMtu: Int = 1400,
+    localSocksPort: Int = 10808,
+  ): String {
+    if (config.protocol == V2RayProtocol.SERVERLESS && !includeTunInbound) {
       val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
       val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
       val remarks =
@@ -501,89 +506,510 @@ object GfwKnockerXrayCore {
       """.trimIndent()
     }
 
-    val escRemarks = escapeJson("${config.cleanTitle} [GFW-knocker/Xray-core]")
-    val escProto = escapeJson(config.protocol.name.lowercase())
-    val escAddr = escapeJson(config.address)
-    val escAuth = escapeJson(config.authId)
-    val escEnc = escapeJson(config.encryption.ifBlank { "none" })
-    val escNet = escapeJson(config.network)
-    val escSec = escapeJson(config.security)
-    val escSni = escapeJson(config.sni)
-    val escPath = escapeJson(config.path.ifBlank { "/" })
-    val escHost = escapeJson(config.hostHeader.ifBlank { config.sni })
+    val inboundsList = mutableListOf<String>()
+    if (includeTunInbound) {
+      inboundsList +=
+        """
+        {
+          "tag": "tun-in",
+          "protocol": "tun",
+          "settings": {
+            "name": "tun0",
+            "mtu": ${tunMtu.coerceIn(1280, 1500)},
+            "userLevel": 8
+          },
+          "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": true
+          }
+        }
+        """.trimIndent()
+    }
+    if (localSocksPort > 0) {
+      inboundsList +=
+        """
+        {
+          "tag": "socks-in",
+          "port": $localSocksPort,
+          "listen": "127.0.0.1",
+          "protocol": "socks",
+          "settings": {
+            "auth": "noauth",
+            "udp": true,
+            "userLevel": 8
+          },
+          "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls"],
+            "routeOnly": true
+          }
+        }
+        """.trimIndent()
+    }
 
+    val proxyOutboundJson = buildXrayProxyOutboundJson(config, includeTunInbound)
+    val tunDnsRule =
+      if (includeTunInbound) {
+        """
+          {
+            "type": "field",
+            "inboundTag": ["tun-in"],
+            "network": "udp",
+            "port": "53",
+            "outboundTag": "dns-out"
+          },
+        """.trimIndent()
+      } else {
+        ""
+      }
+
+    val escRemarks = escapeJson("${config.cleanTitle} [MEH-XrayCore]")
     return """
       {
         "remarks": "$escRemarks",
         "log": {
           "loglevel": "warning"
         },
-        "inbounds": [
-          {
-            "tag": "socks-in",
-            "port": 10808,
-            "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {
-              "auth": "noauth",
-              "udp": true,
-              "userLevel": 8
-            },
-            "sniffing": {
-              "enabled": true,
-              "destOverride": ["http", "tls"]
+        "dns": {
+          "tag": "dns-internal",
+          "queryStrategy": "UseIPv4",
+          "servers": [
+            "8.8.8.8",
+            "1.1.1.1",
+            {
+              "address": "localhost",
+              "domains": [
+                "domain:.ir",
+                "domain:shaparak.ir",
+                "domain:digikala.com",
+                "domain:snapp.ir",
+                "domain:divar.ir",
+                "domain:torob.com",
+                "domain:aparat.com",
+                "domain:rubika.ir",
+                "domain:telewebion.com",
+                "domain:bale.ai",
+                "domain:eitaa.com"
+              ]
             }
-          }
+          ]
+        },
+        "inbounds": [
+          ${inboundsList.joinToString(",\n")}
         ],
         "outbounds": [
+          $proxyOutboundJson,
           {
-            "tag": "proxy",
-            "protocol": "$escProto",
+            "tag": "fragment",
+            "protocol": "freedom",
             "settings": {
-              "address": "$escAddr",
-              "port": ${config.port},
-              "id": "$escAuth",
-              "encryption": "$escEnc"
+              "domainStrategy": "UseIPv4",
+              "fragment": {
+                "packets": "tlshello",
+                "length": "10-25",
+                "interval": "2-5"
+              }
             },
             "streamSettings": {
-              "network": "$escNet",
-              "security": "$escSec",
-              "tlsSettings": {
-                "serverName": "$escSni",
-                "allowInsecure": true,
-                "fingerprint": "chrome"
-              },
-              "wsSettings": {
-                "path": "$escPath",
-                "headers": {
-                  "Host": "$escHost"
-                }
-              },
               "sockopt": {
-                "dialerProxy": "fragment",
                 "tcpNoDelay": true
               }
             }
           },
           {
-            "tag": "fragment",
+            "tag": "direct",
             "protocol": "freedom",
             "settings": {
-              "domainStrategy": "AsIs",
-              "fragment": {
-                "packets": "tlshello",
-                "length": "10-30",
-                "interval": "5-12",
-                "maxSplit": "10-20"
-              }
+              "domainStrategy": "UseIPv4"
+            }
+          },
+          {
+            "tag": "dns-out",
+            "protocol": "dns"
+          },
+          {
+            "tag": "block",
+            "protocol": "blackhole"
+          }
+        ],
+        "routing": {
+          "domainStrategy": "IPIfNonMatch",
+          "rules": [
+            {
+              "type": "field",
+              "inboundTag": ["dns-internal"],
+              "outboundTag": "proxy"
             },
-            "streamSettings": {
-              "sockopt": {
-                "tcpNoDelay": true
-              }
+            $tunDnsRule
+            {
+              "type": "field",
+              "ip": [
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "127.0.0.0/8",
+                "169.254.0.0/16",
+                "224.0.0.0/4",
+                "fc00::/7",
+                "fe80::/10"
+              ],
+              "outboundTag": "direct"
+            },
+            {
+              "type": "field",
+              "domain": [
+                "domain:.ir",
+                "domain:shaparak.ir",
+                "domain:digikala.com",
+                "domain:snapp.ir",
+                "domain:divar.ir",
+                "domain:torob.com",
+                "domain:aparat.com",
+                "domain:rubika.ir",
+                "domain:telewebion.com",
+                "domain:bale.ai",
+                "domain:eitaa.com",
+                "domain:cafebazaar.ir",
+                "domain:myket.ir"
+              ],
+              "outboundTag": "direct"
+            }
+          ]
+        }
+      }
+    """.trimIndent()
+  }
+
+  private fun jsonStr(value: String): String = "\"${escapeJson(value)}\""
+
+  private fun jsonStrArray(values: List<String>): String =
+    values.joinToString(", ", prefix = "[", postfix = "]") { jsonStr(it) }
+
+  private fun buildXrayProxyOutboundJson(
+    config: V2RayConfig,
+    includeTunInbound: Boolean,
+  ): String {
+    val dialAddress = config.resolvedIp.ifBlank { config.address }
+    val sni = config.sni.ifBlank { config.hostHeader }.ifBlank { config.address }.trim()
+    val host = config.hostHeader.ifBlank { sni }.ifBlank { config.address }.trim()
+    val rawPath = config.path.ifBlank { "/" }
+    val normalizedNet =
+      when (config.network.lowercase().trim()) {
+        "websocket", "ws" -> "ws"
+        "httpupgrade" -> "httpupgrade"
+        "grpc", "gun" -> "grpc"
+        "xhttp", "splithttp" -> "xhttp"
+        "h2", "http" -> "http"
+        "kcp", "mkcp" -> "kcp"
+        else -> "tcp"
+      }
+    val sec = config.security.lowercase().trim()
+
+    if (config.protocol == V2RayProtocol.SERVERLESS) {
+      return """
+        {
+          "tag": "proxy",
+          "protocol": "freedom",
+          "settings": {
+            "domainStrategy": "ForceIP",
+            "fragment": {
+              "packets": "tlshello",
+              "length": "10-25",
+              "interval": "1-3"
+            }
+          },
+          "streamSettings": {
+            "sockopt": {
+              "tcpNoDelay": true
             }
           }
-        ]
+        }
+      """.trimIndent()
+    }
+
+    if (config.protocol == V2RayProtocol.HYSTERIA2) {
+      val alpnField =
+        config.alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }.let {
+          if (it.isNotEmpty()) ", \"alpn\": ${jsonStrArray(it)}" else ""
+        }
+      val sniField = if (sni.isNotEmpty()) "\"serverName\": ${jsonStr(sni)}, " else ""
+      val udpMasksField =
+        if (config.obfs.equals("salamander", ignoreCase = true) && config.obfsPassword.isNotBlank()) {
+          """, "udpmasks": [{"type": "salamander", "settings": {"password": ${jsonStr(config.obfsPassword)}}}]"""
+        } else {
+          ""
+        }
+      return """
+        {
+          "tag": "proxy",
+          "protocol": "hysteria",
+          "settings": {
+            "version": 2,
+            "address": ${jsonStr(dialAddress)},
+            "port": ${config.port}
+          },
+          "streamSettings": {
+            "network": "hysteria",
+            "security": "tls",
+            "tlsSettings": {
+              ${sniField}"allowInsecure": true$alpnField
+            },
+            "hysteriaSettings": {
+              "version": 2,
+              "auth": ${jsonStr(config.authId)},
+              "udpIdleTimeout": 60$udpMasksField
+            }
+          }
+        }
+      """.trimIndent()
+    }
+
+    if (config.protocol == V2RayProtocol.WIREGUARD) {
+      val localAddresses =
+        config.localAddress
+          .split(",")
+          .map { it.trim() }
+          .filter { it.isNotEmpty() }
+          .ifEmpty { listOf("172.16.0.2/32") }
+          .map { if (it.contains("/")) it else "$it/32" }
+      val reservedInts = config.reservedBytes.split(",").mapNotNull { it.trim().toIntOrNull() }
+      val reservedField =
+        if (reservedInts.size == 3) """, "reserved": ${reservedInts.joinToString(", ", "[", "]")}""" else ""
+      return """
+        {
+          "tag": "proxy",
+          "protocol": "wireguard",
+          "settings": {
+            "secretKey": ${jsonStr(config.authId)},
+            "address": ${jsonStrArray(localAddresses)},
+            "peers": [
+              {
+                "publicKey": ${jsonStr(config.publicKey)},
+                "endpoint": ${jsonStr("$dialAddress:${config.port}")},
+                "allowedIPs": ["0.0.0.0/0", "::/0"]
+              }
+            ],
+            "mtu": 1380$reservedField
+          }
+        }
+      """.trimIndent()
+    }
+
+    if (config.protocol == V2RayProtocol.SOCKS5 || config.protocol == V2RayProtocol.HTTP_PROXY) {
+      val proto = if (config.protocol == V2RayProtocol.SOCKS5) "socks" else "http"
+      val usersField =
+        if (config.authId.contains(":")) {
+          val u = config.authId.substringBefore(":")
+          val p = config.authId.substringAfter(":")
+          """, "users": [{"user": ${jsonStr(u)}, "pass": ${jsonStr(p)}}]"""
+        } else {
+          ""
+        }
+      return """
+        {
+          "tag": "proxy",
+          "protocol": "$proto",
+          "settings": {
+            "servers": [
+              {
+                "address": ${jsonStr(dialAddress)},
+                "port": ${config.port}$usersField
+              }
+            ]
+          }
+        }
+      """.trimIndent()
+    }
+
+    val (xrayProto, settingsJson) =
+      when (config.protocol) {
+        V2RayProtocol.VLESS,
+        V2RayProtocol.MVLESS,
+        V2RayProtocol.JVLESS -> {
+          val flowField = if (config.flow.isNotBlank()) """, "flow": ${jsonStr(config.flow)}""" else ""
+          val settings =
+            """
+            {
+              "vnext": [
+                {
+                  "address": ${jsonStr(dialAddress)},
+                  "port": ${config.port},
+                  "users": [
+                    {
+                      "id": ${jsonStr(config.authId)},
+                      "encryption": ${jsonStr(config.encryption.ifBlank { "none" })}$flowField
+                    }
+                  ]
+                }
+              ]
+            }
+            """.trimIndent()
+          "vless" to settings
+        }
+
+        V2RayProtocol.VMESS -> {
+          val settings =
+            """
+            {
+              "vnext": [
+                {
+                  "address": ${jsonStr(dialAddress)},
+                  "port": ${config.port},
+                  "users": [
+                    {
+                      "id": ${jsonStr(config.authId)},
+                      "alterId": ${config.alterId.coerceAtLeast(0)},
+                      "security": ${jsonStr(config.cipher.ifBlank { "auto" })}
+                    }
+                  ]
+                }
+              ]
+            }
+            """.trimIndent()
+          "vmess" to settings
+        }
+
+        V2RayProtocol.TROJAN -> {
+          val settings =
+            """
+            {
+              "servers": [
+                {
+                  "address": ${jsonStr(dialAddress)},
+                  "port": ${config.port},
+                  "password": ${jsonStr(config.authId)}
+                }
+              ]
+            }
+            """.trimIndent()
+          "trojan" to settings
+        }
+
+        V2RayProtocol.SHADOWSOCKS -> {
+          val settings =
+            """
+            {
+              "servers": [
+                {
+                  "address": ${jsonStr(dialAddress)},
+                  "port": ${config.port},
+                  "method": ${jsonStr(config.cipher.ifBlank { "chacha20-ietf-poly1305" })},
+                  "password": ${jsonStr(config.authId)}
+                }
+              ]
+            }
+            """.trimIndent()
+          "shadowsocks" to settings
+        }
+
+        else -> "vless" to "{}"
+      }
+
+    val streamBlocks = mutableListOf<String>()
+    val effectiveSec = if (sec == "reality") "reality" else if (sec == "tls") "tls" else "none"
+    streamBlocks += "\"network\": ${jsonStr(normalizedNet)}"
+    streamBlocks += "\"security\": ${jsonStr(effectiveSec)}"
+
+    if (effectiveSec == "tls") {
+      val sniEntry = if (sni.isNotEmpty()) "\"serverName\": ${jsonStr(sni)}, " else ""
+      val alpnList = config.alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+      val alpnEntry =
+        when {
+          alpnList.isNotEmpty() -> ", \"alpn\": ${jsonStrArray(alpnList)}"
+          normalizedNet == "grpc" || normalizedNet == "http" -> ", \"alpn\": [\"h2\"]"
+          else -> ""
+        }
+      streamBlocks +=
+        """
+        "tlsSettings": {
+          ${sniEntry}"allowInsecure": true,
+          "fingerprint": "chrome"$alpnEntry
+        }
+        """.trimIndent()
+    } else if (effectiveSec == "reality") {
+      streamBlocks +=
+        """
+        "realitySettings": {
+          "show": false,
+          "fingerprint": "chrome",
+          "serverName": ${jsonStr(sni)},
+          "publicKey": ${jsonStr(config.pbk)},
+          "shortId": ${jsonStr(config.shortId)},
+          "spiderX": ${jsonStr(config.spiderX.ifBlank { "/" })}
+        }
+        """.trimIndent()
+    }
+
+    when (normalizedNet) {
+      "ws" -> {
+        val headersEntry =
+          if (host.isNotEmpty()) """, "headers": { "Host": ${jsonStr(host)} }""" else ""
+        streamBlocks += """"wsSettings": { "path": ${jsonStr(rawPath)}$headersEntry }"""
+      }
+      "httpupgrade" -> {
+        val hostEntry = if (host.isNotEmpty()) """, "host": ${jsonStr(host)}""" else ""
+        streamBlocks += """"httpupgradeSettings": { "path": ${jsonStr(rawPath)}$hostEntry }"""
+      }
+      "grpc" -> {
+        val svc = config.serviceName.ifBlank { rawPath.removePrefix("/") }
+        streamBlocks += """"grpcSettings": { "serviceName": ${jsonStr(svc)}, "multiMode": false }"""
+      }
+      "xhttp" -> {
+        val hostEntry = if (host.isNotEmpty()) """, "host": ${jsonStr(host)}""" else ""
+        streamBlocks += """"xhttpSettings": { "path": ${jsonStr(rawPath)}, "mode": "auto"$hostEntry }"""
+      }
+      "http" -> {
+        val hostEntry = if (host.isNotEmpty()) """, "host": ${jsonStrArray(listOf(host))}""" else ""
+        streamBlocks += """"httpSettings": { "path": ${jsonStr(rawPath)}$hostEntry }"""
+      }
+      "kcp" -> {
+        val seedEntry = if (config.seed.isNotBlank()) """, "seed": ${jsonStr(config.seed)}""" else ""
+        streamBlocks +=
+          """
+          "kcpSettings": {
+            "mtu": 1350,
+            "tti": 20,
+            "uplinkCapacity": 12,
+            "downlinkCapacity": 100,
+            "congestion": false,
+            "readBufferSize": 2,
+            "writeBufferSize": 2,
+            "header": { "type": ${jsonStr(config.headerType.ifBlank { "none" })} }$seedEntry
+          }
+          """.trimIndent()
+      }
+      "tcp" -> {
+        if (config.headerType.equals("http", ignoreCase = true)) {
+          val hostHeader =
+            if (host.isNotEmpty()) """, "headers": { "Host": ${jsonStrArray(listOf(host))} }""" else ""
+          streamBlocks +=
+            """
+            "tcpSettings": {
+              "header": {
+                "type": "http",
+                "request": {
+                  "path": ${jsonStrArray(listOf(rawPath))}$hostHeader
+                }
+              }
+            }
+            """.trimIndent()
+        }
+      }
+    }
+
+    val useFragment = !includeTunInbound || (sec == "tls" && normalizedNet != "kcp")
+    val dialerProxyLine = if (useFragment) """"dialerProxy": "fragment", """ else ""
+    streamBlocks += """"sockopt": { ${dialerProxyLine}"tcpNoDelay": true }"""
+
+    return """
+      {
+        "tag": "proxy",
+        "protocol": "$xrayProto",
+        "settings": $settingsJson,
+        "streamSettings": {
+          ${streamBlocks.joinToString(",\n")}
+        }
       }
     """.trimIndent()
   }
