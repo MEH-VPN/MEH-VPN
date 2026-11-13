@@ -454,6 +454,9 @@ object GfwKnockerXrayCore {
     includeTunInbound: Boolean = false,
     tunMtu: Int = 1400,
     localSocksPort: Int = 10808,
+    useFragment: Boolean =
+      config.fragmentProfile.isNotBlank() &&
+        !config.fragmentProfile.equals("direct_tls", ignoreCase = true),
   ): String {
     if (config.protocol == V2RayProtocol.SERVERLESS && !includeTunInbound) {
       val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
@@ -521,7 +524,7 @@ object GfwKnockerXrayCore {
           "sniffing": {
             "enabled": true,
             "destOverride": ["http", "tls", "quic"],
-            "routeOnly": true
+            "routeOnly": false
           }
         }
         """.trimIndent()
@@ -542,22 +545,28 @@ object GfwKnockerXrayCore {
           "sniffing": {
             "enabled": true,
             "destOverride": ["http", "tls"],
-            "routeOnly": true
+            "routeOnly": false
           }
         }
         """.trimIndent()
     }
 
-    val proxyOutboundJson = buildXrayProxyOutboundJson(config)
+    val proxyOutboundJson = buildXrayProxyOutboundJson(config, useFragment = useFragment)
     val tunDnsRule =
       if (includeTunInbound) {
         """
           {
             "type": "field",
             "inboundTag": ["tun-in"],
-            "network": "udp",
             "port": "53",
             "outboundTag": "dns-out"
+          },
+          {
+            "type": "field",
+            "inboundTag": ["tun-in"],
+            "network": "udp",
+            "port": "443",
+            "outboundTag": "block"
           },
         """.trimIndent()
       } else {
@@ -573,8 +582,10 @@ object GfwKnockerXrayCore {
           "tag": "dns-internal",
           "queryStrategy": "UseIPv4",
           "servers": [
-            "8.8.8.8",
-            "1.1.1.1"
+            "tcp://8.8.8.8",
+            "https://8.8.8.8/dns-query",
+            "tcp://1.1.1.1",
+            "8.8.8.8"
           ]
         },
         "inbounds": [
@@ -670,7 +681,12 @@ object GfwKnockerXrayCore {
   private fun jsonStrArray(values: List<String>): String =
     values.joinToString(", ", prefix = "[", postfix = "]") { jsonStr(it) }
 
-  private fun buildXrayProxyOutboundJson(config: V2RayConfig): String {
+  private fun buildXrayProxyOutboundJson(
+    config: V2RayConfig,
+    useFragment: Boolean =
+      config.fragmentProfile.isNotBlank() &&
+        !config.fragmentProfile.equals("direct_tls", ignoreCase = true),
+  ): String {
     val dialAddress = config.resolvedIp.ifBlank { config.address }
     val sni = config.sni.ifBlank { config.hostHeader }.ifBlank { config.address }.trim()
     val host = config.hostHeader.ifBlank { sni }.ifBlank { config.address }.trim()
@@ -1001,8 +1017,8 @@ object GfwKnockerXrayCore {
       }
     }
 
-    val useFragment = effectiveSec == "tls" && normalizedNet != "kcp"
-    if (useFragment) {
+    val attachFragment = useFragment && effectiveSec == "tls" && normalizedNet != "kcp"
+    if (attachFragment) {
       streamBlocks += """"sockopt": { "dialerProxy": "fragment" }"""
     }
 

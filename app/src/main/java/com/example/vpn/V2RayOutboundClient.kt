@@ -1562,7 +1562,9 @@ object V2RayOutboundClient {
         emptyList()
       }
 
-    val smartSsl = createSmartSslContext(sniHost, allowInsecureFallback = true)
+    val sniIsDomain =
+      sniHost.isNotBlank() && parseIpv4Bytes(sniHost) == null && !sniHost.contains(':')
+    val smartSsl = createSmartSslContext(sniHost, allowInsecureFallback = !sniIsDomain)
 
     // 1. Standard direct TLS mode: uses real connected rawSocket directly with Android Conscrypt SSLSocket
     if (config.fragmentProfile.equals("direct_tls", ignoreCase = true) ||

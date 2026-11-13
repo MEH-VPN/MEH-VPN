@@ -234,8 +234,11 @@ class ExampleUnitTest {
     assertEquals(V2RayProtocol.MVLESS, parsedMvless?.protocol)
     assertEquals(150.toByte(), com.example.vpn.GfwKnockerXrayCore.vlessWireVersionFor(parsedMvless!!.protocol))
     assertTrue(V2RayOutboundClient.isSupportedByEngine(parsedMvless))
-    assertTrue(parsedMvless.toV2RayCoreJson().contains("\"dialerProxy\": \"fragment\""))
     assertTrue(parsedMvless.toV2RayCoreJson().contains("\"packets\": \"tlshello\""))
+    org.junit.Assert.assertFalse(parsedMvless.toV2RayCoreJson().contains("\"dialerProxy\": \"fragment\""))
+    assertTrue(
+      parsedMvless.copy(fragmentProfile = "gfw_knocker").toV2RayCoreJson().contains("\"dialerProxy\": \"fragment\"")
+    )
   }
 
   @Test

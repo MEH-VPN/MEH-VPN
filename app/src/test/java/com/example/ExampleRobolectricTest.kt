@@ -426,7 +426,29 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("chrome", stream.getJSONObject("tlsSettings").getString("fingerprint"))
     org.junit.Assert.assertFalse(stream.getJSONObject("tlsSettings").has("allowInsecure"))
     org.junit.Assert.assertEquals("cdn.example.org", stream.getJSONObject("wsSettings").getString("host"))
-    org.junit.Assert.assertEquals("fragment", stream.getJSONObject("sockopt").getString("dialerProxy"))
+    org.junit.Assert.assertFalse(stream.has("sockopt"))
+
+    val dnsServers = root.getJSONObject("dns").getJSONArray("servers")
+    org.junit.Assert.assertEquals("tcp://8.8.8.8", dnsServers.getString(0))
+
+    val fragJson =
+      org.json.JSONObject(
+        com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+          config = vlessWsTls,
+          includeTunInbound = true,
+          localSocksPort = 20808,
+          useFragment = true,
+        )
+      )
+    org.junit.Assert.assertEquals(
+      "fragment",
+      fragJson
+        .getJSONArray("outbounds")
+        .getJSONObject(0)
+        .getJSONObject("streamSettings")
+        .getJSONObject("sockopt")
+        .getString("dialerProxy"),
+    )
 
     val fragmentOutbound = outbounds.getJSONObject(1)
     org.junit.Assert.assertFalse(fragmentOutbound.getJSONObject("settings").has("domainStrategy"))

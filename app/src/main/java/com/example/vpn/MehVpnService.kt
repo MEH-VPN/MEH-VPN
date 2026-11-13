@@ -271,29 +271,46 @@ class MehVpnService : VpnService() {
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
 
-      // Try candidates in order with native Xray-core (libXray) until one boots cleanly
+      // Try candidates in order with native Xray-core (libXray) and verify live traffic passes
       var startedConfig: V2RayConfig? = null
+      var verifiedPingMs: Long = initialPing
       var lastError: String? = null
       for (idx in effectiveConfigs.indices) {
         val candidate = effectiveConfigs[idx]
         if (!NativeXrayEngine.supportsNativeXray(candidate)) continue
-        val startErr = launchNativeXrayOnExistingTun(establishedPfd, candidate)
-        if (startErr == null) {
-          startedConfig = candidate
+        emitRealtimeLog(
+          "راه‌اندازی و تست هسته Xray روی ${candidate.cleanTitle}...",
+          VpnLogLevel.SCAN,
+        )
+        val (verifiedCfg, livePing, candidateErr) =
+          launchVerifiedNativeXray(
+            establishedPfd = establishedPfd,
+            candidate = candidate,
+            verifyTimeoutMs = 4500,
+          )
+        if (verifiedCfg != null && livePing != null) {
+          startedConfig = verifiedCfg
+          verifiedPingMs = livePing
           synchronized(poolLock) { poolCursor.set(idx) }
           break
-        } else {
-          lastError = startErr
-          DeadServerStore.markDead(applicationContext, candidate.endpointKey)
         }
+        stopNativeXray()
+        if (candidateErr != null) {
+          lastError = candidateErr
+        } else if (lastError == null) {
+          lastError = "سرور ${candidate.cleanTitle} ترافیک اینترنت را عبور نداد"
+        }
+        DeadServerStore.markDead(applicationContext, candidate.endpointKey)
       }
 
       val active =
         startedConfig
-          ?: throw IllegalStateException(lastError ?: "Native Xray core failed to start")
+          ?: throw IllegalStateException(
+            lastError ?: "هیچ‌یک از سرورها از هسته Xray عبور نکردند"
+          )
 
       val effectiveName = active.cleanTitle.ifBlank { serverName }
-      val effectivePing = if (active.latencyMs > 0L) active.latencyMs else initialPing
+      val effectivePing = verifiedPingMs.coerceAtLeast(1L)
 
       _tunnelSession.value =
         VpnTunnelSession(
@@ -308,12 +325,11 @@ class MehVpnService : VpnService() {
         )
 
       emitRealtimeLog(
-        "متصل به $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
+        "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
         VpnLogLevel.SUCCESS,
       )
 
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
-      verifyActiveNodeAfterConnect()
       startBackgroundNodeRefinement()
       startPoolTopUpAfterConnect()
     } catch (e: Exception) {
@@ -326,6 +342,35 @@ class MehVpnService : VpnService() {
     }
   }
 
+  private fun launchVerifiedNativeXray(
+    establishedPfd: ParcelFileDescriptor,
+    candidate: V2RayConfig,
+    verifyTimeoutMs: Int = 4500,
+  ): Triple<V2RayConfig?, Long?, String?> {
+    val defaultFrag =
+      candidate.fragmentProfile.isNotBlank() &&
+        !candidate.fragmentProfile.equals("direct_tls", ignoreCase = true)
+    var lastError: String? = null
+    for (fragMode in listOf(defaultFrag, !defaultFrag)) {
+      val startErr =
+        launchNativeXrayOnExistingTun(
+          establishedPfd = establishedPfd,
+          config = candidate,
+          useFragmentOverride = fragMode,
+        )
+      if (startErr != null) {
+        lastError = startErr
+        break
+      }
+      val livePing = verifyRealPathViaProxy(localSocksPort, timeoutMs = verifyTimeoutMs)
+      if (livePing != null) {
+        val verifiedCfg = activeConfigState ?: candidate
+        return Triple(verifiedCfg, livePing, null)
+      }
+    }
+    return Triple(null, null, lastError)
+  }
+
   /**
    * Starts (or hot-restarts) native Go Xray-core on the already-open [establishedPfd] TUN
    * using a freshly duped+detached FD so Android `fdsan` never aborts when Xray closes it on stop.
@@ -334,6 +379,7 @@ class MehVpnService : VpnService() {
   private fun launchNativeXrayOnExistingTun(
     establishedPfd: ParcelFileDescriptor,
     config: V2RayConfig,
+    useFragmentOverride: Boolean? = null,
   ): String? {
     val resolvedConfig =
       if (config.resolvedIp.isNotBlank()) {
@@ -344,12 +390,17 @@ class MehVpnService : VpnService() {
       }
 
     val socksPort = NativeXrayEngine.allocateLocalPort()
+    val effectiveFragment =
+      useFragmentOverride
+        ?: (resolvedConfig.fragmentProfile.isNotBlank() &&
+          !resolvedConfig.fragmentProfile.equals("direct_tls", ignoreCase = true))
     val xrayJson =
       GfwKnockerXrayCore.buildXrayCoreJson(
         config = resolvedConfig,
         includeTunInbound = true,
         tunMtu = TUN_MTU,
         localSocksPort = socksPort,
+        useFragment = effectiveFragment,
       )
     try {
       File(filesDir, "active_v2ray_config.json").writeText(xrayJson)
@@ -404,9 +455,10 @@ class MehVpnService : VpnService() {
 
   private fun switchToNextHealthyNode(reason: String): V2RayConfig? {
     val pfd = vpnInterface ?: return currentActiveConfig()
+    val previousActive = currentActiveConfig()
     val candidate =
       synchronized(poolLock) {
-        if (serverPool.isEmpty()) return currentActiveConfig()
+        if (serverPool.isEmpty()) return previousActive
         val nextIdx = (poolCursor.get() + 1) % serverPool.size
         poolCursor.set(nextIdx)
         serverPool[nextIdx]
@@ -419,7 +471,10 @@ class MehVpnService : VpnService() {
       )
       return candidate
     }
-    return currentActiveConfig()
+    if (previousActive != null) {
+      launchNativeXrayOnExistingTun(pfd, previousActive)
+    }
+    return previousActive
   }
 
   private fun replaceServerPool(newPool: List<V2RayConfig>): V2RayConfig? {
@@ -427,15 +482,31 @@ class MehVpnService : VpnService() {
       newPool
         .filter { NativeXrayEngine.supportsNativeXray(it) }
         .distinctBy { it.endpointKey }
-    if (clean.isEmpty()) return currentActiveConfig()
-    synchronized(poolLock) {
-      serverPool = clean
-      poolCursor.set(0)
-    }
+    if (clean.isEmpty()) return null
     val pfd = vpnInterface ?: return clean.first()
-    val first = clean.first()
-    launchNativeXrayOnExistingTun(pfd, first)
-    return currentActiveConfig() ?: first
+    val previousActive = currentActiveConfig()
+
+    for ((idx, candidate) in clean.take(3).withIndex()) {
+      val (verifiedCfg, livePing, _) =
+        launchVerifiedNativeXray(
+          establishedPfd = pfd,
+          candidate = candidate,
+          verifyTimeoutMs = 4000,
+        )
+      if (verifiedCfg != null && livePing != null) {
+        synchronized(poolLock) {
+          serverPool = clean
+          poolCursor.set(idx)
+        }
+        return verifiedCfg.copy(latencyMs = livePing)
+      }
+    }
+
+    // Challengers did not pass real Xray traffic; restore the previous working node.
+    if (previousActive != null) {
+      launchNativeXrayOnExistingTun(pfd, previousActive)
+    }
+    return null
   }
 
   private fun appendToServerPool(more: List<V2RayConfig>): Int {
@@ -468,6 +539,48 @@ class MehVpnService : VpnService() {
 
   private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
     if (proxyPort <= 0) return null
+    val httpsPing = verifyHttpsViaProxy(proxyPort, timeoutMs)
+    if (httpsPing != null) return httpsPing
+    return verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
+  }
+
+  private fun verifyHttpsViaProxy(proxyPort: Int, timeoutMs: Int): Long? {
+    val startedNs = System.nanoTime()
+    var socket: Socket? = null
+    return try {
+      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+      socket = Socket(proxy)
+      socket.soTimeout = timeoutMs
+      socket.connect(InetSocketAddress.createUnresolved("www.google.com", 443), timeoutMs)
+      val (tlsIn, tlsOut) =
+        GfwKnockerXrayCore.openSslEngineOverStreams(
+          sslContext = javax.net.ssl.SSLContext.getDefault(),
+          rawIn = socket.getInputStream(),
+          rawOut = socket.getOutputStream(),
+          sniHost = "www.google.com",
+          port = 443,
+          alpnProtocols = arrayOf("http/1.1"),
+        )
+      val request = "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
+      tlsOut.write(request.toByteArray(Charsets.US_ASCII))
+      tlsOut.flush()
+      val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
+      val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
+      if (code == 204) {
+        val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
+        MehDiag.recordBytesDownloaded(128L)
+        ms
+      } else {
+        null
+      }
+    } catch (_: Exception) {
+      null
+    } finally {
+      try { socket?.close() } catch (_: Exception) {}
+    }
+  }
+
+  private fun verifyHttp204ViaProxy(proxyPort: Int, timeoutMs: Int): Long? {
     val startedNs = System.nanoTime()
     var socket: Socket? = null
     return try {
@@ -585,43 +698,6 @@ class MehVpnService : VpnService() {
       val nm = getSystemService(NotificationManager::class.java)
       nm?.notify(NOTIFICATION_ID, buildForegroundNotification(name, pingMs))
     } catch (_: Exception) {}
-  }
-
-  private fun verifyActiveNodeAfterConnect() {
-    serviceScope.launch {
-      val activeCfg = currentActiveConfig() ?: return@launch
-      val realPing = verifyRealPathViaProxy(localSocksPort)
-      if (realPing != null) {
-        updateSessionAndNotification(activeCfg, realPing)
-        emitRealtimeLog(
-          "اتصال تایید شد: ${activeCfg.cleanTitle} (پینگ واقعی ${realPing}ms)",
-          VpnLogLevel.SUCCESS,
-        )
-        return@launch
-      }
-      var attempts = 0
-      var current = activeCfg
-      while (attempts < 3) {
-        attempts++
-        DeadServerStore.markDead(applicationContext, current.endpointKey)
-        val next = switchToNextHealthyNode("post_connect_verification") ?: break
-        if (next.endpointKey == current.endpointKey) break
-        current = next
-        val nextPing = verifyRealPathViaProxy(localSocksPort)
-        if (nextPing != null) {
-          updateSessionAndNotification(current, nextPing)
-          emitRealtimeLog(
-            "تغییر به سرور پایدارتر: ${current.cleanTitle} (پینگ ${nextPing}ms)",
-            VpnLogLevel.SUCCESS,
-          )
-          return@launch
-        }
-      }
-      android.util.Log.w(
-        "MehVpnService",
-        "Post-connect verification failed; keeping current native Xray tunnel active",
-      )
-    }
   }
 
   private fun startProtectedKeepAliveProbe(
