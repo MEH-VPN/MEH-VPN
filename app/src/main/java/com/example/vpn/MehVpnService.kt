@@ -322,7 +322,7 @@ class MehVpnService : VpnService() {
         errorMessage = e.localizedMessage ?: "Failed to establish native Xray tunnel",
         throwable = e,
       )
-      stopTunnel("خطا در راه‌اندازی هسته Xray: ${e.localizedMessage ?: "نامشخص"}")
+      stopTunnel("خطا در راه‌اندازی هسته Xray:\n${e.localizedMessage ?: "نامشخص"}")
     }
   }
 

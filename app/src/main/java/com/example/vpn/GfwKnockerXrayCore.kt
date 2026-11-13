@@ -709,11 +709,11 @@ object GfwKnockerXrayCore {
     }
 
     if (config.protocol == V2RayProtocol.HYSTERIA2) {
-      val alpnField =
-        config.alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }.let {
-          if (it.isNotEmpty()) ", \"alpn\": ${jsonStrArray(it)}" else ""
-        }
-      val sniField = if (sni.isNotEmpty()) "\"serverName\": ${jsonStr(sni)}, " else ""
+      val sniEntry = if (sni.isNotEmpty()) "\"serverName\": ${jsonStr(sni)}" else ""
+      val alpnItems = config.alpn.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+      val alpnEntry = if (alpnItems.isNotEmpty()) "\"alpn\": ${jsonStrArray(alpnItems)}" else ""
+      val tlsParts = listOf(sniEntry, alpnEntry).filter { it.isNotEmpty() }
+      val tlsSettingsJson = if (tlsParts.isNotEmpty()) tlsParts.joinToString(", ") else ""
       val finalMaskField =
         if (config.obfs.equals("salamander", ignoreCase = true) && config.obfsPassword.isNotBlank()) {
           """, "finalmask": { "udp": [{ "type": "salamander", "settings": { "password": ${jsonStr(config.obfsPassword)} } }] }"""
@@ -733,7 +733,7 @@ object GfwKnockerXrayCore {
             "network": "hysteria",
             "security": "tls",
             "tlsSettings": {
-              ${sniField}"allowInsecure": true$alpnField
+              $tlsSettingsJson
             },
             "hysteriaSettings": {
               "version": 2,
@@ -808,6 +808,10 @@ object GfwKnockerXrayCore {
         V2RayProtocol.VLESS,
         V2RayProtocol.MVLESS,
         V2RayProtocol.JVLESS -> {
+          val vlessEncryption =
+            config.encryption.trim().let {
+              if (it.isBlank() || it.equals("auto", ignoreCase = true)) "none" else it
+            }
           val validFlow =
             if (normalizedNet == "tcp" && config.flow.startsWith("xtls-rprx-vision", ignoreCase = true)) {
               config.flow.trim()
@@ -825,7 +829,7 @@ object GfwKnockerXrayCore {
                   "users": [
                     {
                       "id": ${jsonStr(config.authId)},
-                      "encryption": ${jsonStr(config.encryption.ifBlank { "none" })}$flowField
+                      "encryption": ${jsonStr(vlessEncryption)}$flowField
                     }
                   ]
                 }
@@ -895,9 +899,10 @@ object GfwKnockerXrayCore {
       }
 
     val streamBlocks = mutableListOf<String>()
+    val realityCompatibleNet = normalizedNet == "tcp" || normalizedNet == "xhttp" || normalizedNet == "grpc"
     val effectiveSec =
       when {
-        sec == "reality" && config.pbk.isNotBlank() -> "reality"
+        sec == "reality" && config.pbk.isNotBlank() && realityCompatibleNet -> "reality"
         sec == "tls" || (sec == "reality" && config.sni.isNotBlank()) -> "tls"
         else -> "none"
       }
@@ -916,13 +921,16 @@ object GfwKnockerXrayCore {
       streamBlocks +=
         """
         "tlsSettings": {
-          ${sniEntry}"allowInsecure": true,
-          "fingerprint": "chrome"$alpnEntry
+          ${sniEntry}"fingerprint": "chrome"$alpnEntry
         }
         """.trimIndent()
     } else if (effectiveSec == "reality") {
       val realitySni = sni.ifBlank { "www.microsoft.com" }
       val normalizedSpiderX = config.spiderX.trim().ifBlank { "/" }.let { if (it.startsWith("/")) it else "/$it" }
+      val cleanShortId =
+        config.shortId.trim().lowercase().let { sid ->
+          if (sid.matches(Regex("^([0-9a-f]{2}){0,8}$"))) sid else ""
+        }
       streamBlocks +=
         """
         "realitySettings": {
@@ -930,7 +938,7 @@ object GfwKnockerXrayCore {
           "fingerprint": "chrome",
           "serverName": ${jsonStr(realitySni)},
           "publicKey": ${jsonStr(config.pbk.trim())},
-          "shortId": ${jsonStr(config.shortId.trim())},
+          "shortId": ${jsonStr(cleanShortId)},
           "spiderX": ${jsonStr(normalizedSpiderX)}
         }
         """.trimIndent()
@@ -938,9 +946,9 @@ object GfwKnockerXrayCore {
 
     when (normalizedNet) {
       "ws" -> {
-        val headersEntry =
-          if (host.isNotEmpty()) """, "headers": { "Host": ${jsonStr(host)} }""" else ""
-        streamBlocks += """"wsSettings": { "path": ${jsonStr(rawPath)}$headersEntry }"""
+        val hostEntry =
+          if (host.isNotEmpty()) """, "host": ${jsonStr(host)}""" else ""
+        streamBlocks += """"wsSettings": { "path": ${jsonStr(rawPath)}$hostEntry }"""
       }
       "httpupgrade" -> {
         val hostEntry = if (host.isNotEmpty()) """, "host": ${jsonStr(host)}""" else ""

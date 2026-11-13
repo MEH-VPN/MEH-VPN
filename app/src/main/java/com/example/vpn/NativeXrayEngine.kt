@@ -65,9 +65,28 @@ object NativeXrayEngine {
    * are automatically handled cleanly or converted when compatible.
    */
   fun supportsNativeXray(config: V2RayConfig): Boolean {
+    if (config.protocol == V2RayProtocol.TUIC) return false
+    if (config.protocol == V2RayProtocol.SERVERLESS) return true
+    if (config.address.isBlank() || config.port !in 1..65535) return false
+    val net = config.network.lowercase().trim()
+    // Legacy http/h2 transport was removed in Xray-core v26 (`unknown transport protocol: http`).
+    if (net == "h2" || net == "http") return false
+    if (config.security.equals("reality", ignoreCase = true)) {
+      val normalizedNet =
+        when (net) {
+          "grpc", "gun" -> "grpc"
+          "xhttp", "splithttp" -> "xhttp"
+          "tcp", "" -> "tcp"
+          else -> net
+        }
+      if (normalizedNet !in setOf("tcp", "xhttp", "grpc")) return false
+      if (config.pbk.isBlank()) return false
+    }
     return when (config.protocol) {
-      V2RayProtocol.TUIC -> false
-      else -> true
+      V2RayProtocol.SOCKS5,
+      V2RayProtocol.HTTP_PROXY -> true
+      V2RayProtocol.WIREGUARD -> config.authId.isNotBlank() && config.publicKey.isNotBlank()
+      else -> config.authId.isNotBlank()
     }
   }
 

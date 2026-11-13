@@ -397,6 +397,10 @@ class ExampleRobolectricTest {
       "Strict Xray JSON parser rejects unknown field 'tcpNoDelay'",
       jsonStr.contains("\"tcpNoDelay\""),
     )
+    org.junit.Assert.assertFalse(
+      "Xray-core v26 removed 'allowInsecure'",
+      jsonStr.contains("\"allowInsecure\""),
+    )
     val root = org.json.JSONObject(jsonStr)
     val inbounds = root.getJSONArray("inbounds")
     org.junit.Assert.assertEquals(2, inbounds.length())
@@ -420,6 +424,8 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertEquals("ws", stream.getString("network"))
     org.junit.Assert.assertEquals("tls", stream.getString("security"))
     org.junit.Assert.assertEquals("chrome", stream.getJSONObject("tlsSettings").getString("fingerprint"))
+    org.junit.Assert.assertFalse(stream.getJSONObject("tlsSettings").has("allowInsecure"))
+    org.junit.Assert.assertEquals("cdn.example.org", stream.getJSONObject("wsSettings").getString("host"))
     org.junit.Assert.assertEquals("fragment", stream.getJSONObject("sockopt").getString("dialerProxy"))
 
     val fragmentOutbound = outbounds.getJSONObject(1)
@@ -510,7 +516,29 @@ class ExampleRobolectricTest {
       "proxy",
       serverlessJson.getJSONArray("outbounds").getJSONObject(0).getString("tag"),
     )
+    val hy2Cfg =
+      com.example.model.V2RayConfigParser.parseSingleUri(
+        "hy2://hy2SecretAuth@hy2.example.org:443?sni=hy2.example.org&obfs=salamander&obfs-password=salamanderPass#Hysteria2"
+      )!!
+    val hy2Raw =
+      com.example.vpn.GfwKnockerXrayCore.buildXrayCoreJson(
+        config = hy2Cfg,
+        includeTunInbound = true,
+        localSocksPort = 20812,
+      )
+    org.junit.Assert.assertFalse(hy2Raw.contains("\"allowInsecure\""))
+    org.junit.Assert.assertEquals(
+      "hysteria",
+      org.json.JSONObject(hy2Raw).getJSONArray("outbounds").getJSONObject(0).getString("protocol"),
+    )
     assertTrue(com.example.vpn.NativeXrayEngine.supportsNativeXray(vlessWsTls))
+    assertTrue(com.example.vpn.NativeXrayEngine.supportsNativeXray(realityCfg))
+    org.junit.Assert.assertFalse(
+      com.example.vpn.NativeXrayEngine.supportsNativeXray(vlessWsTls.copy(network = "h2"))
+    )
+    org.junit.Assert.assertFalse(
+      com.example.vpn.NativeXrayEngine.supportsNativeXray(realityCfg.copy(network = "ws"))
+    )
     assertTrue(com.example.vpn.NativeXrayEngine.allocateLocalPort() in 1024..65535)
     com.example.vpn.MehVpnService.emitRealtimeLog(
       "کانفیگ سریع‌تر پیدا شد",
