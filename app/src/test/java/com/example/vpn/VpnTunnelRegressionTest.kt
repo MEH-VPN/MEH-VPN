@@ -1,9 +1,14 @@
 package com.example.vpn
 
+import android.app.job.JobInfo
+import android.app.job.JobScheduler
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import androidx.test.core.app.ApplicationProvider
+import com.example.data.DeadServerStore
+import com.example.data.VerifiedServerPoolStore
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
 import java.io.DataInputStream
@@ -499,5 +504,176 @@ class VpnTunnelRegressionTest {
     assertNotNull(libXrayCls.getDeclaredMethod("stopXray"))
     assertNotNull(libXrayCls.getDeclaredMethod("getXrayState"))
     assertNotNull(libXrayCls.getDeclaredMethod("ping", String::class.java))
+  }
+
+  @Test
+  fun verifiedServerPoolStore_ranksFastestPrunesExpiredAndDeadAndRotatesBatches() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    VerifiedServerPoolStore.clear(context)
+
+    val now = 1_800_000_000_000L
+    val slow =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@slow.example.org:443?security=tls&type=ws#Slow"
+      )!!.copy(latencyMs = 420L, speedScore = 50.0)
+    val fast =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@fast.example.org:443?security=tls&type=ws#Fast"
+      )!!.copy(latencyMs = 115L, speedScore = 180.0)
+    val medium =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@med.example.org:443?security=tls&type=ws#Med"
+      )!!.copy(latencyMs = 210L, speedScore = 120.0)
+
+    // Older entry tested 2 hours ago (valid within 6h TTL, but not within 45m fresh window).
+    VerifiedServerPoolStore.upsertVerified(context, listOf(slow), nowMs = now - 2L * 60L * 60L * 1000L)
+    // Fresh entries tested right now.
+    VerifiedServerPoolStore.upsertVerified(context, listOf(medium, fast), nowMs = now)
+
+    val allCached = VerifiedServerPoolStore.getFastest(context, nowMs = now)
+    assertEquals(
+      "Servers must be sorted fastest-first by latencyMs",
+      listOf(fast.endpointKey, medium.endpointKey, slow.endpointKey),
+      allCached.map { it.endpointKey },
+    )
+
+    val freshOnly = VerifiedServerPoolStore.getFastestFresh(context, nowMs = now)
+    assertEquals(
+      "Fresh query must exclude servers older than 45 minutes",
+      listOf(fast.endpointKey, medium.endpointKey),
+      freshOnly.map { it.endpointKey },
+    )
+
+    // Marking a server dead immediately hides it from VerifiedServerPoolStore reads.
+    DeadServerStore.markDead(context, fast.endpointKey)
+    val afterDead = VerifiedServerPoolStore.getFastestFresh(context, nowMs = now)
+    assertEquals(listOf(medium.endpointKey), afterDead.map { it.endpointKey })
+
+    // Hard TTL expiry (after 7 hours) prunes stale servers completely.
+    val afterExpiry = VerifiedServerPoolStore.getFastest(context, nowMs = now + 7L * 60L * 60L * 1000L)
+    assertTrue("Servers past 6h TTL must expire", afterExpiry.isEmpty())
+
+    // Batch rotation cursor wraps cleanly across runs.
+    assertEquals(0, VerifiedServerPoolStore.nextScanBatchIndex(context, totalBatches = 3))
+    assertEquals(1, VerifiedServerPoolStore.nextScanBatchIndex(context, totalBatches = 3))
+    assertEquals(2, VerifiedServerPoolStore.nextScanBatchIndex(context, totalBatches = 3))
+    assertEquals(0, VerifiedServerPoolStore.nextScanBatchIndex(context, totalBatches = 3))
+  }
+
+  @Test
+  fun gentleScanPolicy_protectsBatteryPowerSaverForegroundConnectAndMeteredData() {
+    val now = 1_800_000_000_000L
+
+    // Power Save Mode -> always skip.
+    assertEquals(
+      GentleScanDecision.SKIP_POWER_SAVE_MODE,
+      GentleScanPolicy.shouldRunGentleScan(
+        isPowerSaveMode = true,
+        batteryPercent = 85,
+        isCharging = false,
+        isForegroundConnectBusy = false,
+        lastScanAtMs = 0L,
+        nowMs = now,
+        cachedFreshCount = 0,
+      ),
+    )
+
+    // Low battery while discharging -> skip; while charging -> allow.
+    assertEquals(
+      GentleScanDecision.SKIP_LOW_BATTERY,
+      GentleScanPolicy.shouldRunGentleScan(
+        isPowerSaveMode = false,
+        batteryPercent = 12,
+        isCharging = false,
+        isForegroundConnectBusy = false,
+        lastScanAtMs = 0L,
+        nowMs = now,
+        cachedFreshCount = 0,
+      ),
+    )
+    assertEquals(
+      GentleScanDecision.RUN,
+      GentleScanPolicy.shouldRunGentleScan(
+        isPowerSaveMode = false,
+        batteryPercent = 12,
+        isCharging = true,
+        isForegroundConnectBusy = false,
+        lastScanAtMs = 0L,
+        nowMs = now,
+        cachedFreshCount = 0,
+      ),
+    )
+
+    // Foreground manual connect in flight -> skip so background never competes.
+    assertEquals(
+      GentleScanDecision.SKIP_FOREGROUND_BUSY,
+      GentleScanPolicy.shouldRunGentleScan(
+        isPowerSaveMode = false,
+        batteryPercent = 90,
+        isCharging = false,
+        isForegroundConnectBusy = true,
+        lastScanAtMs = 0L,
+        nowMs = now,
+        cachedFreshCount = 0,
+      ),
+    )
+
+    // Normal cooldown (10 min) enforced when pool is already healthy.
+    assertEquals(
+      GentleScanDecision.SKIP_COOLDOWN,
+      GentleScanPolicy.shouldRunGentleScan(
+        isPowerSaveMode = false,
+        batteryPercent = 90,
+        isCharging = false,
+        isForegroundConnectBusy = false,
+        lastScanAtMs = now - 5L * 60L * 1000L,
+        nowMs = now,
+        cachedFreshCount = 6,
+      ),
+    )
+
+    // Metered cellular limits must be strictly lighter than Wi-Fi limits.
+    val wifiLimits = GentleScanPolicy.computeLimits(isMetered = false)
+    val cellularLimits = GentleScanPolicy.computeLimits(isMetered = true)
+    assertTrue(cellularLimits.stage1Concurrency < wifiLimits.stage1Concurrency)
+    assertTrue(cellularLimits.maxConfigsToProbe < wifiLimits.maxConfigsToProbe)
+    assertTrue(cellularLimits.sourcesPerBatch <= wifiLimits.sourcesPerBatch)
+    assertTrue(wifiLimits.stage1Concurrency <= 4)
+  }
+
+  @Test
+  fun backgroundScannerJobService_isManifestDeclaredAndSchedulesIdempotently() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    VerifiedServerPoolStore.clear(context)
+
+    val svcInfo =
+      context.packageManager.getServiceInfo(
+        ComponentName(context, BackgroundServerScannerJobService::class.java),
+        0,
+      )
+    assertEquals(android.app.job.JobService.PERMISSION_BIND, svcInfo.permission)
+    assertFalse("Background JobService must not be exported", svcInfo.exported)
+
+    assertTrue(BackgroundServerScanScheduler.ensurePeriodicScheduled(context))
+    val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+    val periodicJob = scheduler.getPendingJob(BackgroundServerScanScheduler.PERIODIC_JOB_ID)
+    assertNotNull("Periodic gentle background job must be scheduled", periodicJob)
+    assertEquals(JobInfo.NETWORK_TYPE_ANY, periodicJob!!.networkType)
+    assertTrue(periodicJob.intervalMillis >= BackgroundServerScanScheduler.PERIODIC_INTERVAL_MS)
+
+    // Warm-up job schedules when fresh cache is empty.
+    assertTrue(BackgroundServerScanScheduler.scheduleWarmupIfNeeded(context))
+    assertNotNull(scheduler.getPendingJob(BackgroundServerScanScheduler.WARMUP_JOB_ID))
+
+    // Once pool has >= 4 fresh servers, warm-up is skipped to avoid unnecessary work.
+    val now = System.currentTimeMillis()
+    val fourFresh =
+      (1..4).map { idx ->
+        V2RayConfigParser.parseSingleUri(
+          "vless://11111111-2222-3333-4444-555555555555@fresh$idx.example.org:443?security=tls&type=ws#Fresh$idx"
+        )!!.copy(latencyMs = 100L + idx * 10L)
+      }
+    VerifiedServerPoolStore.upsertVerified(context, fourFresh, nowMs = now)
+    assertFalse(BackgroundServerScanScheduler.scheduleWarmupIfNeeded(context))
   }
 }

@@ -1448,6 +1448,78 @@ private suspend fun fetchFromSourceList(
             }
     }
 
+    /**
+     * Fast parallel verification of already-discovered cached servers (e.g., from
+     * [VerifiedServerPoolStore]) before downloading subscriptions. Probes up to [maxCandidates]
+     * servers concurrently over HTTPS + small bandwidth check within [timeoutMs] and returns
+     * passing nodes sorted fastest-first.
+     */
+    suspend fun quickVerifyCachedCandidates(
+        cachedCandidates: List<V2RayConfig>,
+        excludedEndpointKeys: Set<String> = emptySet(),
+        maxCandidates: Int = 6,
+        timeoutMs: Long = 3_600L,
+    ): List<V2RayConfig> = withContext(ioDispatcher) {
+        val candidates =
+            cachedCandidates
+                .filter {
+                    it.endpointKey !in excludedEndpointKeys &&
+                        V2RayOutboundClient.isSupportedByEngine(it) &&
+                        it.protocol != V2RayProtocol.HYSTERIA2 &&
+                        it.protocol != V2RayProtocol.TUIC &&
+                        it.protocol != V2RayProtocol.WIREGUARD
+                }
+                .distinctBy { it.endpointKey }
+                .take(maxCandidates.coerceAtLeast(1))
+        if (candidates.isEmpty()) return@withContext emptyList()
+
+        val passed = java.util.Collections.synchronizedList(mutableListOf<V2RayConfig>())
+        kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
+            coroutineScope {
+                candidates
+                    .map { cfg ->
+                        async {
+                            val resolvedIp =
+                                cfg.resolvedIp.ifBlank {
+                                    V2RayOutboundClient.resolveEndpointIpv4(cfg.address).orEmpty()
+                                }
+                            if (resolvedIp.isBlank()) return@async null
+                            val prepared = cfg.copy(resolvedIp = resolvedIp)
+                            val httpsJob = async {
+                                V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                                    config = prepared,
+                                    timeoutMs = 2600,
+                                )
+                            }
+                            val bandwidthJob = async {
+                                V2RayOutboundClient.measureSmallDownloadThroughputKbps(
+                                    config = prepared,
+                                    timeoutMs = 2400,
+                                    targetBytes = 16_384,
+                                )
+                            }
+                            val httpsLatency = httpsJob.await() ?: return@async null
+                            val throughputKbps = bandwidthJob.await() ?: return@async null
+                            if (throughputKbps < 25.0) return@async null
+                            val realPing = httpsLatency.coerceAtLeast(1L)
+                            val score =
+                                (10_000.0 / realPing.toDouble()) +
+                                    (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                            val verified =
+                                prepared.copy(
+                                    latencyMs = realPing,
+                                    speedScore = score,
+                                )
+                            passed.add(verified)
+                            verified
+                        }
+                    }
+                    .awaitAll()
+            }
+        }
+        rankVerifiedByPing(passed.toList(), poolSize = maxCandidates)
+    }
+
     fun measureNodeSpeed(
   config: V2RayConfig,
   timeoutMs: Int = 2600,

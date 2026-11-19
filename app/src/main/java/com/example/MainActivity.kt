@@ -115,12 +115,15 @@ import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VazirmatnFontFamily
+import com.example.vpn.BackgroundServerScanScheduler
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     MehTelemetry.initialize(this)
     MehTelemetry.logAppOpen("MehMinimalScreen")
+    BackgroundServerScanScheduler.ensurePeriodicScheduled(applicationContext)
+    BackgroundServerScanScheduler.scheduleWarmupIfNeeded(applicationContext)
     enableEdgeToEdge()
     setContent {
       MyApplicationTheme {

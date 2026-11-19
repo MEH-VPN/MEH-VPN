@@ -10,9 +10,12 @@ import com.example.data.DeadServerStore
 import com.example.data.MehConnectionMethod
 import com.example.data.UpdateChecker
 import com.example.data.SoliSpiritRepository
+import com.example.data.VerifiedServerPoolStore
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
+import com.example.vpn.BackgroundServerScanScheduler
+import com.example.vpn.BackgroundServerScannerJobService
 import com.example.vpn.MehVpnService
 import com.example.vpn.V2RayOutboundClient
 import java.util.ArrayList
@@ -409,52 +412,107 @@ class MehViewModel(
     workflowJob?.cancel()
     workflowJob =
       viewModelScope.launch {
+        BackgroundServerScannerJobService.setForegroundConnectBusy(true)
         try {
           val deadKeys = DeadServerStore.deadKeys(context)
           MehTelemetry.logConnectAttempt()
 
-          // Step 1 (Priority #1): دریافت لیست سرور ها از rzashakeri/v2ray-configs
-          _uiState.update {
-            it.copy(
-              phase = MehPhase.FETCHING_CONFIGS,
-              liveLogLine = LOG_FETCHING,
-              terminalLogs = emptyList(),
-              selectedConfig = null,
-              activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
-            )
-          }
+          // Step 0: Check freshly verified servers already discovered silently in the background.
+          val freshBackgroundPool =
+            VerifiedServerPoolStore.getFastestFresh(context)
+              .filter { it.endpointKey !in deadKeys }
 
           var verifiedCandidates: List<V2RayConfig> = emptyList()
 
-          _uiState.update {
-            it.copy(
-              phase = MehPhase.TESTING_SPEED,
-              liveLogLine = LOG_TESTING,
-            )
-          }
-          delay(120L)
-
-          // Connect immediately to the first verified config under 1000ms (no 60s blocking wait);
-          // background refinement keeps scanning subscriptions for faster servers afterward.
-          verifiedCandidates =
-            repository.scanBestCandidatesAcrossAllTiers(
-              prioritizedSavedNodes = cachedLastCandidates.filter { it.endpointKey !in deadKeys },
-              minScanDurationMs = 0L,
-              earlyStopPingMs = 1000L,
-              excludedEndpointKeys = deadKeys,
-            ) { logLine ->
-              val logLevel =
-                when {
-                  logLine.contains("تایید شد") || logLine.contains("اتصال به اولین") ->
-                    HackerLogLevel.SUCCESS
-                  logLine.contains("دریافت") || logLine.contains("مخزن") -> HackerLogLevel.SOURCE
-                  else -> HackerLogLevel.SCAN
-                }
-              appendLogLine(
-                message = logLine,
-                level = logLevel,
+          if (freshBackgroundPool.isNotEmpty()) {
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.TESTING_SPEED,
+                liveLogLine = LOG_TESTING,
+                terminalLogs = emptyList(),
+                selectedConfig = null,
+                activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
               )
             }
+            appendLogLine(
+              message = "بررسی سریع ${freshBackgroundPool.size} سرور آماده پس‌زمینه ...",
+              level = HackerLogLevel.SCAN,
+            )
+            val quickWinners =
+              repository.quickVerifyCachedCandidates(
+                cachedCandidates = freshBackgroundPool,
+                excludedEndpointKeys = deadKeys,
+              )
+            if (quickWinners.isNotEmpty()) {
+              verifiedCandidates = quickWinners
+              VerifiedServerPoolStore.upsertVerified(context, quickWinners)
+              val best = quickWinners.first()
+              appendLogLine(
+                message =
+                  "اتصال سریع به سرور آماده: ${best.cleanTitle} (${best.protocol.label} • پینگ ${best.latencyMs}ms)",
+                level = HackerLogLevel.SUCCESS,
+              )
+            } else {
+              freshBackgroundPool.take(6).forEach { stale ->
+                VerifiedServerPoolStore.removeEndpoint(context, stale.endpointKey)
+              }
+              appendLogLine(
+                message = "سرورهای آماده پاسخ ندادند؛ اسکن مخازن جدید ...",
+                level = HackerLogLevel.SOURCE,
+              )
+            }
+          } else {
+            // Step 1 (Priority #1): دریافت لیست سرور ها از rzashakeri/v2ray-configs
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.FETCHING_CONFIGS,
+                liveLogLine = LOG_FETCHING,
+                terminalLogs = emptyList(),
+                selectedConfig = null,
+                activeMethod = MehConnectionMethod.V2RAY_SOLISPIRIT,
+              )
+            }
+            _uiState.update {
+              it.copy(
+                phase = MehPhase.TESTING_SPEED,
+                liveLogLine = LOG_TESTING,
+              )
+            }
+            delay(120L)
+          }
+
+          if (verifiedCandidates.isEmpty()) {
+            val prioritized =
+              (VerifiedServerPoolStore.getFastest(context) + cachedLastCandidates)
+                .distinctBy { it.endpointKey }
+                .filter { it.endpointKey !in deadKeys }
+
+            // Connect immediately to the first verified config under 1000ms (no 60s blocking wait);
+            // background refinement keeps scanning subscriptions for faster servers afterward.
+            verifiedCandidates =
+              repository.scanBestCandidatesAcrossAllTiers(
+                prioritizedSavedNodes = prioritized,
+                minScanDurationMs = 0L,
+                earlyStopPingMs = 1000L,
+                excludedEndpointKeys = deadKeys,
+              ) { logLine ->
+                val logLevel =
+                  when {
+                    logLine.contains("تایید شد") || logLine.contains("اتصال به اولین") ->
+                      HackerLogLevel.SUCCESS
+                    logLine.contains("دریافت") || logLine.contains("مخزن") -> HackerLogLevel.SOURCE
+                    else -> HackerLogLevel.SCAN
+                  }
+                appendLogLine(
+                  message = logLine,
+                  level = logLevel,
+                )
+              }
+
+            if (verifiedCandidates.isNotEmpty()) {
+              VerifiedServerPoolStore.upsertVerified(context, verifiedCandidates)
+            }
+          }
 
           if (verifiedCandidates.isEmpty()) {
             MehTelemetry.logError(
@@ -471,9 +529,17 @@ class MehViewModel(
             return@launch
           }
 
+          val latestDeadKeys = DeadServerStore.deadKeys(context)
+          val combinedPool =
+            (verifiedCandidates +
+              VerifiedServerPoolStore.getFastest(context) +
+              cachedLastCandidates)
+              .filter { it.endpointKey !in latestDeadKeys }
+              .distinctBy { it.endpointKey }
+
           prepareAndStartVpn(
             context = context,
-            candidates = (verifiedCandidates + cachedLastCandidates.filter { it.endpointKey !in DeadServerStore.deadKeys(context) }).distinctBy { it.endpointKey },
+            candidates = combinedPool,
             onRequestVpnPermission = onRequestVpnPermission,
           )
         } catch (ce: CancellationException) {
@@ -491,6 +557,8 @@ class MehViewModel(
               terminalLogs = emptyList(),
             )
           }
+        } finally {
+          BackgroundServerScannerJobService.setForegroundConnectBusy(false)
         }
       }
   }
@@ -632,6 +700,8 @@ class MehViewModel(
     } catch (_: Exception) {}
 
     MehTelemetry.logDisconnected()
+    BackgroundServerScanScheduler.ensurePeriodicScheduled(context)
+    BackgroundServerScanScheduler.scheduleWarmupIfNeeded(context)
 
     _uiState.update { current ->
       current.copy(

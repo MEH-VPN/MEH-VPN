@@ -19,6 +19,7 @@ import com.example.MainActivity
 import com.example.R
 import com.example.data.DeadServerStore
 import com.example.data.SoliSpiritRepository
+import com.example.data.VerifiedServerPoolStore
 import com.example.model.V2RayConfig
 import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
@@ -101,6 +102,23 @@ class MehVpnService : VpnService() {
     super.onCreate()
     MehTelemetry.initialize(this)
     registerPhysicalNetworkTracker()
+    BackgroundServerScanScheduler.ensurePeriodicScheduled(applicationContext)
+    observeBackgroundVerifiedPool()
+  }
+
+  private fun observeBackgroundVerifiedPool() {
+    serviceScope.launch {
+      VerifiedServerPoolStore.poolUpdates.collect { freshServers ->
+        if (!_tunnelSession.value.isRunning || freshServers.isEmpty()) return@collect
+        val added = appendFreshStandbyServers(freshServers)
+        if (added > 0) {
+          android.util.Log.i(
+            "MehVpnService",
+            "Added $added freshly verified background server(s) to standby pool",
+          )
+        }
+      }
+    }
   }
 
   private fun registerPhysicalNetworkTracker() {
@@ -236,8 +254,17 @@ class MehVpnService : VpnService() {
       } catch (_: Exception) {}
       vpnInterface = null
 
+      val deadKeys = DeadServerStore.deadKeys(applicationContext)
+      val backgroundBackups =
+        VerifiedServerPoolStore.getFastest(applicationContext)
+          .filter { it.endpointKey !in deadKeys }
+      val mergedInputConfigs =
+        (configs + backgroundBackups)
+          .distinctBy { it.endpointKey }
+          .take(MAX_STANDBY_POOL_SIZE)
+
       val effectiveConfigs =
-        configs.map { cfg ->
+        mergedInputConfigs.map { cfg ->
           val ip =
             cfg.resolvedIp.ifBlank {
               V2RayOutboundClient.resolveEndpointIpv4(cfg.address).orEmpty()
@@ -285,6 +312,7 @@ class MehVpnService : VpnService() {
           lastError = "سرور ${candidate.cleanTitle} ترافیک اینترنت را عبور نداد"
         }
         DeadServerStore.markDead(applicationContext, candidate.endpointKey)
+        VerifiedServerPoolStore.removeEndpoint(applicationContext, candidate.endpointKey)
       }
 
       val active =
@@ -350,6 +378,10 @@ class MehVpnService : VpnService() {
 
       sessionConnectedAtMs = System.currentTimeMillis()
       initialUpgradeCompleted = effectivePing <= FAST_ENOUGH_PING_MS
+      VerifiedServerPoolStore.upsertVerified(
+        applicationContext,
+        listOf(active.copy(latencyMs = effectivePing)),
+      )
 
       emitRealtimeLog(
         "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
@@ -572,8 +604,33 @@ class MehVpnService : VpnService() {
       val merged =
         (serverPool + more.filter { NativeXrayEngine.supportsNativeXray(it) })
           .distinctBy { it.endpointKey }
+          .take(MAX_STANDBY_POOL_SIZE)
       serverPool = merged
       return merged.size
+    }
+  }
+
+  /**
+   * Appends newly discovered verified servers that are not yet in [serverPool] without moving
+   * [poolCursor] or interrupting the active tunnel, so repeated manual switches cycle smoothly
+   * into newly found background servers.
+   */
+  private fun appendFreshStandbyServers(candidates: List<V2RayConfig>): Int {
+    if (candidates.isEmpty()) return 0
+    val deadKeys = DeadServerStore.deadKeys(applicationContext)
+    val supported =
+      candidates.filter {
+        it.endpointKey !in deadKeys && NativeXrayEngine.supportsNativeXray(it)
+      }
+    if (supported.isEmpty()) return 0
+    synchronized(poolLock) {
+      val existingKeys = serverPool.map { it.endpointKey }.toSet()
+      val brandNew = supported.filter { it.endpointKey !in existingKeys }
+      if (brandNew.isEmpty()) return 0
+      val merged = (serverPool + brandNew).distinctBy { it.endpointKey }.take(MAX_STANDBY_POOL_SIZE)
+      val addedCount = (merged.size - serverPool.size).coerceAtLeast(0)
+      serverPool = merged
+      return addedCount
     }
   }
 
@@ -636,6 +693,7 @@ class MehVpnService : VpnService() {
     failedCfg: V2RayConfig,
     reason: String,
   ): Pair<V2RayConfig, Long?> {
+    appendFreshStandbyServers(VerifiedServerPoolStore.getFastest(applicationContext))
     var abandonedCfg = failedCfg
     val poolSize = currentPoolSnapshot().size.coerceAtLeast(1)
     var attempts = 0
@@ -644,8 +702,10 @@ class MehVpnService : VpnService() {
       attempts++
       if (nextCfg.endpointKey == abandonedCfg.endpointKey) break
       DeadServerStore.markDead(applicationContext, abandonedCfg.endpointKey)
+      VerifiedServerPoolStore.removeEndpoint(applicationContext, abandonedCfg.endpointKey)
       val ping = verifyRealPathViaProxy(localSocksPort)
       if (ping != null) {
+        VerifiedServerPoolStore.upsertVerified(applicationContext, listOf(nextCfg.copy(latencyMs = ping)))
         return nextCfg to ping
       }
       abandonedCfg = nextCfg
@@ -655,6 +715,7 @@ class MehVpnService : VpnService() {
 
   private fun handleManualSwitchServer() {
     val beforeCfg = currentActiveConfig() ?: return
+    appendFreshStandbyServers(VerifiedServerPoolStore.getFastest(applicationContext))
     val poolSize = currentPoolSnapshot().size
     if (poolSize <= 1) {
       serviceScope.launch {
@@ -682,6 +743,7 @@ class MehVpnService : VpnService() {
       while (attempts < 3) {
         val realPing = verifyRealPathViaProxy(localSocksPort)
         if (realPing != null) {
+          VerifiedServerPoolStore.upsertVerified(applicationContext, listOf(candidate.copy(latencyMs = realPing)))
           emitRealtimeLog(
             "سرور جدید متصل شد: ${candidate.cleanTitle} (پینگ ${realPing}ms)",
             VpnLogLevel.SUCCESS,
@@ -692,6 +754,7 @@ class MehVpnService : VpnService() {
         attempts++
         if (attempts >= 3) break
         DeadServerStore.markDead(applicationContext, candidate.endpointKey)
+        VerifiedServerPoolStore.removeEndpoint(applicationContext, candidate.endpointKey)
         val nextCfg = switchToNextHealthyNode("manual_verification") ?: break
         if (nextCfg.endpointKey == candidate.endpointKey) break
         candidate = nextCfg
@@ -985,8 +1048,10 @@ class MehVpnService : VpnService() {
     val nonActiveFresh = fresh.filter { it.endpointKey != active.endpointKey }
     val best = nonActiveFresh.firstOrNull() ?: return false
 
-    // Always place freshly verified fast backups right after the active node in the standby pool.
+    // Always place freshly verified fast backups right after the active node in the standby pool
+    // and persist them to VerifiedServerPoolStore for future fast reconnects & switches.
     val standbyCount = prioritizeStandbyPool(active, nonActiveFresh)
+    VerifiedServerPoolStore.upsertVerified(applicationContext, nonActiveFresh)
 
     val currentPing = _tunnelSession.value.currentPingMs.coerceAtLeast(1L)
     val elapsedMs = (System.currentTimeMillis() - sessionConnectedAtMs).coerceAtLeast(0L)
@@ -1093,6 +1158,8 @@ class MehVpnService : VpnService() {
       @Suppress("DEPRECATION")
       stopForeground(true)
     }
+    BackgroundServerScanScheduler.ensurePeriodicScheduled(applicationContext)
+    BackgroundServerScanScheduler.scheduleWarmupIfNeeded(applicationContext)
     stopSelf()
   }
 
