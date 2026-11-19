@@ -525,7 +525,21 @@ class MehVpnService : VpnService() {
     val previousActive = currentActiveConfig()
     val previousFrag = activeUseFragment
 
+    // Pre-verify challengers on an isolated temporary Xray port FIRST so we never tear down the
+    // live SOCKS5 Xray instance unless a challenger is already proven to pass native Xray HTTPS.
     for ((idx, candidate) in clean.take(3).withIndex()) {
+      val isolatedPing =
+        NativeXrayEngine.pingConfig(
+          datDir = filesDir.absolutePath,
+          tempDir = cacheDir,
+          config = candidate,
+          timeoutSec = 4,
+          protectFd = { fd ->
+            if (vpnInterface == null) true else try { protect(fd) } catch (_: Throwable) { true }
+          },
+        )
+      if (isolatedPing == null) continue
+
       val (verifiedCfg, livePing, _) =
         launchVerifiedNativeXraySocks(
           candidate = candidate,
@@ -539,10 +553,14 @@ class MehVpnService : VpnService() {
         }
         return verifiedCfg.copy(latencyMs = livePing)
       }
+      // Restore previous working node immediately before trying another challenger.
+      if (previousActive != null) {
+        launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
+      }
     }
 
-    // Challengers did not pass real Xray traffic; restore the previous working node.
-    if (previousActive != null) {
+    // Ensure the previous working node is still running on the live SOCKS5 port.
+    if (previousActive != null && !NativeXrayEngine.isRunning()) {
       launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
     }
     return null
@@ -606,62 +624,43 @@ class MehVpnService : VpnService() {
     )
   }
 
+  /**
+   * Verifies real TLS/HTTPS connectivity through the live local SOCKS5 Xray inbound.
+   * Never falls back to plain HTTP port 80 so TLS-broken or captive proxies cannot pass.
+   */
   private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
     if (proxyPort <= 0) return null
-    return verifyHttpsViaProxy(proxyPort, timeoutMs)
-      ?: verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
+    return verifyHttpsViaProxy(proxyPort, "www.google.com", timeoutMs)
+      ?: verifyHttpsViaProxy(proxyPort, "cp.cloudflare.com", timeoutMs.coerceAtMost(3000))
   }
 
-  private fun verifyHttpsViaProxy(proxyPort: Int, timeoutMs: Int): Long? {
+  private fun verifyHttpsViaProxy(
+    proxyPort: Int,
+    targetHost: String = "www.google.com",
+    timeoutMs: Int = 3500,
+  ): Long? {
     val startedNs = System.nanoTime()
     var socket: Socket? = null
     return try {
       val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
       socket = Socket(proxy)
       socket.soTimeout = timeoutMs
-      socket.connect(InetSocketAddress.createUnresolved("www.google.com", 443), timeoutMs)
+      socket.connect(InetSocketAddress.createUnresolved(targetHost, 443), timeoutMs)
       val (tlsIn, tlsOut) =
         GfwKnockerXrayCore.openSslEngineOverStreams(
           sslContext = javax.net.ssl.SSLContext.getDefault(),
           rawIn = socket.getInputStream(),
           rawOut = socket.getOutputStream(),
-          sniHost = "www.google.com",
+          sniHost = targetHost,
           port = 443,
           alpnProtocols = arrayOf("http/1.1"),
         )
-      val request = "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
+      val request = "GET /generate_204 HTTP/1.1\r\nHost: $targetHost\r\nConnection: close\r\n\r\n"
       tlsOut.write(request.toByteArray(Charsets.US_ASCII))
       tlsOut.flush()
       val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
       val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
-      if (code == 204) {
-        val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
-        MehDiag.recordBytesDownloaded(128L)
-        ms
-      } else {
-        null
-      }
-    } catch (_: Exception) {
-      null
-    } finally {
-      try { socket?.close() } catch (_: Exception) {}
-    }
-  }
-
-  private fun verifyHttp204ViaProxy(proxyPort: Int, timeoutMs: Int): Long? {
-    val startedNs = System.nanoTime()
-    var socket: Socket? = null
-    return try {
-      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
-      socket = Socket(proxy)
-      socket.soTimeout = timeoutMs
-      socket.connect(InetSocketAddress.createUnresolved("www.google.com", 80), timeoutMs)
-      val request = "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"
-      socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
-      socket.getOutputStream().flush()
-      val statusLine = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII)).readLine()
-      val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
-      if (code == 204) {
+      if (code == 204 || code == 200) {
         val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
         MehDiag.recordBytesDownloaded(128L)
         ms
@@ -779,7 +778,7 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         var tickCount = 0
         var consecutiveFailures = 0
-        var lastTotalRxBytes = safeTotalRxBytes()
+        var lastOtherAppsRxBytes = safeOtherAppsRxBytes()
 
         if (BuildConfig.DEBUG) {
           launch {
@@ -791,60 +790,68 @@ class MehVpnService : VpnService() {
         }
 
         while (isActive) {
-          delay(KEEP_ALIVE_INTERVAL_MS)
+          delay(if (tickCount == 0) KEEP_ALIVE_FIRST_CHECK_MS else KEEP_ALIVE_INTERVAL_MS)
           tickCount++
           var activeCfg = currentActiveConfig() ?: continue
 
-          val nowRxBytes = safeTunnelRxBytes()
-          if (lastTotalRxBytes >= 0L && nowRxBytes > lastTotalRxBytes + 8192L) {
-            MehDiag.recordRealDownloadBytes(nowRxBytes - lastTotalRxBytes)
-          }
-          lastTotalRxBytes = nowRxBytes
+          val nowOtherRxBytes = safeOtherAppsRxBytes()
+          val rxDelta =
+            if (lastOtherAppsRxBytes >= 0L && nowOtherRxBytes >= lastOtherAppsRxBytes) {
+              nowOtherRxBytes - lastOtherAppsRxBytes
+            } else {
+              0L
+            }
+          lastOtherAppsRxBytes = nowOtherRxBytes
 
-          if (MehDiag.hasRecentRealDownloadTraffic(ACTIVE_TRAFFIC_SKIP_WINDOW_MS)) {
+          if (rxDelta > 16_384L) {
+            MehDiag.recordRealDownloadBytes(rxDelta)
             MehDiag.recordKeepAliveSkippedActiveTraffic()
             consecutiveFailures = 0
           } else {
             MehDiag.recordKeepAliveProbeRun()
-            val realPing = verifyRealPathViaProxy(localSocksPort)
-            val confirmedPing = realPing ?: verifyNodeCapability(activeCfg)
-            if (confirmedPing != null) {
-              lastPing = confirmedPing
+            if (!NativeXrayEngine.isRunning() && localSocksPort > 0) {
+              launchNativeXraySocksCore(activeCfg, localSocksPort, useFragmentOverride = activeUseFragment)
+            }
+            var realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 4000)
+            if (realPing == null) {
+              delay(1_500L)
+              realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 4000)
+            }
+            if (realPing != null) {
+              lastPing = realPing
               consecutiveFailures = 0
             } else {
               consecutiveFailures++
-              if (consecutiveFailures >= CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER) {
-                val (switchedCfg, switchedPing) =
-                  failoverToNextVerifiedNode(activeCfg, "keep_alive_timeout")
-                if (switchedCfg.endpointKey != activeCfg.endpointKey) {
-                  activeCfg = switchedCfg
-                  consecutiveFailures = 0
-                  emitRealtimeLog(
-                    "افت یا قطع نود قبلی؛ انتقال خودکار به ${switchedCfg.cleanTitle}" +
-                      if (switchedPing != null) " (${switchedPing}ms)" else "",
-                    VpnLogLevel.SYSTEM,
-                  )
-                  if (switchedPing != null) {
-                    lastPing = switchedPing
-                  } else {
-                    launch {
-                      try {
-                        refineNodesOnce(force = true)
-                      } catch (_: Exception) {}
-                    }
-                  }
+              val (switchedCfg, switchedPing) =
+                failoverToNextVerifiedNode(activeCfg, "keep_alive_timeout")
+              if (switchedCfg.endpointKey != activeCfg.endpointKey) {
+                activeCfg = switchedCfg
+                consecutiveFailures = 0
+                emitRealtimeLog(
+                  "افت یا قطع نود قبلی؛ انتقال خودکار به ${switchedCfg.cleanTitle}" +
+                    if (switchedPing != null) " (${switchedPing}ms)" else "",
+                  VpnLogLevel.SYSTEM,
+                )
+                if (switchedPing != null) {
+                  lastPing = switchedPing
                 } else {
                   launch {
                     try {
                       refineNodesOnce(force = true)
                     } catch (_: Exception) {}
                   }
-                  if (consecutiveFailures == 3) {
-                    MehTelemetry.logError(
-                      stage = "keep_alive_probe",
-                      errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
-                    )
-                  }
+                }
+              } else {
+                launch {
+                  try {
+                    refineNodesOnce(force = true)
+                  } catch (_: Exception) {}
+                }
+                if (consecutiveFailures == 3) {
+                  MehTelemetry.logError(
+                    stage = "keep_alive_probe",
+                    errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+                  )
                 }
               }
             }
@@ -866,59 +873,46 @@ class MehVpnService : VpnService() {
       }
   }
 
-  private fun safeTotalRxBytes(): Long {
-    return try {
-      TrafficStats.getTotalRxBytes()
-    } catch (_: Throwable) {
-      -1L
-    }
-  }
-
   /**
-   * Reads total RX bytes flowing through `hev-socks5-tunnel` (excludes our own disallowed app
-   * process so background probing never masquerades as user traffic). Falls back to
-   * [TrafficStats.getTotalRxBytes] if native stats are unavailable.
+   * Reads RX bytes for all apps EXCEPT our own process (using standard Android [TrafficStats] +
+   * [android.os.Process.myUid]) so background probing never counts as user traffic and we avoid
+   * extra JNI stats calls into `hev-socks5-tunnel`.
    */
-  private fun safeTunnelRxBytes(): Long {
-    if (hevTunnelRunning) {
-      try {
-        val stats = TProxyService.TProxyGetStats()
-        if (stats != null && stats.size >= 4 && stats[3] >= 0L) {
-          return stats[3]
-        }
-      } catch (_: Throwable) {}
+  private fun safeOtherAppsRxBytes(): Long {
+    return try {
+      val totalRx = TrafficStats.getTotalRxBytes()
+      if (totalRx < 0L) return -1L
+      val ownRx = TrafficStats.getUidRxBytes(android.os.Process.myUid()).coerceAtLeast(0L)
+      (totalRx - ownRx).coerceAtLeast(0L)
+    } catch (_: Throwable) {
+      -1L
     }
-    return safeTotalRxBytes()
   }
 
-  /** Reads combined TX + RX bytes passing through the VPN tunnel for active-traffic detection. */
-  private fun safeTunnelTotalBytes(): Long {
-    if (hevTunnelRunning) {
-      try {
-        val stats = TProxyService.TProxyGetStats()
-        if (stats != null && stats.size >= 4 && stats[1] >= 0L && stats[3] >= 0L) {
-          return stats[1] + stats[3]
-        }
-      } catch (_: Throwable) {}
-    }
+  /** Reads combined TX + RX bytes for all other apps (excluding our own UID). */
+  private fun safeOtherAppsTotalBytes(): Long {
     return try {
-      val rx = TrafficStats.getTotalRxBytes()
-      val tx = TrafficStats.getTotalTxBytes()
-      if (rx >= 0L && tx >= 0L) rx + tx else -1L
+      val totalRx = TrafficStats.getTotalRxBytes()
+      val totalTx = TrafficStats.getTotalTxBytes()
+      if (totalRx < 0L || totalTx < 0L) return -1L
+      val myUid = android.os.Process.myUid()
+      val ownRx = TrafficStats.getUidRxBytes(myUid).coerceAtLeast(0L)
+      val ownTx = TrafficStats.getUidTxBytes(myUid).coerceAtLeast(0L)
+      ((totalRx - ownRx).coerceAtLeast(0L) + (totalTx - ownTx).coerceAtLeast(0L))
     } catch (_: Throwable) {
       -1L
     }
   }
 
   /**
-   * Samples VPN tunnel byte counters over [ACTIVE_TRAFFIC_SAMPLE_MS] to detect active downloads,
-   * video playback, or calls so a background upgrade never drops an in-progress user session.
+   * Samples other-app network byte counters over [ACTIVE_TRAFFIC_SAMPLE_MS] to detect active
+   * downloads, video playback, or calls so a background upgrade never drops an in-progress session.
    */
   private suspend fun isUserTunnelTrafficActive(): Boolean {
-    val before = safeTunnelTotalBytes()
+    val before = safeOtherAppsTotalBytes()
     if (before < 0L) return false
     delay(ACTIVE_TRAFFIC_SAMPLE_MS)
-    val after = safeTunnelTotalBytes()
+    val after = safeOtherAppsTotalBytes()
     if (after < before) return false
     return (after - before) >= ACTIVE_TRAFFIC_THRESHOLD_BYTES
   }
@@ -1278,10 +1272,9 @@ class MehVpnService : VpnService() {
     private const val REFINE_CONCURRENCY = 16
 
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
-    private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
-    private const val ACTIVE_TRAFFIC_SKIP_WINDOW_MS = 30_000L
-    private const val CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER = 2
-    private const val HEARTBEAT_EVERY_N_TICKS = 13
+    private const val KEEP_ALIVE_FIRST_CHECK_MS = 10_000L
+    private const val KEEP_ALIVE_INTERVAL_MS = 25_000L
+    private const val HEARTBEAT_EVERY_N_TICKS = 24
 
     internal fun decideBackgroundRefineAction(
       forceFailover: Boolean,

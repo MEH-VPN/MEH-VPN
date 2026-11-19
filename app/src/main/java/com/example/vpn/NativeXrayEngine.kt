@@ -114,8 +114,17 @@ object NativeXrayEngine {
         try {
           if (LibXray.getXrayState()) {
             LibXray.stopXray()
+            var waitedMs = 0L
+            while (waitedMs < 600L && LibXray.getXrayState()) {
+              try {
+                Thread.sleep(40L)
+              } catch (_: InterruptedException) {
+                break
+              }
+              waitedMs += 40L
+            }
             try {
-              Thread.sleep(60L)
+              Thread.sleep(120L)
             } catch (_: InterruptedException) {}
           }
         } catch (_: Throwable) {}
@@ -126,16 +135,30 @@ object NativeXrayEngine {
         }
 
         val reqB64 = LibXray.newXrayRunFromJSONRequest(datDir, configJson)
-        val rawRespB64 = LibXray.runXrayFromJSON(reqB64)
-        val parsed = parseResponseJson(rawRespB64)
-        val ok = parsed?.optBoolean("success", false) ?: false
-        if (ok) {
-          StartResult(success = true)
-        } else {
-          val errMsg = parsed?.optString("error").orEmpty().ifBlank { "runXrayFromJSON failed" }
-          Log.w(TAG, "Native Xray start error: $errMsg")
-          StartResult(success = false, error = errMsg)
+        var lastErr = "runXrayFromJSON failed"
+        for (attempt in 0 until 3) {
+          val rawRespB64 = LibXray.runXrayFromJSON(reqB64)
+          val parsed = parseResponseJson(rawRespB64)
+          val ok = parsed?.optBoolean("success", false) ?: false
+          if (ok) {
+            return StartResult(success = true)
+          }
+          lastErr = parsed?.optString("error").orEmpty().ifBlank { "runXrayFromJSON failed" }
+          val isPortBusy =
+            lastErr.contains("address already in use", ignoreCase = true) ||
+              lastErr.contains("bind:", ignoreCase = true)
+          if (!isPortBusy || attempt == 2) {
+            break
+          }
+          Log.w(TAG, "Native Xray port busy (attempt ${attempt + 1}), retrying: $lastErr")
+          try {
+            Thread.sleep(250L)
+          } catch (_: InterruptedException) {
+            break
+          }
         }
+        Log.w(TAG, "Native Xray start error: $lastErr")
+        StartResult(success = false, error = lastErr)
       } catch (t: Throwable) {
         Log.e(TAG, "Native Xray exception", t)
         StartResult(
