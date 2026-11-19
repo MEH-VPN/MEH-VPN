@@ -87,6 +87,8 @@ class MehVpnService : VpnService() {
   private var keepAliveJob: Job? = null
   private var refineJob: Job? = null
   private var topUpPoolJob: Job? = null
+  @Volatile private var sessionConnectedAtMs: Long = 0L
+  @Volatile private var initialUpgradeCompleted: Boolean = false
 
   private val nodeRepository by lazy { SoliSpiritRepository() }
   @Volatile private var refineBatchIndex: Int = 0
@@ -346,14 +348,16 @@ class MehVpnService : VpnService() {
           errorMessage = null,
         )
 
+      sessionConnectedAtMs = System.currentTimeMillis()
+      initialUpgradeCompleted = effectivePing <= FAST_ENOUGH_PING_MS
+
       emitRealtimeLog(
         "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
         VpnLogLevel.SUCCESS,
       )
 
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
-      startBackgroundNodeRefinement()
-      startPoolTopUpAfterConnect()
+      startBackgroundNodeRefinement(effectivePing)
     } catch (ce: CancellationException) {
       throw ce
     } catch (t: Throwable) {
@@ -552,6 +556,36 @@ class MehVpnService : VpnService() {
           .distinctBy { it.endpointKey }
       serverPool = merged
       return merged.size
+    }
+  }
+
+  /**
+   * Places newly discovered fast standby servers immediately after [active] (index 0) so the next
+   * automatic failover or manual switch picks the fastest verified standby server right away
+   * without interrupting the current active connection.
+   */
+  private fun prioritizeStandbyPool(
+    active: V2RayConfig,
+    standbyCandidates: List<V2RayConfig>,
+  ): Int {
+    val cleanStandby =
+      standbyCandidates
+        .filter { it.endpointKey != active.endpointKey && NativeXrayEngine.supportsNativeXray(it) }
+        .distinctBy { it.endpointKey }
+    if (cleanStandby.isEmpty()) return currentPoolSnapshot().size
+    synchronized(poolLock) {
+      val existingOthers =
+        serverPool.filter { existing ->
+          existing.endpointKey != active.endpointKey &&
+            cleanStandby.none { it.endpointKey == existing.endpointKey }
+        }
+      val reordered =
+        (listOf(active) + cleanStandby + existingOthers)
+          .distinctBy { it.endpointKey }
+          .take(MAX_STANDBY_POOL_SIZE)
+      serverPool = reordered
+      poolCursor.set(0)
+      return reordered.size
     }
   }
 
@@ -761,9 +795,9 @@ class MehVpnService : VpnService() {
           tickCount++
           var activeCfg = currentActiveConfig() ?: continue
 
-          val nowRxBytes = safeTotalRxBytes()
+          val nowRxBytes = safeTunnelRxBytes()
           if (lastTotalRxBytes >= 0L && nowRxBytes > lastTotalRxBytes + 8192L) {
-            MehDiag.recordBytesDownloaded(nowRxBytes - lastTotalRxBytes)
+            MehDiag.recordRealDownloadBytes(nowRxBytes - lastTotalRxBytes)
           }
           lastTotalRxBytes = nowRxBytes
 
@@ -840,64 +874,111 @@ class MehVpnService : VpnService() {
     }
   }
 
-  private fun startBackgroundNodeRefinement() {
+  /**
+   * Reads total RX bytes flowing through `hev-socks5-tunnel` (excludes our own disallowed app
+   * process so background probing never masquerades as user traffic). Falls back to
+   * [TrafficStats.getTotalRxBytes] if native stats are unavailable.
+   */
+  private fun safeTunnelRxBytes(): Long {
+    if (hevTunnelRunning) {
+      try {
+        val stats = TProxyService.TProxyGetStats()
+        if (stats != null && stats.size >= 4 && stats[3] >= 0L) {
+          return stats[3]
+        }
+      } catch (_: Throwable) {}
+    }
+    return safeTotalRxBytes()
+  }
+
+  /** Reads combined TX + RX bytes passing through the VPN tunnel for active-traffic detection. */
+  private fun safeTunnelTotalBytes(): Long {
+    if (hevTunnelRunning) {
+      try {
+        val stats = TProxyService.TProxyGetStats()
+        if (stats != null && stats.size >= 4 && stats[1] >= 0L && stats[3] >= 0L) {
+          return stats[1] + stats[3]
+        }
+      } catch (_: Throwable) {}
+    }
+    return try {
+      val rx = TrafficStats.getTotalRxBytes()
+      val tx = TrafficStats.getTotalTxBytes()
+      if (rx >= 0L && tx >= 0L) rx + tx else -1L
+    } catch (_: Throwable) {
+      -1L
+    }
+  }
+
+  /**
+   * Samples VPN tunnel byte counters over [ACTIVE_TRAFFIC_SAMPLE_MS] to detect active downloads,
+   * video playback, or calls so a background upgrade never drops an in-progress user session.
+   */
+  private suspend fun isUserTunnelTrafficActive(): Boolean {
+    val before = safeTunnelTotalBytes()
+    if (before < 0L) return false
+    delay(ACTIVE_TRAFFIC_SAMPLE_MS)
+    val after = safeTunnelTotalBytes()
+    if (after < before) return false
+    return (after - before) >= ACTIVE_TRAFFIC_THRESHOLD_BYTES
+  }
+
+  /**
+   * Smart, non-disruptive background refinement:
+   * - If the initial server is already fast (<= 350ms), warms up a standby pool once and stops
+   *   scanning so active calls/downloads and IP stability are never disturbed.
+   * - If the initial server is slow (> 350ms), searches during a short 2-minute initial upgrade
+   *   window to perform at most ONE upgrade when the tunnel is idle; afterwards (or if user
+   *   traffic is active), faster servers are placed at the front of the standby pool for instant
+   *   failover or manual switching.
+   */
+  private fun startBackgroundNodeRefinement(initialPingMs: Long) {
     refineJob?.cancel()
     refineBatchIndex = 0
     refineJob =
       serviceScope.launch {
-        delay(REFINE_FIRST_DELAY_MS)
-        var lastSwitchAtMs = 0L
-        while (isActive) {
-          var switched = false
-          try {
-            if (System.currentTimeMillis() - lastSwitchAtMs >= REFINE_MIN_SWITCH_GAP_MS) {
-              switched = refineNodesOnce()
-              if (switched) {
-                lastSwitchAtMs = System.currentTimeMillis()
-              }
+        if (initialUpgradeCompleted) {
+          delay(STANDBY_WARMUP_DELAY_MS)
+          if (currentPoolSnapshot().size < STANDBY_POOL_TARGET_SIZE) {
+            try {
+              refineNodesOnce(force = false)
+            } catch (ce: CancellationException) {
+              throw ce
+            } catch (t: Throwable) {
+              android.util.Log.w("MehRefine", "standby warm-up failed: ${t.javaClass.simpleName}")
             }
+          }
+          return@launch
+        }
+
+        emitRealtimeLog(
+          "سرور فعلی پینگ ${initialPingMs}ms دارد؛ جستجوی ارتقای یک‌باره در پس‌زمینه فعال شد...",
+          VpnLogLevel.SYSTEM,
+        )
+        delay(REFINE_FIRST_DELAY_MS)
+        var attempts = 0
+        while (isActive && !initialUpgradeCompleted && attempts < MAX_INITIAL_UPGRADE_ATTEMPTS) {
+          val elapsed = System.currentTimeMillis() - sessionConnectedAtMs
+          if (elapsed > INITIAL_UPGRADE_WINDOW_MS) break
+          attempts++
+          var upgraded = false
+          try {
+            upgraded = refineNodesOnce(force = false)
           } catch (ce: CancellationException) {
             throw ce
           } catch (t: Throwable) {
-            android.util.Log.w("MehRefine", "refinement cycle failed: ${t.javaClass.simpleName}")
+            android.util.Log.w("MehRefine", "initial upgrade scan failed: ${t.javaClass.simpleName}")
           }
-          val activePing = _tunnelSession.value.currentPingMs
-          val nextDelay =
-            when {
-              isPhysicalNetworkMetered() -> REFINE_INTERVAL_METERED_MS
-              activePing <= 0L || activePing > 300L -> REFINE_INTERVAL_FAST_HUNT_MS
-              activePing > 150L -> REFINE_INTERVAL_MODERATE_MS
-              else -> REFINE_INTERVAL_MS
+          if (upgraded || initialUpgradeCompleted) break
+          val remainingMs = INITIAL_UPGRADE_WINDOW_MS - (System.currentTimeMillis() - sessionConnectedAtMs)
+          if (remainingMs <= 3_000L) break
+          val stepDelay =
+            if (isPhysicalNetworkMetered()) {
+              REFINE_RETRY_METERED_MS
+            } else {
+              REFINE_RETRY_IDLE_MS
             }
-          delay(if (switched) nextDelay.coerceAtLeast(20_000L) else nextDelay)
-        }
-      }
-  }
-
-  private fun startPoolTopUpAfterConnect() {
-    topUpPoolJob?.cancel()
-    topUpPoolJob =
-      serviceScope.launch {
-        delay(POOL_TOP_UP_DELAY_MS)
-        val currentPool = currentPoolSnapshot()
-        val needed = POOL_TOP_UP_TARGET_SIZE - currentPool.size
-        if (needed <= 0) return@launch
-        val deadKeys = DeadServerStore.deadKeys(applicationContext)
-        val excluded = currentPool.map { it.endpointKey }.toSet() + deadKeys
-        val found =
-          try {
-            nodeRepository.findFirstPassingFromSources(
-              sources = SoliSpiritRepository.MHCFP_SOURCES + SoliSpiritRepository.FALLBACK_SOURCES,
-              poolSize = needed,
-              excludedEndpointKeys = excluded,
-            ) { _ -> }
-          } catch (ce: CancellationException) {
-            throw ce
-          } catch (_: Exception) {
-            emptyList()
-          }
-        if (found.isNotEmpty()) {
-          appendToServerPool(found)
+          delay(stepDelay.coerceAtMost(remainingMs))
         }
       }
   }
@@ -912,8 +993,13 @@ class MehVpnService : VpnService() {
     val batchIdx = if (batches.isNotEmpty()) (refineBatchIndex++ % batches.size) else 0
     val batch = batches.getOrNull(batchIdx).orEmpty()
     val sourceLabel = batch.firstOrNull()?.repoLabel ?: "ساب‌ها"
+    val standbyOnlyMode = !force && (initialUpgradeCompleted || (System.currentTimeMillis() - sessionConnectedAtMs) > INITIAL_UPGRADE_WINDOW_MS)
     emitRealtimeLog(
-      "جستجوی سرور سریع‌تر در پس‌زمینه ($sourceLabel • دسته ${batchIdx + 1}/${batches.size.coerceAtLeast(1)}) ...",
+      if (standbyOnlyMode) {
+        "آماده‌سازی صف سرورهای ذخیره ($sourceLabel • دسته ${batchIdx + 1}/${batches.size.coerceAtLeast(1)}) ..."
+      } else {
+        "جستجوی سرور سریع‌تر در پس‌زمینه ($sourceLabel • دسته ${batchIdx + 1}/${batches.size.coerceAtLeast(1)}) ..."
+      },
       VpnLogLevel.SOURCE,
     )
 
@@ -941,17 +1027,6 @@ class MehVpnService : VpnService() {
       VpnLogLevel.SCAN,
     )
 
-    val currentScored =
-      nodeRepository
-        .testAndSelectFastestCandidates(
-          configs = listOf(active),
-          maxCount = 1,
-          maxWaves = 1,
-          concurrency = 1,
-          verifyConcurrency = 1,
-        ) { _ -> }
-        .firstOrNull()
-
     val fresh =
       nodeRepository.testAndSelectFastestCandidates(
         configs = challengers,
@@ -961,44 +1036,72 @@ class MehVpnService : VpnService() {
         concurrency = REFINE_CONCURRENCY,
         verifyConcurrency = 3,
       ) { _ -> }
-    val best = fresh.firstOrNull() ?: return false
-    if (best.endpointKey == active.endpointKey) return false
+    val nonActiveFresh = fresh.filter { it.endpointKey != active.endpointKey }
+    val best = nonActiveFresh.firstOrNull() ?: return false
 
-    val currentPing = currentScored?.latencyMs ?: _tunnelSession.value.currentPingMs.coerceAtLeast(1L)
-    val isClearlyFaster =
-      when {
-        currentScored == null -> force || verifyRealPathViaProxy(localSocksPort) == null
-        force -> true
-        best.latencyMs <= (currentPing * 0.82).toLong() -> true
-        best.speedScore >= currentScored.speedScore * REFINE_SCORE_FACTOR &&
-          best.latencyMs <= currentScored.latencyMs * REFINE_LATENCY_TOLERANCE -> true
-        else -> false
+    // Always place freshly verified fast backups right after the active node in the standby pool.
+    val standbyCount = prioritizeStandbyPool(active, nonActiveFresh)
+
+    val currentPing = _tunnelSession.value.currentPingMs.coerceAtLeast(1L)
+    val elapsedMs = (System.currentTimeMillis() - sessionConnectedAtMs).coerceAtLeast(0L)
+    val shouldCheckTraffic =
+      !force &&
+        !initialUpgradeCompleted &&
+        elapsedMs <= INITIAL_UPGRADE_WINDOW_MS &&
+        currentPing > FAST_ENOUGH_PING_MS
+    val userTrafficBusy = if (shouldCheckTraffic) isUserTunnelTrafficActive() else false
+
+    val decision =
+      decideBackgroundRefineAction(
+        forceFailover = force,
+        initialUpgradeCompleted = initialUpgradeCompleted,
+        elapsedSinceConnectMs = elapsedMs,
+        currentPingMs = currentPing,
+        challengerPingMs = best.latencyMs,
+        isUserTrafficActive = userTrafficBusy,
+      )
+
+    when (decision) {
+      RefineAction.STORE_STANDBY_ONLY -> {
+        emitRealtimeLog(
+          "صف ذخیره به‌روز شد (${standbyCount - 1} سرور آماده • سریع‌ترین: ${best.cleanTitle} ${best.latencyMs}ms) — اتصال فعلی ثابت ماند.",
+          VpnLogLevel.SYSTEM,
+        )
+        return false
       }
-    if (!isClearlyFaster) {
-      if (fresh.size > 1) {
-        appendToServerPool(fresh.filter { it.endpointKey != active.endpointKey })
+      RefineAction.DEFER_ACTIVE_TRAFFIC -> {
+        emitRealtimeLog(
+          "سرور سریع‌تر پیدا شد (${best.cleanTitle} • ${best.latencyMs}ms)؛ به‌دلیل مصرف فعال اینترنت، در صف ذخیره قرار گرفت تا اتصال قطع نشود.",
+          VpnLogLevel.SYSTEM,
+        )
+        return false
       }
-      return false
+      RefineAction.UPGRADE_NOW -> {
+        emitRealtimeLog(
+          "کانفیگ سریع‌تر پیدا شد: ${best.cleanTitle} (${best.protocol.label} • پینگ ${best.latencyMs}ms)",
+          VpnLogLevel.SUCCESS,
+        )
+        val newPool =
+          (nonActiveFresh.take(REFINE_POOL_SIZE - 1) + listOf(active) + others)
+            .distinctBy { it.endpointKey }
+            .take(MAX_STANDBY_POOL_SIZE)
+        val newActive = replaceServerPool(newPool) ?: return false
+        val upgradedPing = newActive.latencyMs.coerceAtLeast(1L)
+        if (!force) {
+          initialUpgradeCompleted = true
+        }
+        updateSessionAndNotification(newActive, upgradedPing)
+        emitRealtimeLog(
+          if (force) {
+            "اتصال به سرور جایگزین برقرار شد: ${newActive.cleanTitle} (${upgradedPing}ms)"
+          } else {
+            "ارتقای یک‌باره به سرور سریع‌تر انجام شد: ${newActive.cleanTitle} (${upgradedPing}ms) — اتصال برای پایداری ثابت می‌ماند."
+          },
+          VpnLogLevel.SUCCESS,
+        )
+        return true
+      }
     }
-
-    emitRealtimeLog(
-      "کانفیگ سریع‌تر پیدا شد: ${best.cleanTitle} (${best.protocol.label} • پینگ ${best.latencyMs}ms)",
-      VpnLogLevel.SUCCESS,
-    )
-
-    val newPool =
-      (fresh.take(REFINE_POOL_SIZE - 1) +
-          listOfNotNull(currentScored?.let { active }) +
-          others)
-        .distinctBy { it.endpointKey }
-        .take(REFINE_POOL_SIZE)
-    val newActive = replaceServerPool(newPool) ?: return false
-    updateSessionAndNotification(newActive, best.latencyMs.coerceAtLeast(1L))
-    emitRealtimeLog(
-      "اتصال به سرور سریع‌تر تغییر یافت: ${newActive.cleanTitle} (${best.latencyMs}ms)",
-      VpnLogLevel.SUCCESS,
-    )
-    return true
   }
 
   private fun isPhysicalNetworkMetered(): Boolean {
@@ -1021,6 +1124,8 @@ class MehVpnService : VpnService() {
     refineJob = null
     topUpPoolJob?.cancel()
     topUpPoolJob = null
+    sessionConnectedAtMs = 0L
+    initialUpgradeCompleted = false
     stopHevTunnel()
     stopNativeXray()
     localSocksPort = 0
@@ -1124,6 +1229,12 @@ class MehVpnService : VpnService() {
       .build()
   }
 
+  internal enum class RefineAction {
+    UPGRADE_NOW,
+    DEFER_ACTIVE_TRAFFIC,
+    STORE_STANDBY_ONLY,
+  }
+
   companion object {
     const val ACTION_CONNECT = "com.example.vpn.ACTION_CONNECT"
     const val ACTION_DISCONNECT = "com.example.vpn.ACTION_DISCONNECT"
@@ -1150,24 +1261,53 @@ class MehVpnService : VpnService() {
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
-    private const val REFINE_FIRST_DELAY_MS = 3_000L
-    private const val REFINE_INTERVAL_FAST_HUNT_MS = 25_000L
-    private const val REFINE_INTERVAL_MODERATE_MS = 90_000L
-    private const val REFINE_INTERVAL_MS = 5 * 60_000L
-    private const val REFINE_INTERVAL_METERED_MS = 10 * 60_000L
-    private const val REFINE_MIN_SWITCH_GAP_MS = 12_000L
-    private const val REFINE_SCORE_FACTOR = 1.20
-    private const val REFINE_LATENCY_TOLERANCE = 1.15
+    private const val REFINE_FIRST_DELAY_MS = 4_000L
+    private const val STANDBY_WARMUP_DELAY_MS = 6_000L
+    private const val INITIAL_UPGRADE_WINDOW_MS = 120_000L
+    private const val MAX_INITIAL_UPGRADE_ATTEMPTS = 4
+    private const val REFINE_RETRY_IDLE_MS = 14_000L
+    private const val REFINE_RETRY_METERED_MS = 25_000L
+    private const val FAST_ENOUGH_PING_MS = 350L
+    private const val FAST_TARGET_PING_MS = 250L
+    private const val INITIAL_UPGRADE_RATIO = 0.60
+    private const val ACTIVE_TRAFFIC_SAMPLE_MS = 1_200L
+    private const val ACTIVE_TRAFFIC_THRESHOLD_BYTES = 12_288L
     private const val REFINE_POOL_SIZE = 6
+    private const val MAX_STANDBY_POOL_SIZE = 8
+    private const val STANDBY_POOL_TARGET_SIZE = 4
     private const val REFINE_CONCURRENCY = 16
-    private const val POOL_TOP_UP_TARGET_SIZE = 5
-    private const val POOL_TOP_UP_DELAY_MS = 15_000L
 
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
     private const val KEEP_ALIVE_INTERVAL_MS = 45_000L
     private const val ACTIVE_TRAFFIC_SKIP_WINDOW_MS = 30_000L
     private const val CONSECUTIVE_PROBE_FAILURES_FOR_FAILOVER = 2
     private const val HEARTBEAT_EVERY_N_TICKS = 13
+
+    internal fun decideBackgroundRefineAction(
+      forceFailover: Boolean,
+      initialUpgradeCompleted: Boolean,
+      elapsedSinceConnectMs: Long,
+      currentPingMs: Long,
+      challengerPingMs: Long,
+      isUserTrafficActive: Boolean,
+    ): RefineAction {
+      if (forceFailover) return RefineAction.UPGRADE_NOW
+      if (initialUpgradeCompleted) return RefineAction.STORE_STANDBY_ONLY
+      if (elapsedSinceConnectMs > INITIAL_UPGRADE_WINDOW_MS) return RefineAction.STORE_STANDBY_ONLY
+      if (currentPingMs in 1L..FAST_ENOUGH_PING_MS) return RefineAction.STORE_STANDBY_ONLY
+      if (challengerPingMs <= 0L || challengerPingMs >= currentPingMs) {
+        return RefineAction.STORE_STANDBY_ONLY
+      }
+      val significantlyFaster =
+        challengerPingMs <= FAST_TARGET_PING_MS ||
+          challengerPingMs <= (currentPingMs * INITIAL_UPGRADE_RATIO).toLong()
+      if (!significantlyFaster) return RefineAction.STORE_STANDBY_ONLY
+      return if (isUserTrafficActive) {
+        RefineAction.DEFER_ACTIVE_TRAFFIC
+      } else {
+        RefineAction.UPGRADE_NOW
+      }
+    }
 
     private val _tunnelSession = MutableStateFlow(VpnTunnelSession())
     val tunnelSession: StateFlow<VpnTunnelSession> = _tunnelSession.asStateFlow()

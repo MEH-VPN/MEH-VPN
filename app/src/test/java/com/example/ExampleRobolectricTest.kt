@@ -589,4 +589,85 @@ class ExampleRobolectricTest {
       com.example.vpn.VpnLogLevel.SUCCESS,
     )
   }
+
+  @Test
+  fun smartBackgroundRefinement_respectsOneShotWindowAndActiveTraffic() {
+    // 1. Slow initial server (>350ms), inside 2-min window, much faster challenger, idle tunnel -> UPGRADE_NOW
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.UPGRADE_NOW,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = false,
+        elapsedSinceConnectMs = 20_000L,
+        currentPingMs = 720L,
+        challengerPingMs = 190L,
+        isUserTrafficActive = false,
+      ),
+    )
+
+    // 2. Same scenario, but user is actively downloading / calling -> DEFER_ACTIVE_TRAFFIC
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.DEFER_ACTIVE_TRAFFIC,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = false,
+        elapsedSinceConnectMs = 20_000L,
+        currentPingMs = 720L,
+        challengerPingMs = 190L,
+        isUserTrafficActive = true,
+      ),
+    )
+
+    // 3. Initial one-shot upgrade already done -> STORE_STANDBY_ONLY (no repeat disruption)
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.STORE_STANDBY_ONLY,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = true,
+        elapsedSinceConnectMs = 30_000L,
+        currentPingMs = 450L,
+        challengerPingMs = 120L,
+        isUserTrafficActive = false,
+      ),
+    )
+
+    // 4. Current server already fast enough (<=350ms) -> STORE_STANDBY_ONLY
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.STORE_STANDBY_ONLY,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = false,
+        elapsedSinceConnectMs = 15_000L,
+        currentPingMs = 280L,
+        challengerPingMs = 110L,
+        isUserTrafficActive = false,
+      ),
+    )
+
+    // 5. Past 2-minute initial upgrade window -> STORE_STANDBY_ONLY
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.STORE_STANDBY_ONLY,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = false,
+        elapsedSinceConnectMs = 150_000L,
+        currentPingMs = 800L,
+        challengerPingMs = 150L,
+        isUserTrafficActive = false,
+      ),
+    )
+
+    // 6. Forced failover when current node died -> always UPGRADE_NOW
+    org.junit.Assert.assertEquals(
+      com.example.vpn.MehVpnService.RefineAction.UPGRADE_NOW,
+      com.example.vpn.MehVpnService.decideBackgroundRefineAction(
+        forceFailover = true,
+        initialUpgradeCompleted = true,
+        elapsedSinceConnectMs = 600_000L,
+        currentPingMs = 200L,
+        challengerPingMs = 300L,
+        isUserTrafficActive = true,
+      ),
+    )
+  }
 }
