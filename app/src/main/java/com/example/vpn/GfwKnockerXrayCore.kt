@@ -458,53 +458,6 @@ object GfwKnockerXrayCore {
       config.fragmentProfile.isNotBlank() &&
         !config.fragmentProfile.equals("direct_tls", ignoreCase = true),
   ): String {
-    if (config.protocol == V2RayProtocol.SERVERLESS && !includeTunInbound) {
-      val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
-      val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
-      val socksInboundBlock =
-        if (localSocksPort > 0) {
-          """
-          "inbounds": [
-            {
-              "tag": "socks-in",
-              "port": $localSocksPort,
-              "listen": "127.0.0.1",
-              "protocol": "socks",
-              "settings": { "auth": "noauth", "udp": true, "userLevel": 8 }
-            }
-          ],
-          """.trimIndent()
-        } else {
-          ""
-        }
-      return """
-        {
-          "log": { "loglevel": "warning" },
-          "dns": {
-            "hosts": { "cloudflare-dns.com": "challenges.cloudflare.com" },
-            "servers": ["8.8.8.8", "1.1.1.1"]
-          },
-          $socksInboundBlock
-          "outbounds": [
-            {
-              "tag": "proxy",
-              "protocol": "freedom",
-              "settings": {},
-              "streamSettings": {
-                "finalmask": {
-                  "tcp": [
-                    { "type": "fragment", "settings": { "packets": "tlshello", "lengths": $lengthsJson, "delays": ["0"], "maxSplit": "0" } },
-                    { "type": "fragment", "settings": { "packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11" } }
-                  ]
-                },
-                "sockopt": { "domainStrategy": "ForceIP" }
-              }
-            }
-          ]
-        }
-      """.trimIndent()
-    }
-
     val inboundsList = mutableListOf<String>()
     if (includeTunInbound) {
       inboundsList +=
@@ -762,18 +715,20 @@ object GfwKnockerXrayCore {
     val sec = config.security.lowercase().trim()
 
     if (config.protocol == V2RayProtocol.SERVERLESS) {
+      val isFragA = config.fragmentProfile.contains("frag_a", ignoreCase = true)
+      val lengthsJson = if (isFragA) """["6", "98", "1"]""" else """["0", "104", "1"]"""
       return """
         {
           "tag": "proxy",
           "protocol": "freedom",
-          "settings": {
-            "fragment": {
-              "packets": "tlshello",
-              "length": "10-25",
-              "interval": "1-3"
-            }
-          },
+          "settings": {},
           "streamSettings": {
+            "finalmask": {
+              "tcp": [
+                { "type": "fragment", "settings": { "packets": "tlshello", "lengths": $lengthsJson, "delays": ["0"], "maxSplit": "0" } },
+                { "type": "fragment", "settings": { "packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11" } }
+              ]
+            },
             "sockopt": {
               "domainStrategy": "ForceIP"
             }

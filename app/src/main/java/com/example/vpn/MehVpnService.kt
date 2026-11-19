@@ -525,43 +525,43 @@ class MehVpnService : VpnService() {
     val previousActive = currentActiveConfig()
     val previousFrag = activeUseFragment
 
-    // Pre-verify challengers on an isolated temporary Xray port FIRST so we never tear down the
-    // live SOCKS5 Xray instance unless a challenger is already proven to pass native Xray HTTPS.
-    for ((idx, candidate) in clean.take(3).withIndex()) {
-      val isolatedPing =
-        NativeXrayEngine.pingConfig(
-          datDir = filesDir.absolutePath,
-          tempDir = cacheDir,
-          config = candidate,
-          timeoutSec = 4,
-          protectFd = { fd ->
-            if (vpnInterface == null) true else try { protect(fd) } catch (_: Throwable) { true }
-          },
-        )
-      if (isolatedPing == null) continue
+    val swapped =
+      executeSafeServerSwap(
+        candidates = clean.take(3),
+        previousActive = previousActive,
+        preVerifyIsolated = { candidate ->
+          NativeXrayEngine.pingConfig(
+            datDir = filesDir.absolutePath,
+            tempDir = cacheDir,
+            config = candidate,
+            timeoutSec = 4,
+            protectFd = { fd ->
+              if (vpnInterface == null) true else try { protect(fd) } catch (_: Throwable) { true }
+            },
+          )
+        },
+        launchAndVerifyLive = { candidate ->
+          val (verifiedCfg, livePing, _) =
+            launchVerifiedNativeXraySocks(
+              candidate = candidate,
+              socksPort = socksPort,
+              verifyTimeoutMs = 4000,
+            )
+          if (verifiedCfg != null && livePing != null) verifiedCfg to livePing else null
+        },
+        restorePrevious = { prev ->
+          launchNativeXraySocksCore(prev, socksPort, useFragmentOverride = previousFrag)
+        },
+        isLiveCoreRunning = { NativeXrayEngine.isRunning() },
+      )
 
-      val (verifiedCfg, livePing, _) =
-        launchVerifiedNativeXraySocks(
-          candidate = candidate,
-          socksPort = socksPort,
-          verifyTimeoutMs = 4000,
-        )
-      if (verifiedCfg != null && livePing != null) {
-        synchronized(poolLock) {
-          serverPool = clean
-          poolCursor.set(idx)
-        }
-        return verifiedCfg.copy(latencyMs = livePing)
+    if (swapped != null) {
+      val (idx, verifiedCfg, livePing) = swapped
+      synchronized(poolLock) {
+        serverPool = clean
+        poolCursor.set(idx)
       }
-      // Restore previous working node immediately before trying another challenger.
-      if (previousActive != null) {
-        launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
-      }
-    }
-
-    // Ensure the previous working node is still running on the live SOCKS5 port.
-    if (previousActive != null && !NativeXrayEngine.isRunning()) {
-      launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
+      return verifiedCfg.copy(latencyMs = livePing)
     }
     return null
   }
@@ -586,21 +586,16 @@ class MehVpnService : VpnService() {
     active: V2RayConfig,
     standbyCandidates: List<V2RayConfig>,
   ): Int {
-    val cleanStandby =
-      standbyCandidates
-        .filter { it.endpointKey != active.endpointKey && NativeXrayEngine.supportsNativeXray(it) }
-        .distinctBy { it.endpointKey }
-    if (cleanStandby.isEmpty()) return currentPoolSnapshot().size
+    val supportedStandby = standbyCandidates.filter { NativeXrayEngine.supportsNativeXray(it) }
+    if (supportedStandby.isEmpty()) return currentPoolSnapshot().size
     synchronized(poolLock) {
-      val existingOthers =
-        serverPool.filter { existing ->
-          existing.endpointKey != active.endpointKey &&
-            cleanStandby.none { it.endpointKey == existing.endpointKey }
-        }
       val reordered =
-        (listOf(active) + cleanStandby + existingOthers)
-          .distinctBy { it.endpointKey }
-          .take(MAX_STANDBY_POOL_SIZE)
+        buildReorderedStandbyPool(
+          active = active,
+          standbyCandidates = supportedStandby,
+          existingPool = serverPool,
+          maxSize = MAX_STANDBY_POOL_SIZE,
+        )
       serverPool = reordered
       poolCursor.set(0)
       return reordered.size
@@ -628,51 +623,8 @@ class MehVpnService : VpnService() {
    * Verifies real TLS/HTTPS connectivity through the live local SOCKS5 Xray inbound.
    * Never falls back to plain HTTP port 80 so TLS-broken or captive proxies cannot pass.
    */
-  private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
-    if (proxyPort <= 0) return null
-    return verifyHttpsViaProxy(proxyPort, "www.google.com", timeoutMs)
-      ?: verifyHttpsViaProxy(proxyPort, "cp.cloudflare.com", timeoutMs.coerceAtMost(3000))
-  }
-
-  private fun verifyHttpsViaProxy(
-    proxyPort: Int,
-    targetHost: String = "www.google.com",
-    timeoutMs: Int = 3500,
-  ): Long? {
-    val startedNs = System.nanoTime()
-    var socket: Socket? = null
-    return try {
-      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
-      socket = Socket(proxy)
-      socket.soTimeout = timeoutMs
-      socket.connect(InetSocketAddress.createUnresolved(targetHost, 443), timeoutMs)
-      val (tlsIn, tlsOut) =
-        GfwKnockerXrayCore.openSslEngineOverStreams(
-          sslContext = javax.net.ssl.SSLContext.getDefault(),
-          rawIn = socket.getInputStream(),
-          rawOut = socket.getOutputStream(),
-          sniHost = targetHost,
-          port = 443,
-          alpnProtocols = arrayOf("http/1.1"),
-        )
-      val request = "GET /generate_204 HTTP/1.1\r\nHost: $targetHost\r\nConnection: close\r\n\r\n"
-      tlsOut.write(request.toByteArray(Charsets.US_ASCII))
-      tlsOut.flush()
-      val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
-      val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
-      if (code == 204 || code == 200) {
-        val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
-        MehDiag.recordBytesDownloaded(128L)
-        ms
-      } else {
-        null
-      }
-    } catch (_: Exception) {
-      null
-    } finally {
-      try { socket?.close() } catch (_: Exception) {}
-    }
-  }
+  private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? =
+    verifyRealPathOverSocks(proxyPort, timeoutMs)
 
   private fun verifyNodeFully(config: V2RayConfig, proxyPort: Int): Long? {
     val directPing = verifyNodeCapability(config)
@@ -1249,9 +1201,9 @@ class MehVpnService : VpnService() {
     const val EXTRA_INITIAL_PING = "extra_initial_ping"
     const val EXTRA_CORE_JSON = "extra_core_json"
 
-    private const val TUN_MTU = 1400
-    private const val TUN_IPV4_ADDRESS = "10.10.14.1"
-    private const val MAP_DNS_ADDRESS = "10.10.14.2"
+    internal const val TUN_MTU = 1400
+    internal const val TUN_IPV4_ADDRESS = "10.10.14.1"
+    internal const val MAP_DNS_ADDRESS = "10.10.14.2"
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
@@ -1275,6 +1227,97 @@ class MehVpnService : VpnService() {
     private const val KEEP_ALIVE_FIRST_CHECK_MS = 10_000L
     private const val KEEP_ALIVE_INTERVAL_MS = 25_000L
     private const val HEARTBEAT_EVERY_N_TICKS = 24
+
+    internal fun verifyRealPathOverSocks(proxyPort: Int, timeoutMs: Int = 3500): Long? {
+      if (proxyPort <= 0) return null
+      return verifyHttpsOverSocks(proxyPort, "www.google.com", timeoutMs)
+        ?: verifyHttpsOverSocks(proxyPort, "cp.cloudflare.com", timeoutMs.coerceAtMost(3000))
+    }
+
+    internal fun verifyHttpsOverSocks(
+      proxyPort: Int,
+      targetHost: String = "www.google.com",
+      timeoutMs: Int = 3500,
+    ): Long? {
+      val startedNs = System.nanoTime()
+      var socket: Socket? = null
+      return try {
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
+        socket = Socket(proxy)
+        socket.soTimeout = timeoutMs
+        socket.connect(InetSocketAddress.createUnresolved(targetHost, 443), timeoutMs)
+        val (tlsIn, tlsOut) =
+          GfwKnockerXrayCore.openSslEngineOverStreams(
+            sslContext = javax.net.ssl.SSLContext.getDefault(),
+            rawIn = socket.getInputStream(),
+            rawOut = socket.getOutputStream(),
+            sniHost = targetHost,
+            port = 443,
+            alpnProtocols = arrayOf("http/1.1"),
+          )
+        val request = "GET /generate_204 HTTP/1.1\r\nHost: $targetHost\r\nConnection: close\r\n\r\n"
+        tlsOut.write(request.toByteArray(Charsets.US_ASCII))
+        tlsOut.flush()
+        val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
+        val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
+        if (code == 204 || code == 200) {
+          val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
+          MehDiag.recordBytesDownloaded(128L)
+          ms
+        } else {
+          null
+        }
+      } catch (_: Exception) {
+        null
+      } finally {
+        try { socket?.close() } catch (_: Exception) {}
+      }
+    }
+
+    internal fun executeSafeServerSwap(
+      candidates: List<V2RayConfig>,
+      previousActive: V2RayConfig?,
+      preVerifyIsolated: (V2RayConfig) -> Long?,
+      launchAndVerifyLive: (V2RayConfig) -> Pair<V2RayConfig, Long>?,
+      restorePrevious: (V2RayConfig) -> Unit,
+      isLiveCoreRunning: () -> Boolean,
+    ): Triple<Int, V2RayConfig, Long>? {
+      for ((idx, candidate) in candidates.withIndex()) {
+        if (preVerifyIsolated(candidate) == null) continue
+        val liveResult = launchAndVerifyLive(candidate)
+        if (liveResult != null) {
+          return Triple(idx, liveResult.first, liveResult.second)
+        }
+        if (previousActive != null) {
+          restorePrevious(previousActive)
+        }
+      }
+      if (previousActive != null && !isLiveCoreRunning()) {
+        restorePrevious(previousActive)
+      }
+      return null
+    }
+
+    internal fun buildReorderedStandbyPool(
+      active: V2RayConfig,
+      standbyCandidates: List<V2RayConfig>,
+      existingPool: List<V2RayConfig>,
+      maxSize: Int = MAX_STANDBY_POOL_SIZE,
+    ): List<V2RayConfig> {
+      val cleanStandby =
+        standbyCandidates
+          .filter { it.endpointKey != active.endpointKey }
+          .distinctBy { it.endpointKey }
+      if (cleanStandby.isEmpty()) return existingPool
+      val existingOthers =
+        existingPool.filter { existing ->
+          existing.endpointKey != active.endpointKey &&
+            cleanStandby.none { it.endpointKey == existing.endpointKey }
+        }
+      return (listOf(active) + cleanStandby + existingOthers)
+        .distinctBy { it.endpointKey }
+        .take(maxSize)
+    }
 
     internal fun decideBackgroundRefineAction(
       forceFailover: Boolean,

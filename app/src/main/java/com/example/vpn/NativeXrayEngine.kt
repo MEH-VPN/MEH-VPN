@@ -135,30 +135,22 @@ object NativeXrayEngine {
         }
 
         val reqB64 = LibXray.newXrayRunFromJSONRequest(datDir, configJson)
-        var lastErr = "runXrayFromJSON failed"
-        for (attempt in 0 until 3) {
-          val rawRespB64 = LibXray.runXrayFromJSON(reqB64)
-          val parsed = parseResponseJson(rawRespB64)
-          val ok = parsed?.optBoolean("success", false) ?: false
-          if (ok) {
-            return StartResult(success = true)
+        val result =
+          runWithPortBusyRetry(maxAttempts = 3, retryDelayMs = 250L) {
+            val rawRespB64 = LibXray.runXrayFromJSON(reqB64)
+            val parsed = parseResponseJson(rawRespB64)
+            val ok = parsed?.optBoolean("success", false) ?: false
+            if (ok) {
+              StartResult(success = true)
+            } else {
+              val errMsg = parsed?.optString("error").orEmpty().ifBlank { "runXrayFromJSON failed" }
+              StartResult(success = false, error = errMsg)
+            }
           }
-          lastErr = parsed?.optString("error").orEmpty().ifBlank { "runXrayFromJSON failed" }
-          val isPortBusy =
-            lastErr.contains("address already in use", ignoreCase = true) ||
-              lastErr.contains("bind:", ignoreCase = true)
-          if (!isPortBusy || attempt == 2) {
-            break
-          }
-          Log.w(TAG, "Native Xray port busy (attempt ${attempt + 1}), retrying: $lastErr")
-          try {
-            Thread.sleep(250L)
-          } catch (_: InterruptedException) {
-            break
-          }
+        if (!result.success) {
+          Log.w(TAG, "Native Xray start error: ${result.error}")
         }
-        Log.w(TAG, "Native Xray start error: $lastErr")
-        StartResult(success = false, error = lastErr)
+        result
       } catch (t: Throwable) {
         Log.e(TAG, "Native Xray exception", t)
         StartResult(
@@ -167,6 +159,35 @@ object NativeXrayEngine {
         )
       }
     }
+  }
+
+  internal fun runWithPortBusyRetry(
+    maxAttempts: Int = 3,
+    retryDelayMs: Long = 250L,
+    sleepFn: (Long) -> Unit = { ms ->
+      try {
+        Thread.sleep(ms)
+      } catch (_: InterruptedException) {}
+    },
+    attemptStart: (Int) -> StartResult,
+  ): StartResult {
+    var lastResult = StartResult(success = false, error = "runXrayFromJSON failed")
+    for (attempt in 0 until maxAttempts.coerceAtLeast(1)) {
+      val res = attemptStart(attempt)
+      if (res.success) return res
+      lastResult = res
+      val err = res.error.orEmpty()
+      val isPortBusy =
+        err.contains("address already in use", ignoreCase = true) ||
+          err.contains("bind:", ignoreCase = true)
+      if (!isPortBusy || attempt == maxAttempts - 1) {
+        break
+      }
+      if (retryDelayMs > 0L) {
+        sleepFn(retryDelayMs)
+      }
+    }
+    return lastResult
   }
 
   fun stopTunnel() {
