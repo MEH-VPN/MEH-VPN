@@ -49,8 +49,10 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -90,6 +92,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppUpdateInfo
@@ -234,7 +237,7 @@ fun MehMinimalScreen(
         modifier =
           Modifier.fillMaxSize()
             .widthIn(max = 460.dp)
-            .padding(horizontal = 24.dp),
+            .padding(horizontal = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
       ) {
         // Equal top weight keeps the power button permanently locked at the vertical center
@@ -292,7 +295,8 @@ fun MehMinimalScreen(
           Column(
             modifier =
               Modifier.fillMaxWidth()
-                .padding(top = 12.dp),
+                .verticalScroll(rememberScrollState())
+                .padding(top = 12.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
           ) {
             if (uiState.liveLogLine.isNotEmpty()) {
@@ -645,8 +649,8 @@ private fun SingleLineLiveLog(
     Row(
       modifier =
         Modifier.fillMaxWidth()
-          .height(28.dp)
-          .padding(horizontal = 8.dp)
+          .defaultMinSize(minHeight = 24.dp)
+          .padding(horizontal = 4.dp)
           .testTag("live_status_log_container"),
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.Center,
@@ -654,12 +658,12 @@ private fun SingleLineLiveLog(
       if (logText.isNotEmpty()) {
         Box(
           modifier =
-            Modifier.size(8.dp)
+            Modifier.size(7.dp)
               .clip(CircleShape)
               .background(color = accentColor.copy(alpha = dotAlpha))
         )
 
-        Spacer(modifier = Modifier.width(10.dp))
+        Spacer(modifier = Modifier.width(7.dp))
       }
 
       AnimatedContent(
@@ -671,8 +675,11 @@ private fun SingleLineLiveLog(
       ) { currentLog ->
         Text(
           text = currentLog,
-          style = MaterialTheme.typography.bodyLarge,
+          style = MaterialTheme.typography.bodyMedium,
           fontFamily = VazirmatnFontFamily,
+          fontSize = 13.sp,
+          lineHeight = 18.sp,
+          fontWeight = FontWeight.Medium,
           color =
             when (phase) {
               MehPhase.CONNECTED -> NeonEmeraldGlow
@@ -680,7 +687,7 @@ private fun SingleLineLiveLog(
               MehPhase.DISCONNECTED -> TextSecondary
               else -> TextPrimary
             },
-          maxLines = 1,
+          maxLines = 2,
           overflow = TextOverflow.Ellipsis,
           textAlign = TextAlign.Center,
           modifier = Modifier.testTag("live_status_log"),
@@ -701,10 +708,10 @@ private fun MinimalLogList(
     Column(
       modifier =
         Modifier.fillMaxWidth()
-          .padding(horizontal = 12.dp)
+          .padding(horizontal = 4.dp)
           .testTag("minimal_sub_logs_list"),
       horizontalAlignment = Alignment.CenterHorizontally,
-      verticalArrangement = Arrangement.spacedBy(4.dp),
+      verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
       logs.forEachIndexed { index, entry ->
         val isLatest = index == logs.lastIndex
@@ -718,11 +725,13 @@ private fun MinimalLogList(
           }
         Text(
           text = entry.message,
-          style = MaterialTheme.typography.bodyMedium,
+          style = MaterialTheme.typography.labelMedium,
           fontFamily = VazirmatnFontFamily,
+          fontSize = 11.sp,
+          lineHeight = 16.sp,
           fontWeight = if (isLatest) FontWeight.Medium else FontWeight.Normal,
           color = baseColor.copy(alpha = if (isLatest) 0.95f else 0.65f),
-          maxLines = if (entry.level == com.example.ui.HackerLogLevel.ERROR) 12 else 1,
+          maxLines = if (entry.level == com.example.ui.HackerLogLevel.ERROR) 10 else 2,
           overflow = TextOverflow.Ellipsis,
           textAlign = TextAlign.Center,
         )
