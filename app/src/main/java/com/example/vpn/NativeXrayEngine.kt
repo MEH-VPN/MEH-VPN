@@ -99,11 +99,12 @@ object NativeXrayEngine {
   }
 
   /**
-   * Starts native Xray-core directly attached to the detached Android VpnService TUN [tunFd].
+   * Starts native Xray-core. When [tunFd] is non-null, attaches directly to the TUN fd; when null,
+   * runs in SOCKS5 inbound mode (paired with `hev-socks5-tunnel` owning the Android TUN fd).
    */
   fun startTunnel(
     datDir: String,
-    tunFd: Int,
+    tunFd: Int? = null,
     configJson: String,
     protectFd: (Int) -> Boolean,
   ): StartResult {
@@ -113,12 +114,16 @@ object NativeXrayEngine {
         try {
           if (LibXray.getXrayState()) {
             LibXray.stopXray()
+            try {
+              Thread.sleep(60L)
+            } catch (_: InterruptedException) {}
           }
         } catch (_: Throwable) {}
 
         LibXray.registerDialerController(dialerController)
-        LibXray.registerListenerController(dialerController)
-        LibXray.setTunFd(tunFd)
+        if (tunFd != null && tunFd >= 0) {
+          LibXray.setTunFd(tunFd)
+        }
 
         val reqB64 = LibXray.newXrayRunFromJSONRequest(datDir, configJson)
         val rawRespB64 = LibXray.runXrayFromJSON(reqB64)

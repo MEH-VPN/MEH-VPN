@@ -552,19 +552,23 @@ object GfwKnockerXrayCore {
     }
 
     val proxyOutboundJson = buildXrayProxyOutboundJson(config, useFragment = useFragment)
-    val tunDnsRule =
-      if (includeTunInbound) {
-        """
-          {
-            "type": "field",
-            "inboundTag": ["tun-in"],
-            "port": "53",
-            "outboundTag": "dns-out"
-          },
-        """.trimIndent()
+    val dnsInboundTags =
+      if (includeTunInbound && localSocksPort > 0) {
+        """["tun-in", "socks-in"]"""
+      } else if (includeTunInbound) {
+        """["tun-in"]"""
       } else {
-        ""
+        """["socks-in"]"""
       }
+    val dnsRedirectRule =
+      """
+        {
+          "type": "field",
+          "inboundTag": $dnsInboundTags,
+          "port": "53",
+          "outboundTag": "dns-out"
+        },
+      """.trimIndent()
 
     return """
       {
@@ -579,7 +583,25 @@ object GfwKnockerXrayCore {
             "tcp://8.8.8.8",
             "https://8.8.8.8/dns-query",
             "tcp://1.1.1.1",
-            "https://1.1.1.1/dns-query"
+            "https://1.1.1.1/dns-query",
+            {
+              "address": "localhost",
+              "domains": [
+                "domain:ir",
+                "domain:shaparak.ir",
+                "domain:digikala.com",
+                "domain:snapp.ir",
+                "domain:divar.ir",
+                "domain:torob.com",
+                "domain:aparat.com",
+                "domain:rubika.ir",
+                "domain:telewebion.com",
+                "domain:bale.ai",
+                "domain:eitaa.com",
+                "domain:cafebazaar.ir",
+                "domain:myket.ir"
+              ]
+            }
           ]
         },
         "inbounds": [
@@ -626,14 +648,20 @@ object GfwKnockerXrayCore {
           }
         ],
         "routing": {
-          "domainStrategy": "IPIfNonMatch",
+          "domainStrategy": "AsIs",
           "rules": [
             {
               "type": "field",
               "inboundTag": ["dns-internal"],
               "outboundTag": "proxy"
             },
-            $tunDnsRule
+            $dnsRedirectRule
+            {
+              "type": "field",
+              "network": "udp",
+              "port": "443",
+              "outboundTag": "block"
+            },
             {
               "type": "field",
               "ip": [
@@ -671,6 +699,39 @@ object GfwKnockerXrayCore {
         }
       }
     """.trimIndent()
+  }
+
+  /**
+   * Builds the `hev-socks5-tunnel` YAML config that bridges Android's TUN interface to Xray's
+   * local SOCKS5 inbound with built-in `mapdns` (fake-IP -> domain-name SOCKS5 CONNECT), matching
+   * v2rayNG / MahsaNG so all apps resolve domains remotely through the proxy with zero DNS stall.
+   */
+  fun buildHevSocks5TunnelYaml(
+    socksPort: Int,
+    tunMtu: Int = 1400,
+    tunIpv4: String = "10.10.14.1",
+    mapDnsAddress: String = "10.10.14.2",
+  ): String {
+    return """
+      tunnel:
+        mtu: ${tunMtu.coerceIn(1280, 8500)}
+        ipv4: $tunIpv4
+      socks5:
+        port: $socksPort
+        address: 127.0.0.1
+        udp: 'udp'
+      mapdns:
+        address: $mapDnsAddress
+        port: 53
+        network: 100.64.0.0
+        netmask: 255.192.0.0
+        cache-size: 10000
+      misc:
+        task-stack-size: 81920
+        connect-timeout: 5000
+        read-write-timeout: 60000
+        log-level: warn
+    """.trimIndent() + "\n"
   }
 
   private fun jsonStr(value: String): String = "\"${escapeJson(value)}\""

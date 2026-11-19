@@ -29,6 +29,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicInteger
+import org.amnezia.awg.hevtunnel.TProxyService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -77,8 +78,10 @@ class MehVpnService : VpnService() {
   @Volatile private var serverPool: List<V2RayConfig> = emptyList()
   private val poolCursor = AtomicInteger(0)
   @Volatile private var activeConfigState: V2RayConfig? = null
+  @Volatile private var activeUseFragment: Boolean = false
   @Volatile private var localSocksPort: Int = 0
   @Volatile private var nativeCoreStarted: Boolean = false
+  @Volatile private var hevTunnelRunning: Boolean = false
 
   private var connectJob: Job? = null
   private var keepAliveJob: Job? = null
@@ -224,6 +227,7 @@ class MehVpnService : VpnService() {
     initialPing: Long,
   ) {
     try {
+      stopHevTunnel()
       stopNativeXray()
       try {
         vpnInterface?.close()
@@ -244,30 +248,12 @@ class MehVpnService : VpnService() {
         poolCursor.set(0)
       }
 
-      // Establish IPv4-only device TUN interface (0.0.0.0/0) excluding our own app so apps
-      // (like Instagram) do not stall on broken IPv6 routes over IPv4-only proxy servers.
-      val builder =
-        Builder()
-          .setSession("MEH • $serverName")
-          .setMtu(TUN_MTU)
-          .addAddress("10.10.14.2", 24)
-          .addRoute("0.0.0.0", 0)
-          .addDnsServer("8.8.8.8")
-          .addDnsServer("1.1.1.1")
+      // Allocate one fixed local SOCKS5 port for this VPN session.
+      // We verify candidates on native Xray SOCKS5 FIRST (without touching TUN), then attach
+      // pure-C `hev-socks5-tunnel` + `mapdns` ONCE to this fixed port (v2rayNG / MahsaNG model).
+      val fixedSocksPort = NativeXrayEngine.allocateLocalPort()
+      localSocksPort = fixedSocksPort
 
-      try {
-        builder.addDisallowedApplication(packageName)
-      } catch (_: Exception) {}
-
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        builder.setMetered(false)
-      }
-
-      val establishedPfd =
-        builder.establish() ?: throw IllegalStateException("TUN establish returned null")
-      vpnInterface = establishedPfd
-
-      // Try candidates in order with native Xray-core (libXray) and verify live traffic passes
       var startedConfig: V2RayConfig? = null
       var verifiedPingMs: Long = initialPing
       var lastError: String? = null
@@ -279,9 +265,9 @@ class MehVpnService : VpnService() {
           VpnLogLevel.SCAN,
         )
         val (verifiedCfg, livePing, candidateErr) =
-          launchVerifiedNativeXray(
-            establishedPfd = establishedPfd,
+          launchVerifiedNativeXraySocks(
             candidate = candidate,
+            socksPort = fixedSocksPort,
             verifyTimeoutMs = 4500,
           )
         if (verifiedCfg != null && livePing != null) {
@@ -308,6 +294,46 @@ class MehVpnService : VpnService() {
       val effectiveName = active.cleanTitle.ifBlank { serverName }
       val effectivePing = verifiedPingMs.coerceAtLeast(1L)
 
+      if (connectJob?.isActive == false) {
+        stopNativeXray()
+        return
+      }
+
+      // Establish IPv4-only Android TUN interface ONCE and bridge all device TCP/UDP/DNS traffic
+      // to Xray's local SOCKS5 inbound via `hev-socks5-tunnel` with built-in `mapdns`.
+      val builder =
+        Builder()
+          .setSession("MEH • $effectiveName")
+          .setMtu(TUN_MTU)
+          .addAddress(TUN_IPV4_ADDRESS, 30)
+          .addRoute("0.0.0.0", 0)
+          .addDnsServer(MAP_DNS_ADDRESS)
+
+      try {
+        builder.addDisallowedApplication(packageName)
+      } catch (_: Exception) {}
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        builder.setMetered(false)
+      }
+
+      val establishedPfd =
+        builder.establish() ?: throw IllegalStateException("TUN establish returned null")
+      vpnInterface = establishedPfd
+
+      val hevYaml =
+        GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
+          socksPort = fixedSocksPort,
+          tunMtu = TUN_MTU,
+          tunIpv4 = TUN_IPV4_ADDRESS,
+          mapDnsAddress = MAP_DNS_ADDRESS,
+        )
+      val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
+      hevConfigFile.writeText(hevYaml)
+
+      TProxyService.TProxyStartService(hevConfigFile.absolutePath, establishedPfd.fd)
+      hevTunnelRunning = true
+
       _tunnelSession.value =
         VpnTunnelSession(
           isRunning = true,
@@ -316,7 +342,7 @@ class MehVpnService : VpnService() {
           serverPort = active.port,
           protocolLabel = active.protocol.label,
           currentPingMs = effectivePing,
-          localProxyPort = localSocksPort,
+          localProxyPort = fixedSocksPort,
           errorMessage = null,
         )
 
@@ -328,19 +354,21 @@ class MehVpnService : VpnService() {
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
       startBackgroundNodeRefinement()
       startPoolTopUpAfterConnect()
-    } catch (e: Exception) {
+    } catch (ce: CancellationException) {
+      throw ce
+    } catch (t: Throwable) {
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
-        errorMessage = e.localizedMessage ?: "Failed to establish native Xray tunnel",
-        throwable = e,
+        errorMessage = t.localizedMessage ?: t.javaClass.simpleName,
+        throwable = t,
       )
-      stopTunnel("خطا در راه‌اندازی هسته Xray:\n${e.localizedMessage ?: "نامشخص"}")
+      stopTunnel("خطا در راه‌اندازی هسته Xray:\n${t.localizedMessage ?: t.javaClass.simpleName}")
     }
   }
 
-  private fun launchVerifiedNativeXray(
-    establishedPfd: ParcelFileDescriptor,
+  private fun launchVerifiedNativeXraySocks(
     candidate: V2RayConfig,
+    socksPort: Int,
     verifyTimeoutMs: Int = 4500,
   ): Triple<V2RayConfig?, Long?, String?> {
     val defaultFrag =
@@ -349,16 +377,16 @@ class MehVpnService : VpnService() {
     var lastError: String? = null
     for (fragMode in listOf(defaultFrag, !defaultFrag)) {
       val startErr =
-        launchNativeXrayOnExistingTun(
-          establishedPfd = establishedPfd,
+        launchNativeXraySocksCore(
           config = candidate,
+          socksPort = socksPort,
           useFragmentOverride = fragMode,
         )
       if (startErr != null) {
         lastError = startErr
         break
       }
-      val livePing = verifyRealPathViaProxy(localSocksPort, timeoutMs = verifyTimeoutMs)
+      val livePing = verifyRealPathViaProxy(socksPort, timeoutMs = verifyTimeoutMs)
       if (livePing != null) {
         val verifiedCfg = activeConfigState ?: candidate
         return Triple(verifiedCfg, livePing, null)
@@ -368,15 +396,16 @@ class MehVpnService : VpnService() {
   }
 
   /**
-   * Starts (or hot-restarts) native Go Xray-core on the already-open [establishedPfd] TUN
-   * using a freshly duped+detached FD so Android `fdsan` never aborts when Xray closes it on stop.
-   * Returns `null` on success, or an error description on failure.
+   * Starts (or hot-restarts) native Go Xray-core in SOCKS5-only inbound mode on [socksPort].
+   * `hev-socks5-tunnel` owns the Android TUN interface and forwards all traffic to `127.0.0.1:[socksPort]`,
+   * so switching servers never touches or corrupts the Android TUN file descriptor.
    */
-  private fun launchNativeXrayOnExistingTun(
-    establishedPfd: ParcelFileDescriptor,
+  private fun launchNativeXraySocksCore(
     config: V2RayConfig,
+    socksPort: Int,
     useFragmentOverride: Boolean? = null,
   ): String? {
+    if (socksPort <= 0) return "Invalid local SOCKS5 port"
     val resolvedConfig =
       if (config.resolvedIp.isNotBlank()) {
         config
@@ -385,7 +414,6 @@ class MehVpnService : VpnService() {
         config.copy(resolvedIp = ip)
       }
 
-    val socksPort = NativeXrayEngine.allocateLocalPort()
     val effectiveFragment =
       useFragmentOverride
         ?: (resolvedConfig.fragmentProfile.isNotBlank() &&
@@ -393,7 +421,7 @@ class MehVpnService : VpnService() {
     val xrayJson =
       GfwKnockerXrayCore.buildXrayCoreJson(
         config = resolvedConfig,
-        includeTunInbound = true,
+        includeTunInbound = false,
         tunMtu = TUN_MTU,
         localSocksPort = socksPort,
         useFragment = effectiveFragment,
@@ -402,23 +430,20 @@ class MehVpnService : VpnService() {
       File(filesDir, "active_v2ray_config.json").writeText(xrayJson)
     } catch (_: Exception) {}
 
-    val tunFd =
-      try {
-        ParcelFileDescriptor.dup(establishedPfd.fileDescriptor)?.detachFd() ?: establishedPfd.fd
-      } catch (_: Exception) {
-        establishedPfd.fd
-      }
-
     val result =
       NativeXrayEngine.startTunnel(
         datDir = filesDir.absolutePath,
-        tunFd = tunFd,
+        tunFd = null,
         configJson = xrayJson,
         protectFd = { fd ->
-          try {
-            protect(fd)
-          } catch (_: Throwable) {
-            false
+          if (vpnInterface == null) {
+            true
+          } else {
+            try {
+              protect(fd)
+            } catch (_: Throwable) {
+              true
+            }
           }
         },
       )
@@ -426,11 +451,21 @@ class MehVpnService : VpnService() {
     return if (result.success) {
       nativeCoreStarted = true
       activeConfigState = resolvedConfig
+      activeUseFragment = effectiveFragment
       localSocksPort = socksPort
       null
     } else {
       nativeCoreStarted = false
       result.error ?: "Failed to start Xray core"
+    }
+  }
+
+  private fun stopHevTunnel() {
+    if (hevTunnelRunning) {
+      hevTunnelRunning = false
+      try {
+        TProxyService.TProxyStopService()
+      } catch (_: Throwable) {}
     }
   }
 
@@ -450,8 +485,10 @@ class MehVpnService : VpnService() {
     synchronized(poolLock) { serverPool }
 
   private fun switchToNextHealthyNode(reason: String): V2RayConfig? {
-    val pfd = vpnInterface ?: return currentActiveConfig()
+    val socksPort = localSocksPort
+    if (socksPort <= 0) return currentActiveConfig()
     val previousActive = currentActiveConfig()
+    val previousFrag = activeUseFragment
     val candidate =
       synchronized(poolLock) {
         if (serverPool.isEmpty()) return previousActive
@@ -459,7 +496,7 @@ class MehVpnService : VpnService() {
         poolCursor.set(nextIdx)
         serverPool[nextIdx]
       }
-    val err = launchNativeXrayOnExistingTun(pfd, candidate)
+    val err = launchNativeXraySocksCore(candidate, socksPort)
     if (err == null) {
       android.util.Log.i(
         "MehVpnService",
@@ -468,7 +505,7 @@ class MehVpnService : VpnService() {
       return candidate
     }
     if (previousActive != null) {
-      launchNativeXrayOnExistingTun(pfd, previousActive)
+      launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
     }
     return previousActive
   }
@@ -479,14 +516,16 @@ class MehVpnService : VpnService() {
         .filter { NativeXrayEngine.supportsNativeXray(it) }
         .distinctBy { it.endpointKey }
     if (clean.isEmpty()) return null
-    val pfd = vpnInterface ?: return clean.first()
+    val socksPort = localSocksPort
+    if (socksPort <= 0) return clean.first()
     val previousActive = currentActiveConfig()
+    val previousFrag = activeUseFragment
 
     for ((idx, candidate) in clean.take(3).withIndex()) {
       val (verifiedCfg, livePing, _) =
-        launchVerifiedNativeXray(
-          establishedPfd = pfd,
+        launchVerifiedNativeXraySocks(
           candidate = candidate,
+          socksPort = socksPort,
           verifyTimeoutMs = 4000,
         )
       if (verifiedCfg != null && livePing != null) {
@@ -500,7 +539,7 @@ class MehVpnService : VpnService() {
 
     // Challengers did not pass real Xray traffic; restore the previous working node.
     if (previousActive != null) {
-      launchNativeXrayOnExistingTun(pfd, previousActive)
+      launchNativeXraySocksCore(previousActive, socksPort, useFragmentOverride = previousFrag)
     }
     return null
   }
@@ -535,104 +574,8 @@ class MehVpnService : VpnService() {
 
   private fun verifyRealPathViaProxy(proxyPort: Int, timeoutMs: Int = 3500): Long? {
     if (proxyPort <= 0) return null
-    val httpsPing =
-      verifyHttpsViaProxy(proxyPort, timeoutMs)
-        ?: verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
-        ?: return null
-    if (!verifyDnsViaProxy(proxyPort, timeoutMs.coerceAtMost(2800))) {
-      return null
-    }
-    return httpsPing
-  }
-
-  /**
-   * Verifies that Xray's `dns-internal` upstreams (`tcp://8.8.8.8` or `https://8.8.8.8/dns-query`)
-   * actually return DNS answers through the active proxy outbound, so apps relying on domain
-   * resolution (Instagram, Chrome, etc.) do not stall after Telegram connects by raw IP.
-   */
-  private fun verifyDnsViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
-    if (verifyTcpDnsQueryViaProxy(proxyPort, timeoutMs)) return true
-    return verifyDohQueryViaProxy(proxyPort, timeoutMs)
-  }
-
-  private fun verifyTcpDnsQueryViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
-    var socket: Socket? = null
-    return try {
-      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
-      socket = Socket(proxy)
-      socket.soTimeout = timeoutMs
-      socket.connect(InetSocketAddress.createUnresolved("8.8.8.8", 53), timeoutMs)
-      // Standard DNS A query for instagram.com
-      val dnsPayload =
-        byteArrayOf(
-          0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x09, 'i'.code.toByte(), 'n'.code.toByte(), 's'.code.toByte(), 't'.code.toByte(),
-          'a'.code.toByte(), 'g'.code.toByte(), 'r'.code.toByte(), 'a'.code.toByte(), 'm'.code.toByte(),
-          0x03, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(),
-          0x00, 0x00, 0x01, 0x00, 0x01,
-        )
-      val out = socket.getOutputStream()
-      out.write(
-        byteArrayOf(
-          ((dnsPayload.size ushr 8) and 0xFF).toByte(),
-          (dnsPayload.size and 0xFF).toByte(),
-        )
-      )
-      out.write(dnsPayload)
-      out.flush()
-      val input = socket.getInputStream()
-      val lenHi = input.read()
-      val lenLo = input.read()
-      if (lenHi < 0 || lenLo < 0) return false
-      val respLen = (lenHi shl 8) or lenLo
-      if (respLen < 12) return false
-      val resp = ByteArray(respLen.coerceAtMost(512))
-      var readTotal = 0
-      while (readTotal < resp.size) {
-        val n = input.read(resp, readTotal, resp.size - readTotal)
-        if (n <= 0) break
-        readTotal += n
-      }
-      if (readTotal < 12) return false
-      val rcode = resp[3].toInt() and 0x0F
-      val answerCount = ((resp[6].toInt() and 0xFF) shl 8) or (resp[7].toInt() and 0xFF)
-      rcode == 0 && answerCount >= 1
-    } catch (_: Exception) {
-      false
-    } finally {
-      try { socket?.close() } catch (_: Exception) {}
-    }
-  }
-
-  private fun verifyDohQueryViaProxy(proxyPort: Int, timeoutMs: Int): Boolean {
-    var socket: Socket? = null
-    return try {
-      val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", proxyPort))
-      socket = Socket(proxy)
-      socket.soTimeout = timeoutMs
-      socket.connect(InetSocketAddress.createUnresolved("8.8.8.8", 443), timeoutMs)
-      val (tlsIn, tlsOut) =
-        GfwKnockerXrayCore.openSslEngineOverStreams(
-          sslContext = javax.net.ssl.SSLContext.getDefault(),
-          rawIn = socket.getInputStream(),
-          rawOut = socket.getOutputStream(),
-          sniHost = "dns.google",
-          port = 443,
-          alpnProtocols = arrayOf("http/1.1"),
-        )
-      val req =
-        "GET /resolve?name=instagram.com&type=A HTTP/1.1\r\n" +
-          "Host: dns.google\r\n" +
-          "Connection: close\r\n\r\n"
-      tlsOut.write(req.toByteArray(Charsets.US_ASCII))
-      tlsOut.flush()
-      val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
-      statusLine?.startsWith("HTTP/1.1 200") == true || statusLine?.startsWith("HTTP/2 200") == true
-    } catch (_: Exception) {
-      false
-    } finally {
-      try { socket?.close() } catch (_: Exception) {}
-    }
+    return verifyHttpsViaProxy(proxyPort, timeoutMs)
+      ?: verifyHttp204ViaProxy(proxyPort, timeoutMs.coerceAtMost(2500))
   }
 
   private fun verifyHttpsViaProxy(proxyPort: Int, timeoutMs: Int): Long? {
@@ -1078,6 +1021,7 @@ class MehVpnService : VpnService() {
     refineJob = null
     topUpPoolJob?.cancel()
     topUpPoolJob = null
+    stopHevTunnel()
     stopNativeXray()
     localSocksPort = 0
     activeConfigState = null
@@ -1111,6 +1055,7 @@ class MehVpnService : VpnService() {
     keepAliveJob?.cancel()
     refineJob?.cancel()
     topUpPoolJob?.cancel()
+    stopHevTunnel()
     stopNativeXray()
     try {
       vpnInterface?.close()
@@ -1200,6 +1145,8 @@ class MehVpnService : VpnService() {
     const val EXTRA_CORE_JSON = "extra_core_json"
 
     private const val TUN_MTU = 1400
+    private const val TUN_IPV4_ADDRESS = "10.10.14.1"
+    private const val MAP_DNS_ADDRESS = "10.10.14.2"
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 

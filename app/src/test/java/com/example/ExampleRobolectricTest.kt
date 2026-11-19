@@ -465,9 +465,23 @@ class ExampleRobolectricTest {
       fragmentOutbound.getJSONObject("streamSettings").getJSONObject("sockopt").getString("domainStrategy"),
     )
 
-    val rules = root.getJSONObject("routing").getJSONArray("rules")
+    val routingObj = root.getJSONObject("routing")
+    org.junit.Assert.assertEquals("AsIs", routingObj.getString("domainStrategy"))
+    val rules = routingObj.getJSONArray("rules")
     assertTrue(rules.toString().contains("domain:ir"))
     org.junit.Assert.assertFalse(rules.toString().contains("domain:.ir"))
+
+    val hevYaml =
+      com.example.vpn.GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
+        socksPort = 20808,
+        tunMtu = 1400,
+        tunIpv4 = "10.10.14.1",
+        mapDnsAddress = "10.10.14.2",
+      )
+    assertTrue(hevYaml.contains("port: 20808"))
+    assertTrue(hevYaml.contains("address: 10.10.14.2"))
+    assertTrue(hevYaml.contains("network: 100.64.0.0"))
+    assertTrue(hevYaml.contains("read-write-timeout: 60000"))
 
     val realityPubKey =
       java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })

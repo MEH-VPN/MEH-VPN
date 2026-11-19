@@ -5,13 +5,15 @@
 -keepattributes SourceFile,LineNumberTable
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# Keep Go mobile / gomobile / libXray JNI bindings and classes
+# Keep Go mobile / gomobile / libXray & hev-socks5-tunnel JNI bindings and classes
 -keep class go.** { *; }
 -keep class libXray.** { *; }
+-keep class org.amnezia.awg.hevtunnel.** { *; }
 -keep class engine.** { *; }
 -keep class tun2socks.** { *; }
 -dontwarn go.**
 -dontwarn libXray.**
+-dontwarn org.amnezia.awg.hevtunnel.**
 -dontwarn engine.**
 -dontwarn tun2socks.**
 

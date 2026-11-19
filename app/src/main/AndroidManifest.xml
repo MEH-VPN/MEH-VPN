@@ -3,7 +3,7 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-sdk
-        tools:overrideLibrary="androidx.core,androidx.core.ktx,com.google.android.gms.ads_identifier,com.google.android.gms.base,com.google.android.gms.common,com.google.android.gms.measurement.api,com.google.android.gms.measurement.sdk,com.google.android.gms.measurement.sdk.api,com.google.android.gms.measurement_base,com.google.android.gms.stats,com.google.android.gms.tasks" />
+        tools:overrideLibrary="androidx.core,androidx.core.ktx,com.google.android.gms.ads_identifier,com.google.android.gms.base,com.google.android.gms.common,com.google.android.gms.measurement.api,com.google.android.gms.measurement.sdk,com.google.android.gms.measurement.sdk.api,com.google.android.gms.measurement_base,com.google.android.gms.stats,com.google.android.gms.tasks,org.amnezia.awg.hevtunnel" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
