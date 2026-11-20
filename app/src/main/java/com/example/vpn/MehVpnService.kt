@@ -29,7 +29,11 @@ import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import org.amnezia.awg.hevtunnel.TProxyService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -100,6 +104,7 @@ class MehVpnService : VpnService() {
 
   override fun onCreate() {
     super.onCreate()
+    VerifiedServerPoolStore.resetCachesIfAppUpdated(applicationContext, BuildConfig.VERSION_CODE)
     MehTelemetry.initialize(this)
     registerPhysicalNetworkTracker()
     BackgroundServerScanScheduler.ensurePeriodicScheduled(applicationContext)
@@ -285,6 +290,9 @@ class MehVpnService : VpnService() {
 
       var startedConfig: V2RayConfig? = null
       var verifiedPingMs: Long = initialPing
+      var connectedReport: SocialProbeReport? = null
+      var youtubeOnlyFallback: Triple<V2RayConfig, Boolean, SocialProbeReport>? = null
+      var extraSocialSearchTries = 0
       var lastError: String? = null
       for (idx in effectiveConfigs.indices) {
         val candidate = effectiveConfigs[idx]
@@ -293,15 +301,31 @@ class MehVpnService : VpnService() {
           "راه‌اندازی و تست هسته Xray روی ${candidate.cleanTitle}...",
           VpnLogLevel.SCAN,
         )
-        val (verifiedCfg, livePing, candidateErr) =
-          launchVerifiedNativeXraySocks(
+        val (verifiedCfg, report, candidateErr) =
+          launchVerifiedNativeXraySocksWithReport(
             candidate = candidate,
             socksPort = fixedSocksPort,
             verifyTimeoutMs = 4500,
           )
-        if (verifiedCfg != null && livePing != null) {
+        if (verifiedCfg != null && report != null && report.anyPassed) {
+          val livePing = report.bestLatencyMs ?: initialPing
+          // Prefer a server that actually opens Instagram or X/Twitter over a YouTube-only node.
+          val hasMoreCandidates = idx + 1 < effectiveConfigs.size
+          if (!report.socialPassed && hasMoreCandidates && extraSocialSearchTries < 2) {
+            if (youtubeOnlyFallback == null) {
+              youtubeOnlyFallback = Triple(verifiedCfg, activeUseFragment, report)
+            }
+            extraSocialSearchTries++
+            emitRealtimeLog(
+              "این سرور فقط یوتیوب را باز کرد (اینستاگرام/توییتر پاسخ نداد)؛ بررسی سرور بعدی...",
+              VpnLogLevel.SCAN,
+            )
+            stopNativeXray()
+            continue
+          }
           startedConfig = verifiedCfg
           verifiedPingMs = livePing
+          connectedReport = report
           synchronized(poolLock) { poolCursor.set(idx) }
           break
         }
@@ -313,6 +337,25 @@ class MehVpnService : VpnService() {
         }
         DeadServerStore.markDead(applicationContext, candidate.endpointKey)
         VerifiedServerPoolStore.removeEndpoint(applicationContext, candidate.endpointKey)
+      }
+
+      if (startedConfig == null && youtubeOnlyFallback != null) {
+        val (fallbackCfg, fallbackFrag, fallbackReport) = youtubeOnlyFallback
+        val restoreErr =
+          launchNativeXraySocksCore(
+            config = fallbackCfg,
+            socksPort = fixedSocksPort,
+            useFragmentOverride = fallbackFrag,
+          )
+        if (restoreErr == null) {
+          startedConfig = fallbackCfg
+          verifiedPingMs = fallbackReport.bestLatencyMs ?: initialPing
+          connectedReport = fallbackReport
+          val fallbackIdx = effectiveConfigs.indexOfFirst { it.endpointKey == fallbackCfg.endpointKey }
+          if (fallbackIdx >= 0) {
+            synchronized(poolLock) { poolCursor.set(fallbackIdx) }
+          }
+        }
       }
 
       val active =
@@ -391,6 +434,12 @@ class MehVpnService : VpnService() {
         "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
         VpnLogLevel.SUCCESS,
       )
+      connectedReport?.let { report ->
+        emitRealtimeLog(
+          report.formatDiagnosticLog(),
+          if (report.socialPassed) VpnLogLevel.SUCCESS else VpnLogLevel.SYSTEM,
+        )
+      }
 
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
       startBackgroundNodeRefinement(effectivePing)
@@ -404,6 +453,35 @@ class MehVpnService : VpnService() {
       )
       stopTunnel("خطا در راه‌اندازی هسته Xray:\n${t.localizedMessage ?: t.javaClass.simpleName}")
     }
+  }
+
+  private fun launchVerifiedNativeXraySocksWithReport(
+    candidate: V2RayConfig,
+    socksPort: Int,
+    verifyTimeoutMs: Int = 4500,
+  ): Triple<V2RayConfig?, SocialProbeReport?, String?> {
+    val defaultFrag =
+      candidate.fragmentProfile.isNotBlank() &&
+        !candidate.fragmentProfile.equals("direct_tls", ignoreCase = true)
+    var lastError: String? = null
+    for (fragMode in listOf(defaultFrag, !defaultFrag)) {
+      val startErr =
+        launchNativeXraySocksCore(
+          config = candidate,
+          socksPort = socksPort,
+          useFragmentOverride = fragMode,
+        )
+      if (startErr != null) {
+        lastError = startErr
+        break
+      }
+      val report = probeSocialConnectivityOverSocks(socksPort, timeoutMs = verifyTimeoutMs)
+      if (report.anyPassed) {
+        val verifiedCfg = activeConfigState ?: candidate
+        return Triple(verifiedCfg, report, null)
+      }
+    }
+    return Triple(null, null, lastError)
   }
 
   private fun launchVerifiedNativeXraySocks(
@@ -697,24 +775,54 @@ class MehVpnService : VpnService() {
     failedCfg: V2RayConfig,
     reason: String,
   ): Pair<V2RayConfig, Long?> {
+    val socksPort = localSocksPort
+    if (socksPort <= 0) return failedCfg to null
+    val failedFrag = activeUseFragment
     appendFreshStandbyServers(VerifiedServerPoolStore.getFastest(applicationContext))
-    var abandonedCfg = failedCfg
-    val poolSize = currentPoolSnapshot().size.coerceAtLeast(1)
-    var attempts = 0
-    while (attempts < poolSize) {
-      val nextCfg = switchToNextHealthyNode(reason) ?: break
-      attempts++
-      if (nextCfg.endpointKey == abandonedCfg.endpointKey) break
-      DeadServerStore.markDead(applicationContext, abandonedCfg.endpointKey)
-      VerifiedServerPoolStore.removeEndpoint(applicationContext, abandonedCfg.endpointKey)
-      val ping = verifyRealPathViaProxy(localSocksPort)
-      if (ping != null) {
-        VerifiedServerPoolStore.upsertVerified(applicationContext, listOf(nextCfg.copy(latencyMs = ping)))
-        return nextCfg to ping
-      }
-      abandonedCfg = nextCfg
+    val standbyCandidates =
+      currentPoolSnapshot()
+        .filter { it.endpointKey != failedCfg.endpointKey && NativeXrayEngine.supportsNativeXray(it) }
+        .take(4)
+
+    val result =
+      executeFailoverWithRollback(
+        failedCfg = failedCfg,
+        standbyCandidates = standbyCandidates,
+        launchAndVerify = { candidate ->
+          val (verifiedCfg, livePing, _) =
+            launchVerifiedNativeXraySocks(
+              candidate = candidate,
+              socksPort = socksPort,
+              verifyTimeoutMs = 4500,
+            )
+          if (verifiedCfg != null && livePing != null) {
+            val idx = currentPoolSnapshot().indexOfFirst { it.endpointKey == verifiedCfg.endpointKey }
+            if (idx >= 0) synchronized(poolLock) { poolCursor.set(idx) }
+            verifiedCfg to livePing
+          } else {
+            null
+          }
+        },
+        markDead = { deadCfg ->
+          DeadServerStore.markDead(applicationContext, deadCfg.endpointKey)
+          VerifiedServerPoolStore.removeEndpoint(applicationContext, deadCfg.endpointKey)
+        },
+        restoreFailed = { prev ->
+          val restoreErr = launchNativeXraySocksCore(prev, socksPort, useFragmentOverride = failedFrag)
+          if (restoreErr == null) {
+            val idx = currentPoolSnapshot().indexOfFirst { it.endpointKey == prev.endpointKey }
+            if (idx >= 0) synchronized(poolLock) { poolCursor.set(idx) }
+          }
+        },
+      )
+
+    if (result.second != null) {
+      VerifiedServerPoolStore.upsertVerified(
+        applicationContext,
+        listOf(result.first.copy(latencyMs = result.second!!)),
+      )
     }
-    return (currentActiveConfig() ?: failedCfg) to null
+    return result
   }
 
   private fun handleManualSwitchServer() {
@@ -852,49 +960,55 @@ class MehVpnService : VpnService() {
           } else {
             consecutiveSkippedProbes = 0
             MehDiag.recordKeepAliveProbeRun()
+            var coreDied = false
             if (!NativeXrayEngine.isRunning() && localSocksPort > 0) {
+              coreDied = true
               launchNativeXraySocksCore(activeCfg, localSocksPort, useFragmentOverride = activeUseFragment)
             }
-            var realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 4000)
+            var realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 5500)
             if (realPing == null) {
-              delay(1_500L)
-              realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 4000)
+              delay(2_500L)
+              realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 5500)
             }
             if (realPing != null) {
               lastPing = realPing
               consecutiveFailures = 0
             } else {
               consecutiveFailures++
-              val (switchedCfg, switchedPing) =
-                failoverToNextVerifiedNode(activeCfg, "keep_alive_timeout")
-              if (switchedCfg.endpointKey != activeCfg.endpointKey) {
-                activeCfg = switchedCfg
-                consecutiveFailures = 0
-                emitRealtimeLog(
-                  "افت یا قطع نود قبلی؛ انتقال خودکار به ${switchedCfg.cleanTitle}" +
-                    if (switchedPing != null) " (${switchedPing}ms)" else "",
-                  VpnLogLevel.SYSTEM,
-                )
-                if (switchedPing != null) {
-                  lastPing = switchedPing
+              // Require 2 consecutive failed keep-alive ticks (unless Xray actually exited) so a
+              // temporary slowdown while Instagram/Twitter downloads media never kills live sockets.
+              if (coreDied || consecutiveFailures >= 2) {
+                val (switchedCfg, switchedPing) =
+                  failoverToNextVerifiedNode(activeCfg, "keep_alive_timeout")
+                if (switchedCfg.endpointKey != activeCfg.endpointKey) {
+                  activeCfg = switchedCfg
+                  consecutiveFailures = 0
+                  emitRealtimeLog(
+                    "افت یا قطع نود قبلی؛ انتقال خودکار به ${switchedCfg.cleanTitle}" +
+                      if (switchedPing != null) " (${switchedPing}ms)" else "",
+                    VpnLogLevel.SYSTEM,
+                  )
+                  if (switchedPing != null) {
+                    lastPing = switchedPing
+                  } else {
+                    launch {
+                      try {
+                        refineNodesOnce(force = true)
+                      } catch (_: Exception) {}
+                    }
+                  }
                 } else {
                   launch {
                     try {
                       refineNodesOnce(force = true)
                     } catch (_: Exception) {}
                   }
-                }
-              } else {
-                launch {
-                  try {
-                    refineNodesOnce(force = true)
-                  } catch (_: Exception) {}
-                }
-                if (consecutiveFailures == 3) {
-                  MehTelemetry.logError(
-                    stage = "keep_alive_probe",
-                    errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
-                  )
+                  if (consecutiveFailures == 3) {
+                    MehTelemetry.logError(
+                      stage = "keep_alive_probe",
+                      errorMessage = "3 consecutive keep-alive probes timed out on ${activeCfg.cleanTitle}",
+                    )
+                  }
                 }
               }
             }
@@ -1276,6 +1390,26 @@ class MehVpnService : VpnService() {
     STORE_STANDBY_ONLY,
   }
 
+  internal data class SocialProbeReport(
+    val youtubeMs: Long?,
+    val instagramMs: Long?,
+    val twitterMs: Long?,
+  ) {
+    val anyPassed: Boolean
+      get() = youtubeMs != null || instagramMs != null || twitterMs != null
+
+    val socialPassed: Boolean
+      get() = instagramMs != null || twitterMs != null
+
+    val bestLatencyMs: Long?
+      get() = listOfNotNull(instagramMs, twitterMs, youtubeMs).minOrNull()
+
+    fun formatDiagnosticLog(): String {
+      fun fmt(ms: Long?): String = if (ms != null) "✓ ${ms}ms" else "✗"
+      return "تست مسیر زنده: اینستاگرام ${fmt(instagramMs)} • توییتر ${fmt(twitterMs)} • یوتیوب ${fmt(youtubeMs)}"
+    }
+  }
+
   companion object {
     const val ACTION_CONNECT = "com.example.vpn.ACTION_CONNECT"
     const val ACTION_DISCONNECT = "com.example.vpn.ACTION_DISCONNECT"
@@ -1303,13 +1437,13 @@ class MehVpnService : VpnService() {
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
-    private const val REFINE_FIRST_DELAY_MS = 4_000L
-    private const val STANDBY_WARMUP_DELAY_MS = 6_000L
+    private const val REFINE_FIRST_DELAY_MS = 25_000L
+    private const val STANDBY_WARMUP_DELAY_MS = 20_000L
     private const val INITIAL_UPGRADE_WINDOW_MS = 120_000L
     private const val MAX_INITIAL_UPGRADE_ATTEMPTS = 4
-    private const val REFINE_RETRY_IDLE_MS = 14_000L
-    private const val REFINE_RETRY_METERED_MS = 25_000L
-    private const val FAST_ENOUGH_PING_MS = 350L
+    private const val REFINE_RETRY_IDLE_MS = 20_000L
+    private const val REFINE_RETRY_METERED_MS = 30_000L
+    private const val FAST_ENOUGH_PING_MS = 1_200L
     private const val FAST_TARGET_PING_MS = 250L
     private const val INITIAL_UPGRADE_RATIO = 0.60
     private const val ACTIVE_TRAFFIC_SAMPLE_MS = 1_200L
@@ -1317,12 +1451,84 @@ class MehVpnService : VpnService() {
     private const val REFINE_POOL_SIZE = 6
     private const val MAX_STANDBY_POOL_SIZE = 8
     private const val STANDBY_POOL_TARGET_SIZE = 4
-    private const val REFINE_CONCURRENCY = 16
+    private const val REFINE_CONCURRENCY = 6
 
     private const val DIAG_LOG_INTERVAL_MS = 30_000L
-    private const val KEEP_ALIVE_FIRST_CHECK_MS = 10_000L
-    private const val KEEP_ALIVE_INTERVAL_MS = 25_000L
+    private const val KEEP_ALIVE_FIRST_CHECK_MS = 20_000L
+    private const val KEEP_ALIVE_INTERVAL_MS = 30_000L
     private const val HEARTBEAT_EVERY_N_TICKS = 24
+
+    /**
+     * Probes YouTube, Instagram, and X/Twitter in parallel over the live Xray SOCKS5 inbound so
+     * initial connect prefers nodes where social apps actually respond (not just 0-byte YouTube
+     * 204) and emits clear per-service diagnostics.
+     */
+    internal fun probeSocialConnectivityOverSocks(
+      proxyPort: Int,
+      timeoutMs: Int = 4500,
+    ): SocialProbeReport {
+      if (proxyPort <= 0) return SocialProbeReport(null, null, null)
+      val ytRef = AtomicReference<Long?>(null)
+      val igRef = AtomicReference<Long?>(null)
+      val xRef = AtomicReference<Long?>(null)
+      val latch = CountDownLatch(3)
+
+      thread(isDaemon = true, name = "socks-probe-yt") {
+        try {
+          ytRef.set(
+            verifyHttpsOverSocks(
+              proxyPort = proxyPort,
+              targetHost = "www.youtube.com",
+              requestPath = "/generate_204",
+              timeoutMs = timeoutMs,
+              requireStatus204Or200 = true,
+            )
+          )
+        } finally {
+          latch.countDown()
+        }
+      }
+      thread(isDaemon = true, name = "socks-probe-ig") {
+        try {
+          igRef.set(
+            verifyHttpsOverSocks(
+              proxyPort = proxyPort,
+              targetHost = "i.instagram.com",
+              requestPath = "/api/v1/si/fetch_headers/",
+              timeoutMs = timeoutMs,
+              requireStatus204Or200 = false,
+            )
+          )
+        } finally {
+          latch.countDown()
+        }
+      }
+      thread(isDaemon = true, name = "socks-probe-x") {
+        try {
+          xRef.set(
+            verifyHttpsOverSocks(
+              proxyPort = proxyPort,
+              targetHost = "api.x.com",
+              requestPath = "/1.1/help/settings.json",
+              timeoutMs = timeoutMs,
+              requireStatus204Or200 = false,
+            )
+          )
+        } finally {
+          latch.countDown()
+        }
+      }
+
+      try {
+        latch.await(timeoutMs.toLong() + 1_000L, TimeUnit.MILLISECONDS)
+      } catch (_: InterruptedException) {}
+
+      return SocialProbeReport(
+        youtubeMs = ytRef.get(),
+        instagramMs = igRef.get(),
+        twitterMs = xRef.get(),
+      )
+    }
 
     /**
      * Verifies real censorship bypass over the live Xray SOCKS5 inbound using strictly CA-verified
@@ -1403,6 +1609,28 @@ class MehVpnService : VpnService() {
       } finally {
         try { socket?.close() } catch (_: Exception) {}
       }
+    }
+
+    internal fun executeFailoverWithRollback(
+      failedCfg: V2RayConfig,
+      standbyCandidates: List<V2RayConfig>,
+      launchAndVerify: (V2RayConfig) -> Pair<V2RayConfig, Long>?,
+      markDead: (V2RayConfig) -> Unit,
+      restoreFailed: (V2RayConfig) -> Unit,
+    ): Pair<V2RayConfig, Long?> {
+      for (candidate in standbyCandidates) {
+        if (candidate.endpointKey == failedCfg.endpointKey) continue
+        val verified = launchAndVerify(candidate)
+        if (verified != null) {
+          markDead(failedCfg)
+          return verified.first to verified.second
+        }
+        markDead(candidate)
+      }
+      // No standby candidate passed: roll back to failedCfg rather than leaving Xray stuck on a
+      // dead backup node while reporting "connected".
+      restoreFailed(failedCfg)
+      return failedCfg to null
     }
 
     internal fun executeSafeServerSwap(

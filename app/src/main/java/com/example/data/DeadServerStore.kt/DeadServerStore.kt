@@ -45,6 +45,15 @@ object DeadServerStore {
     return live.keys
   }
 
+  /** Clears all remembered dead server entries (e.g. after an app version upgrade). */
+  fun clear(context: Context) {
+    context.applicationContext
+      .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .remove(KEY_DEAD_SERVERS_JSON)
+      .apply()
+  }
+
   private fun loadEntries(context: Context): Map<String, Long> {
     val raw =
       context

@@ -218,6 +218,7 @@ class MehViewModel(
 
   fun loadSavedLastServer(context: Context) {
     try {
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, com.example.BuildConfig.VERSION_CODE)
       val prefs = context.applicationContext.getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
       val rawJson = prefs.getString(KEY_SAVED_CANDIDATES_JSON, null)
       if (rawJson.isNullOrBlank()) return

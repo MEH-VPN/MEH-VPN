@@ -25,6 +25,10 @@ object VerifiedServerPoolStore {
   private const val KEY_VERIFIED_POOL_JSON = "verified_pool_json"
   private const val KEY_BATCH_CURSOR = "scan_batch_cursor"
   private const val KEY_LAST_SCAN_AT_MS = "last_scan_at_ms"
+  private const val KEY_CACHE_APP_VERSION = "cache_app_version_code"
+  private const val KEY_CACHE_INSTALL_TIME_MS = "cache_install_update_time_ms"
+  private const val PREFS_LAST_SERVER = "meh_last_server_prefs"
+  private const val KEY_SAVED_CANDIDATES_JSON = "saved_candidates_json"
 
   /** Maximum number of fastest verified servers kept in persistent storage. */
   const val MAX_POOL_SIZE = 15
@@ -195,6 +199,53 @@ object VerifiedServerPoolStore {
         .edit()
         .clear()
         .apply()
+    }
+  }
+
+  /**
+   * Automatically clears stale cached servers, last-connected server history, and dead-server
+   * blacklists ONCE whenever the app is upgraded to a new [currentVersionCode] OR reinstalled in
+   * place (detected via Android's [PackageInfo.lastUpdateTime]), so in-place APK updates behave
+   * identically to a clean install and never inherit stale configs from older builds.
+   */
+  fun resetCachesIfAppUpdated(
+    context: Context,
+    currentVersionCode: Int,
+    installUpdateTimeMs: Long = readPackageLastUpdateTimeMs(context),
+  ): Boolean {
+    val appCtx = context.applicationContext
+    synchronized(storeLock) {
+      val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val savedVersion = prefs.getInt(KEY_CACHE_APP_VERSION, -1)
+      val savedInstallTimeMs = prefs.getLong(KEY_CACHE_INSTALL_TIME_MS, -1L)
+      val versionChanged = savedVersion != currentVersionCode
+      val installTimeChanged =
+        installUpdateTimeMs > 0L && savedInstallTimeMs != installUpdateTimeMs
+      if (!versionChanged && !installTimeChanged) return false
+      prefs.edit()
+        .remove(KEY_VERIFIED_POOL_JSON)
+        .remove(KEY_LAST_SCAN_AT_MS)
+        .putInt(KEY_CACHE_APP_VERSION, currentVersionCode)
+        .putLong(KEY_CACHE_INSTALL_TIME_MS, installUpdateTimeMs)
+        .apply()
+      appCtx
+        .getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
+        .edit()
+        .remove(KEY_SAVED_CANDIDATES_JSON)
+        .apply()
+      DeadServerStore.clear(appCtx)
+      return true
+    }
+  }
+
+  private fun readPackageLastUpdateTimeMs(context: Context): Long {
+    return try {
+      val appCtx = context.applicationContext
+      @Suppress("DEPRECATION")
+      val pkgInfo = appCtx.packageManager.getPackageInfo(appCtx.packageName, 0)
+      pkgInfo.lastUpdateTime
+    } catch (_: Throwable) {
+      0L
     }
   }
 

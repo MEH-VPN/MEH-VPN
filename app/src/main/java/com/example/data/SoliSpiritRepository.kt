@@ -885,6 +885,7 @@ private suspend fun fetchFromSourceList(
                         youtubeLatency != null || instagramLatency != null || twitterLatency != null
                       if (!passedAnyFiltered) return@withTimeoutOrNull null
 
+                      val passedBothSocial = instagramLatency != null && twitterLatency != null
                       val passedMultipleFiltered =
                         listOfNotNull(youtubeLatency, instagramLatency, twitterLatency).size >= 2
 
@@ -902,18 +903,31 @@ private suspend fun fetchFromSourceList(
 
                       val socialBonus =
                         when {
-                          passedMultipleFiltered && instagramLatency != null && tgLatency != null -> 140.0
+                          passedBothSocial && tgLatency != null -> 260.0
+                          passedBothSocial -> 220.0
+                          passedMultipleFiltered && instagramLatency != null -> 140.0
                           passedMultipleFiltered -> 100.0
-                          instagramLatency != null -> 60.0
-                          else -> 35.0
+                          instagramLatency != null || twitterLatency != null -> 70.0
+                          else -> 15.0
                         }
                       val effectiveLatency = measuredLatencyMs
                       val bandwidthScore =
-                        if (throughputKbps < 15.0) -50.0 else (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                        when {
+                          throughputKbps < 30.0 -> -80.0
+                          throughputKbps < 45.0 -> -20.0
+                          else -> throughputKbps.coerceAtMost(2500.0) * 0.90
+                        }
                       val compositeScore =
                         (10_000.0 / effectiveLatency.toDouble()) + bandwidthScore + socialBonus
 
-                      val tier = if (passedMultipleFiltered) 1 else 2
+                      // Tier 1 requires at least Instagram or X/Twitter working alongside >= 2 filtered targets
+                      // and non-throttled bandwidth, so YouTube-only or dial-up-slow nodes stay in fallback tier 2.
+                      val tier =
+                        if (passedBothSocial || (passedMultipleFiltered && (instagramLatency != null || twitterLatency != null) && throughputKbps >= 40.0)) {
+                          1
+                        } else {
+                          2
+                        }
 
                       Pair(
                         tier,
@@ -1505,8 +1519,14 @@ private suspend fun fetchFromSourceList(
                                 }
                             if (resolvedIp.isBlank()) return@async null
                             val prepared = cfg.copy(resolvedIp = resolvedIp)
-                            val bypassJob = async {
-                                V2RayOutboundClient.verifyCensorshipBypassCapability(
+                            val instagramJob = async {
+                                V2RayOutboundClient.verifyInstagramCapability(
+                                    config = prepared,
+                                    timeoutMs = 2800,
+                                )
+                            }
+                            val twitterJob = async {
+                                V2RayOutboundClient.verifySocialMediaCapability(
                                     config = prepared,
                                     timeoutMs = 2800,
                                 )
@@ -1518,13 +1538,18 @@ private suspend fun fetchFromSourceList(
                                     targetBytes = 16_384,
                                 )
                             }
-                            val bypassLatency = bypassJob.await() ?: return@async null
+                            val igLatency = instagramJob.await()
+                            val xLatency = twitterJob.await()
+                            val socialLatency = listOfNotNull(igLatency, xLatency).minOrNull()
+                                ?: return@async null
                             val throughputKbps = bandwidthJob.await() ?: return@async null
-                            if (throughputKbps < 25.0) return@async null
-                            val realPing = bypassLatency.coerceAtLeast(1L)
+                            if (throughputKbps < 35.0) return@async null
+                            val realPing = socialLatency.coerceAtLeast(1L)
+                            val bothBonus = if (igLatency != null && xLatency != null) 200.0 else 60.0
                             val score =
                                 (10_000.0 / realPing.toDouble()) +
-                                    (throughputKbps.coerceAtMost(2500.0) * 0.85)
+                                    (throughputKbps.coerceAtMost(2500.0) * 0.90) +
+                                    bothBonus
                             val verified =
                                 prepared.copy(
                                     latencyMs = realPing,

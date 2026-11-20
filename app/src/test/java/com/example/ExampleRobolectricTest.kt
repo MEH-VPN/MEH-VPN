@@ -429,9 +429,9 @@ class ExampleRobolectricTest {
     org.junit.Assert.assertFalse(stream.has("sockopt"))
 
     val dnsObj = root.getJSONObject("dns")
-    org.junit.Assert.assertTrue(dnsObj.getBoolean("enableParallelQuery"))
+    org.junit.Assert.assertFalse(dnsObj.optBoolean("enableParallelQuery", false))
     val dnsServers = dnsObj.getJSONArray("servers")
-    org.junit.Assert.assertEquals("tcp://8.8.8.8", dnsServers.getString(0))
+    org.junit.Assert.assertEquals("1.1.1.1", dnsServers.getString(0))
     val dnsOutbound = outbounds.getJSONObject(3)
     org.junit.Assert.assertEquals("dns-out", dnsOutbound.getString("tag"))
     org.junit.Assert.assertEquals(
@@ -592,14 +592,14 @@ class ExampleRobolectricTest {
 
   @Test
   fun smartBackgroundRefinement_respectsOneShotWindowAndActiveTraffic() {
-    // 1. Slow initial server (>350ms), inside 2-min window, much faster challenger, idle tunnel -> UPGRADE_NOW
+    // 1. Very slow initial server (>1200ms), inside 2-min window, much faster challenger, idle tunnel -> UPGRADE_NOW
     org.junit.Assert.assertEquals(
       com.example.vpn.MehVpnService.RefineAction.UPGRADE_NOW,
       com.example.vpn.MehVpnService.decideBackgroundRefineAction(
         forceFailover = false,
         initialUpgradeCompleted = false,
         elapsedSinceConnectMs = 20_000L,
-        currentPingMs = 720L,
+        currentPingMs = 1500L,
         challengerPingMs = 190L,
         isUserTrafficActive = false,
       ),
@@ -612,7 +612,7 @@ class ExampleRobolectricTest {
         forceFailover = false,
         initialUpgradeCompleted = false,
         elapsedSinceConnectMs = 20_000L,
-        currentPingMs = 720L,
+        currentPingMs = 1500L,
         challengerPingMs = 190L,
         isUserTrafficActive = true,
       ),

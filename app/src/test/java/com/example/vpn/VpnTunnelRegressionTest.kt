@@ -171,6 +171,7 @@ class VpnTunnelRegressionTest {
     assertTrue(yaml.contains("netmask: 255.192.0.0"))
     assertFalse("Avoid reserved Class E 240.0.0.0/4 on Android kernels", yaml.contains("240.0.0.0"))
     assertTrue("Must use valid hev-socks5-tunnel key read-write-timeout", yaml.contains("read-write-timeout:"))
+    assertTrue("connect-timeout should allow 10s for high-latency mobile handshakes", yaml.contains("connect-timeout: 10000"))
     assertFalse("tcp-read-write-timeout is rejected by libhev-socks5-tunnel.so", yaml.contains("tcp-read-write-timeout:"))
   }
 
@@ -237,6 +238,11 @@ class VpnTunnelRegressionTest {
         assertFalse("${cfg.remarks} must not contain invalid 'domain:.ir'", rawJson.contains("domain:.ir"))
 
         val root = JSONObject(rawJson)
+        val policyLevels = root.getJSONObject("policy").getJSONObject("levels")
+        val level8 = policyLevels.getJSONObject("8")
+        assertTrue("Level 8 handshake timeout must be >= 8s for bursty mobile handshakes", level8.getInt("handshake") >= 8)
+        assertTrue("Level 8 bufferSize must be >= 32 KB for media feeds", level8.getInt("bufferSize") >= 32)
+
         val inbounds = root.getJSONArray("inbounds")
         assertEquals("${cfg.remarks} live mode must only bind socks-in (hev-tunnel owns TUN)", 1, inbounds.length())
         val socksIn = inbounds.getJSONObject(0)
@@ -244,6 +250,10 @@ class VpnTunnelRegressionTest {
         assertEquals("127.0.0.1", socksIn.getString("listen"))
         assertEquals(20808, socksIn.getInt("port"))
         assertTrue(socksIn.getJSONObject("settings").getBoolean("udp"))
+        assertEquals("127.0.0.1", socksIn.getJSONObject("settings").getString("ip"))
+        val sniffOverrides = socksIn.getJSONObject("sniffing").getJSONArray("destOverride")
+        val sniffSet = (0 until sniffOverrides.length()).map { sniffOverrides.getString(it) }.toSet()
+        assertTrue("socks-in sniffing must cover http, tls, and quic", setOf("http", "tls", "quic").all { it in sniffSet })
 
         val outbounds = root.getJSONArray("outbounds")
         assertEquals("proxy", outbounds.getJSONObject(0).getString("tag"))
@@ -468,28 +478,41 @@ class VpnTunnelRegressionTest {
       reordered.map { it.endpointKey },
     )
 
-    // Marginal speedup (<40% and >250ms) must NOT disrupt the user -> STORE_STANDBY_ONLY.
+    // Normal healthy Iranian node (<= 1200ms) must NEVER be disrupted mid-session -> STORE_STANDBY_ONLY.
     assertEquals(
       MehVpnService.RefineAction.STORE_STANDBY_ONLY,
       MehVpnService.decideBackgroundRefineAction(
         forceFailover = false,
         initialUpgradeCompleted = false,
         elapsedSinceConnectMs = 20_000L,
-        currentPingMs = 500L,
-        challengerPingMs = 390L,
+        currentPingMs = 650L,
+        challengerPingMs = 210L,
         isUserTrafficActive = false,
       ),
     )
 
-    // Significant speedup while user is idle within 2-min window -> UPGRADE_NOW.
+    // Marginal speedup on a very slow node (> 1200ms) must NOT disrupt -> STORE_STANDBY_ONLY.
+    assertEquals(
+      MehVpnService.RefineAction.STORE_STANDBY_ONLY,
+      MehVpnService.decideBackgroundRefineAction(
+        forceFailover = false,
+        initialUpgradeCompleted = false,
+        elapsedSinceConnectMs = 20_000L,
+        currentPingMs = 1500L,
+        challengerPingMs = 1100L,
+        isUserTrafficActive = false,
+      ),
+    )
+
+    // Dramatic speedup on a sluggish node (> 1200ms) while user is idle -> UPGRADE_NOW.
     assertEquals(
       MehVpnService.RefineAction.UPGRADE_NOW,
       MehVpnService.decideBackgroundRefineAction(
         forceFailover = false,
         initialUpgradeCompleted = false,
         elapsedSinceConnectMs = 20_000L,
-        currentPingMs = 650L,
-        challengerPingMs = 210L,
+        currentPingMs = 1600L,
+        challengerPingMs = 240L,
         isUserTrafficActive = false,
       ),
     )
@@ -501,11 +524,73 @@ class VpnTunnelRegressionTest {
         forceFailover = false,
         initialUpgradeCompleted = false,
         elapsedSinceConnectMs = 20_000L,
-        currentPingMs = 650L,
-        challengerPingMs = 210L,
+        currentPingMs = 1600L,
+        challengerPingMs = 240L,
         isUserTrafficActive = true,
       ),
     )
+  }
+
+  @Test
+  fun failoverWithRollback_restoresPreviousNodeWhenBackupsFail_andSocialReportClassifiesTargets() {
+    val active =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@active.example.org:443?security=tls&type=ws#Active"
+      )!!
+    val deadBackup =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@dead-b.example.org:443?security=tls&type=ws#DeadBackup"
+      )!!
+    val goodBackup =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@good-b.example.org:443?security=tls&type=ws#GoodBackup"
+      )!!
+
+    // Case 1: All standby backups fail -> MUST restore active and NOT mark active dead!
+    val markedDead1 = mutableListOf<String>()
+    var restored1: V2RayConfig? = null
+    val fallbackResult =
+      MehVpnService.executeFailoverWithRollback(
+        failedCfg = active,
+        standbyCandidates = listOf(deadBackup),
+        launchAndVerify = { null },
+        markDead = { markedDead1.add(it.endpointKey) },
+        restoreFailed = { restored1 = it },
+      )
+    assertEquals(active.endpointKey, fallbackResult.first.endpointKey)
+    assertNull(fallbackResult.second)
+    assertEquals("Active node must be restored when all standby backups fail", active, restored1)
+    assertFalse("Active node must not be permanently marked dead without a working replacement", active.endpointKey in markedDead1)
+    assertTrue("Failed standby backup should be marked dead", deadBackup.endpointKey in markedDead1)
+
+    // Case 2: Second standby backup passes -> switches cleanly and marks active + first dead backup.
+    val markedDead2 = mutableListOf<String>()
+    var restored2 = false
+    val switchResult =
+      MehVpnService.executeFailoverWithRollback(
+        failedCfg = active,
+        standbyCandidates = listOf(deadBackup, goodBackup),
+        launchAndVerify = { cfg -> if (cfg.endpointKey == goodBackup.endpointKey) cfg to 180L else null },
+        markDead = { markedDead2.add(it.endpointKey) },
+        restoreFailed = { restored2 = true },
+      )
+    assertEquals(goodBackup.endpointKey, switchResult.first.endpointKey)
+    assertEquals(180L, switchResult.second)
+    assertFalse(restored2)
+    assertTrue(active.endpointKey in markedDead2)
+    assertTrue(deadBackup.endpointKey in markedDead2)
+
+    // Verify SocialProbeReport distinguishes YouTube-only nodes from Instagram/Twitter-ready nodes.
+    val ytOnly = MehVpnService.SocialProbeReport(youtubeMs = 310L, instagramMs = null, twitterMs = null)
+    assertTrue(ytOnly.anyPassed)
+    assertFalse("YouTube-only node must not be classified as socialPassed", ytOnly.socialPassed)
+    assertEquals(310L, ytOnly.bestLatencyMs)
+
+    val fullSocial = MehVpnService.SocialProbeReport(youtubeMs = 380L, instagramMs = 420L, twitterMs = 490L)
+    assertTrue(fullSocial.anyPassed)
+    assertTrue(fullSocial.socialPassed)
+    assertTrue(fullSocial.formatDiagnosticLog().contains("اینستاگرام ✓ 420ms"))
+    assertTrue(fullSocial.formatDiagnosticLog().contains("توییتر ✓ 490ms"))
   }
 
   @Test
@@ -773,6 +858,72 @@ class VpnTunnelRegressionTest {
     assertTrue("LinkProperties strict Private DNS must trigger even when Settings.Global is null", linkOnlyStatus.isStrictCustomActive)
     assertTrue(linkOnlyStatus.isLikelyIranianSanctionDns)
     assertEquals("pro.shecan.ir", linkOnlyStatus.hostname)
+  }
+
+  @Test
+  fun upgradeCacheReset_clearsStalePoolAndDeadStoreOncePerAppVersion() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    VerifiedServerPoolStore.clear(context)
+    DeadServerStore.clear(context)
+
+    val oldServer =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@old-cache.example.org:443?security=tls&type=ws#OldCache"
+      )!!.copy(latencyMs = 150L)
+    val deadServer =
+      V2RayConfigParser.parseSingleUri(
+        "vless://11111111-2222-3333-4444-555555555555@dead-cache.example.org:443?security=tls&type=ws#DeadCache"
+      )!!
+
+    val t1 = 1_700_000_000_000L
+    val t2 = 1_700_000_050_000L
+
+    // Simulate pre-upgrade state left over from an older APK version.
+    VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 100, installUpdateTimeMs = t1)
+    VerifiedServerPoolStore.upsertVerified(context, listOf(oldServer))
+    DeadServerStore.markDead(context, deadServer.endpointKey)
+    context.getSharedPreferences("meh_last_server_prefs", Context.MODE_PRIVATE)
+      .edit()
+      .putString("saved_candidates_json", """[{"rawUri":"${oldServer.rawUri}"}]""")
+      .apply()
+
+    // Same version + same install timestamp restart MUST preserve the fresh cache.
+    assertFalse(
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 100, installUpdateTimeMs = t1)
+    )
+    assertEquals(1, VerifiedServerPoolStore.getFastest(context).size)
+    assertTrue(DeadServerStore.isDead(context, deadServer.endpointKey))
+
+    // Upgrading to a new versionCode MUST wipe all stale caches once so it behaves like a clean install.
+    assertTrue(
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 101, installUpdateTimeMs = t1)
+    )
+    assertTrue("Stale verified pool must be cleared on upgrade", VerifiedServerPoolStore.getFastest(context).isEmpty())
+    assertFalse("Stale dead-server blacklist must be cleared on upgrade", DeadServerStore.isDead(context, deadServer.endpointKey))
+    assertNull(
+      "Stale last-connected candidates must be cleared on upgrade",
+      context.getSharedPreferences("meh_last_server_prefs", Context.MODE_PRIVATE)
+        .getString("saved_candidates_json", null),
+    )
+
+    // Subsequent launches on version 101 with the same install timestamp must NOT clear newly discovered servers.
+    VerifiedServerPoolStore.upsertVerified(context, listOf(oldServer))
+    assertFalse(
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 101, installUpdateTimeMs = t1)
+    )
+    assertEquals(1, VerifiedServerPoolStore.getFastest(context).size)
+
+    // In-place reinstall of a new APK build even with the SAME versionCode (newer lastUpdateTime)
+    // MUST wipe stale caches once, then stay stable on subsequent launches.
+    assertTrue(
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 101, installUpdateTimeMs = t2)
+    )
+    assertTrue("In-place APK reinstall must clear stale pool", VerifiedServerPoolStore.getFastest(context).isEmpty())
+    VerifiedServerPoolStore.upsertVerified(context, listOf(oldServer))
+    assertFalse(
+      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 101, installUpdateTimeMs = t2)
+    )
+    assertEquals(1, VerifiedServerPoolStore.getFastest(context).size)
   }
 }
 

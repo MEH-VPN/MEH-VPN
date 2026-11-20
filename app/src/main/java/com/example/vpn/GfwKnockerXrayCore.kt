@@ -493,11 +493,12 @@ object GfwKnockerXrayCore {
           "settings": {
             "auth": "noauth",
             "udp": true,
+            "ip": "127.0.0.1",
             "userLevel": 8
           },
           "sniffing": {
             "enabled": true,
-            "destOverride": ["http", "tls"],
+            "destOverride": ["http", "tls", "quic"],
             "routeOnly": false
           }
         }
@@ -528,15 +529,29 @@ object GfwKnockerXrayCore {
         "log": {
           "loglevel": "warning"
         },
+        "policy": {
+          "levels": {
+            "8": {
+              "handshake": 10,
+              "connIdle": 300,
+              "uplinkOnly": 1,
+              "downlinkOnly": 1,
+              "bufferSize": 64
+            }
+          },
+          "system": {
+            "statsInboundUplink": false,
+            "statsInboundDownlink": false
+          }
+        },
         "dns": {
           "tag": "dns-internal",
           "queryStrategy": "UseIPv4",
-          "enableParallelQuery": true,
           "servers": [
-            "tcp://8.8.8.8",
-            "https://8.8.8.8/dns-query",
+            "1.1.1.1",
+            "8.8.8.8",
             "tcp://1.1.1.1",
-            "https://1.1.1.1/dns-query",
+            "tcp://8.8.8.8",
             {
               "address": "localhost",
               "domains": [
@@ -568,8 +583,8 @@ object GfwKnockerXrayCore {
             "settings": {
               "fragment": {
                 "packets": "tlshello",
-                "length": "10-25",
-                "interval": "2-5"
+                "length": "50-100",
+                "interval": "5-10"
               }
             },
             "streamSettings": {
@@ -701,7 +716,7 @@ object GfwKnockerXrayCore {
         cache-size: 10000
       misc:
         task-stack-size: 81920
-        connect-timeout: 5000
+        connect-timeout: 10000
         read-write-timeout: 60000
         log-level: warn
     """.trimIndent() + "\n"

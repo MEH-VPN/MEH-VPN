@@ -223,6 +223,7 @@ class BackgroundServerScannerJobService : JobService() {
 
     val nowMs = System.currentTimeMillis()
     val appCtx = applicationContext
+    VerifiedServerPoolStore.resetCachesIfAppUpdated(appCtx, com.example.BuildConfig.VERSION_CODE)
     val (batteryPercent, isCharging) = readBatteryState(appCtx)
     val powerSaveMode = isDeviceInPowerSaveMode(appCtx)
     val lastScanAt = VerifiedServerPoolStore.getLastScanAtMs(appCtx)
