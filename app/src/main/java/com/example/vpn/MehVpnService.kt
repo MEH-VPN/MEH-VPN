@@ -329,8 +329,9 @@ class MehVpnService : VpnService() {
         return
       }
 
-      // Establish IPv4-only Android TUN interface ONCE and bridge all device TCP/UDP/DNS traffic
-      // to Xray's local SOCKS5 inbound via `hev-socks5-tunnel` with built-in `mapdns`.
+      // Establish dual-stack IPv4 + IPv6 Android TUN interface ONCE and bridge all device
+      // TCP/UDP/DNS traffic to Xray's local SOCKS5 inbound via `hev-socks5-tunnel` + `mapdns`.
+      // Capturing `::/0` prevents IPv6 leaks on dual-stack carriers (Irancell/MCI/Rightel).
       val builder =
         Builder()
           .setSession("MEH • $effectiveName")
@@ -338,6 +339,14 @@ class MehVpnService : VpnService() {
           .addAddress(TUN_IPV4_ADDRESS, 30)
           .addRoute("0.0.0.0", 0)
           .addDnsServer(MAP_DNS_ADDRESS)
+
+      var ipv6Captured = false
+      try {
+        builder
+          .addAddress(TUN_IPV6_ADDRESS, 126)
+          .addRoute("::", 0)
+        ipv6Captured = true
+      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -357,6 +366,7 @@ class MehVpnService : VpnService() {
           tunMtu = TUN_MTU,
           tunIpv4 = TUN_IPV4_ADDRESS,
           mapDnsAddress = MAP_DNS_ADDRESS,
+          tunIpv6 = if (ipv6Captured) TUN_IPV6_ADDRESS else null,
         )
       val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
       hevConfigFile.writeText(hevYaml)
@@ -1270,6 +1280,7 @@ class MehVpnService : VpnService() {
 
     internal const val TUN_MTU = 1400
     internal const val TUN_IPV4_ADDRESS = "10.10.14.1"
+    internal const val TUN_IPV6_ADDRESS = "fd00::10:10:14:1"
     internal const val MAP_DNS_ADDRESS = "10.10.14.2"
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
@@ -1295,16 +1306,44 @@ class MehVpnService : VpnService() {
     private const val KEEP_ALIVE_INTERVAL_MS = 25_000L
     private const val HEARTBEAT_EVERY_N_TICKS = 24
 
+    /**
+     * Verifies real censorship bypass over the live Xray SOCKS5 inbound using strictly CA-verified
+     * TLS 443 probes to genuinely filtered destinations (`www.youtube.com`, fallback `i.instagram.com`,
+     * fallback `api.x.com`). Never relies solely on unfiltered hosts like `google.com`/`cloudflare.com`
+     * or plain HTTP port 80, so domestic relays or filtered exit IPs cannot pass as "connected".
+     */
     internal fun verifyRealPathOverSocks(proxyPort: Int, timeoutMs: Int = 3500): Long? {
       if (proxyPort <= 0) return null
-      return verifyHttpsOverSocks(proxyPort, "www.google.com", timeoutMs)
-        ?: verifyHttpsOverSocks(proxyPort, "cp.cloudflare.com", timeoutMs.coerceAtMost(3000))
+      val fallbackTimeout = timeoutMs.coerceAtMost(3000)
+      return verifyHttpsOverSocks(
+        proxyPort = proxyPort,
+        targetHost = "www.youtube.com",
+        requestPath = "/generate_204",
+        timeoutMs = timeoutMs,
+        requireStatus204Or200 = true,
+      )
+        ?: verifyHttpsOverSocks(
+          proxyPort = proxyPort,
+          targetHost = "i.instagram.com",
+          requestPath = "/api/v1/si/fetch_headers/",
+          timeoutMs = fallbackTimeout,
+          requireStatus204Or200 = false,
+        )
+        ?: verifyHttpsOverSocks(
+          proxyPort = proxyPort,
+          targetHost = "api.x.com",
+          requestPath = "/1.1/help/settings.json",
+          timeoutMs = fallbackTimeout,
+          requireStatus204Or200 = false,
+        )
     }
 
     internal fun verifyHttpsOverSocks(
       proxyPort: Int,
-      targetHost: String = "www.google.com",
+      targetHost: String = "www.youtube.com",
+      requestPath: String = "/generate_204",
       timeoutMs: Int = 3500,
+      requireStatus204Or200: Boolean = true,
     ): Long? {
       val startedNs = System.nanoTime()
       var socket: Socket? = null
@@ -1322,12 +1361,19 @@ class MehVpnService : VpnService() {
             port = 443,
             alpnProtocols = arrayOf("http/1.1"),
           )
-        val request = "GET /generate_204 HTTP/1.1\r\nHost: $targetHost\r\nConnection: close\r\n\r\n"
+        val request =
+          "GET $requestPath HTTP/1.1\r\nHost: $targetHost\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
         tlsOut.write(request.toByteArray(Charsets.US_ASCII))
         tlsOut.flush()
         val statusLine = BufferedReader(InputStreamReader(tlsIn, Charsets.US_ASCII)).readLine()
         val code = statusLine?.split(" ")?.getOrNull(1)?.toIntOrNull()
-        if (code == 204 || code == 200) {
+        val validStatus =
+          if (requireStatus204Or200) {
+            code == 204 || code == 200
+          } else {
+            code != null && code in 200..499
+          }
+        if (validStatus) {
           val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
           MehDiag.recordBytesDownloaded(128L)
           ms

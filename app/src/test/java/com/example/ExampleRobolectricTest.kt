@@ -670,4 +670,34 @@ class ExampleRobolectricTest {
       ),
     )
   }
+
+  @Test
+  fun minimalScreen_displaysPrivateDnsWarningBannerWhenStrictCustomDnsActive() {
+    var settingsOpened = false
+
+    composeTestRule.setContent {
+      MyApplicationTheme {
+        MehMinimalScreen(
+          uiState =
+            MehUiState(
+              phase = MehPhase.DISCONNECTED,
+              privateDnsStatus =
+                com.example.vpn.PrivateDnsStatus(
+                  isStrictCustomActive = true,
+                  hostname = "free.shecan.ir",
+                  isLikelyIranianSanctionDns = true,
+                ),
+            ),
+          onPowerToggle = {},
+          onOpenPrivateDnsSettings = { settingsOpened = true },
+        )
+      }
+    }
+
+    composeTestRule.onNodeWithTag("vpn_toggle_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("private_dns_warning_banner").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("private_dns_settings_button").assertIsDisplayed().performClick()
+    assertTrue("Tapping Private DNS settings button must invoke callback", settingsOpened)
+  }
 }
+

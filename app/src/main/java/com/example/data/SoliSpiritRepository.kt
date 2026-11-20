@@ -846,6 +846,12 @@ private suspend fun fetchFromSourceList(
                           targetBytes = 16_384,
                         )
                       }
+                      val youtubeJob = async {
+                        V2RayOutboundClient.verifyYouTubeCapability(
+                          config = candidate,
+                          timeoutMs = 3000,
+                        )
+                      }
                       val twitterJob = async {
                         V2RayOutboundClient.verifySocialMediaCapability(
                           config = candidate,
@@ -868,35 +874,38 @@ private suspend fun fetchFromSourceList(
                       val httpsLatency = httpsJob.await() ?: return@withTimeoutOrNull null
                       val throughputKbps = bandwidthJob.await() ?: return@withTimeoutOrNull null
                       if (throughputKbps < 25.0) return@withTimeoutOrNull null
+                      val youtubeLatency = youtubeJob.await()
                       val twitterLatency = twitterJob.await()
                       val instagramLatency = instagramJob.await()
                       val tgLatency = tgJob.await()
 
-                      val passedBothSocial = twitterLatency != null && instagramLatency != null
-                      val passedAtLeastOneSocial = twitterLatency != null || instagramLatency != null
+                      // Never accept a proxy that only reaches unfiltered Google/Cloudflare endpoints
+                      // (e.g., domestic Iranian relays or Russian-censored nodes).
+                      val passedAnyFiltered =
+                        youtubeLatency != null || instagramLatency != null || twitterLatency != null
+                      if (!passedAnyFiltered) return@withTimeoutOrNull null
 
+                      val passedMultipleFiltered =
+                        listOfNotNull(youtubeLatency, instagramLatency, twitterLatency).size >= 2
+
+                      val latencySamples =
+                        listOfNotNull(
+                          candidate.latencyMs,
+                          httpsLatency,
+                          youtubeLatency,
+                          twitterLatency,
+                          instagramLatency,
+                          tgLatency,
+                        )
                       val measuredLatencyMs =
-                        when {
-                          passedBothSocial && tgLatency != null ->
-                            (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!! + tgLatency) / 5L
-                          passedBothSocial ->
-                            (candidate.latencyMs + httpsLatency + twitterLatency!! + instagramLatency!!) / 4L
-                          passedAtLeastOneSocial -> {
-                            val soc = twitterLatency ?: instagramLatency ?: httpsLatency
-                            (candidate.latencyMs + httpsLatency + soc) / 3L
-                          }
-                          tgLatency != null ->
-                            (candidate.latencyMs + httpsLatency + tgLatency) / 3L
-                          else ->
-                            (candidate.latencyMs + httpsLatency) / 2L
-                        }.coerceAtLeast(1L)
+                        (latencySamples.sum() / latencySamples.size.coerceAtLeast(1)).coerceAtLeast(1L)
 
                       val socialBonus =
                         when {
-                          passedBothSocial && tgLatency != null -> 120.0
-                          passedBothSocial -> 90.0
-                          passedAtLeastOneSocial -> 40.0
-                          else -> 0.0
+                          passedMultipleFiltered && instagramLatency != null && tgLatency != null -> 140.0
+                          passedMultipleFiltered -> 100.0
+                          instagramLatency != null -> 60.0
+                          else -> 35.0
                         }
                       val effectiveLatency = measuredLatencyMs
                       val bandwidthScore =
@@ -904,12 +913,7 @@ private suspend fun fetchFromSourceList(
                       val compositeScore =
                         (10_000.0 / effectiveLatency.toDouble()) + bandwidthScore + socialBonus
 
-                      val tier =
-                        when {
-                          passedBothSocial -> 1
-                          passedAtLeastOneSocial -> 2
-                          else -> 3
-                        }
+                      val tier = if (passedMultipleFiltered) 1 else 2
 
                       Pair(
                         tier,
@@ -929,8 +933,7 @@ private suspend fun fetchFromSourceList(
         for ((tier, cfg) in stage2Results) {
           when (tier) {
             1 -> fullSocialPool.add(cfg)
-            2 -> partialSocialPool.add(cfg)
-            else -> fallbackHttpsPool.add(cfg)
+            else -> partialSocialPool.add(cfg)
           }
         }
 
@@ -945,7 +948,7 @@ private suspend fun fetchFromSourceList(
         when {
           fullSocialPool.isNotEmpty() -> selectDiverseCandidates(fullSocialPool + partialSocialPool, maxCount)
           partialSocialPool.isNotEmpty() -> selectDiverseCandidates(partialSocialPool, maxCount)
-          else -> selectDiverseCandidates(fallbackHttpsPool, maxCount)
+          else -> emptyList()
         }
       if (finalSelection.isNotEmpty()) {
         onLogUpdate("بهترین سرور انتخاب شد (پینگ ${finalSelection.first().latencyMs}ms)")
@@ -1317,6 +1320,12 @@ private suspend fun fetchFromSourceList(
                                             targetBytes = 16_384,
                                         )
                                     }
+                                    val youtubeJob = async {
+                                        V2RayOutboundClient.verifyYouTubeCapability(
+                                            config = candidate,
+                                            timeoutMs = 3000,
+                                        )
+                                    }
                                     val instagramJob = async {
                                         V2RayOutboundClient.verifyInstagramCapability(
                                             config = candidate,
@@ -1328,19 +1337,30 @@ private suspend fun fetchFromSourceList(
                                     if (throughputKbps < 25.0) {
                                         return@async null
                                     }
+                                    val youtubeLatency = youtubeJob.await()
                                     val instagramLatency = instagramJob.await()
-                                    val combinedPing =
-                                        if (instagramLatency != null) {
-                                            (candidate.latencyMs + httpsLatency + instagramLatency) / 3L
-                                        } else {
-                                            (candidate.latencyMs + httpsLatency) / 2L
+                                    // Require at least one genuinely filtered destination to pass.
+                                    if (youtubeLatency == null && instagramLatency == null) {
+                                        return@async null
+                                    }
+                                    val samples =
+                                        listOfNotNull(
+                                            candidate.latencyMs,
+                                            httpsLatency,
+                                            youtubeLatency,
+                                            instagramLatency,
+                                        )
+                                    val realPing = (samples.sum() / samples.size).coerceAtLeast(1L)
+                                    val bypassBonus =
+                                        when {
+                                            youtubeLatency != null && instagramLatency != null -> 300.0
+                                            instagramLatency != null -> 220.0
+                                            else -> 150.0
                                         }
-                                    val realPing = combinedPing.coerceAtLeast(1L)
-                                    val instaBonus = if (instagramLatency != null) 250.0 else 0.0
                                     val score =
                                         (10_000.0 / realPing.toDouble()) +
                                             (throughputKbps.coerceAtMost(2500.0) * 0.85) +
-                                            instaBonus
+                                            bypassBonus
                                     val verifiedCfg =
                                         candidate.copy(
                                             latencyMs = realPing,
@@ -1350,7 +1370,7 @@ private suspend fun fetchFromSourceList(
                                     onLogUpdate(
                                         "کانفیگ تایید شد: ${verifiedCfg.cleanTitle} (${verifiedCfg.protocol.label} • پینگ ${realPing}ms)",
                                     )
-                                    if (minScanDurationMs <= 0L && realPing < earlyStopPingMs && instagramLatency != null) {
+                                    if (minScanDurationMs <= 0L && realPing < earlyStopPingMs) {
                                         earlyWinnerSignal.complete(verifiedCfg)
                                     }
                                     verifiedCfg
@@ -1485,10 +1505,10 @@ private suspend fun fetchFromSourceList(
                                 }
                             if (resolvedIp.isBlank()) return@async null
                             val prepared = cfg.copy(resolvedIp = resolvedIp)
-                            val httpsJob = async {
-                                V2RayOutboundClient.verifyHttpsAndDnsCapability(
+                            val bypassJob = async {
+                                V2RayOutboundClient.verifyCensorshipBypassCapability(
                                     config = prepared,
-                                    timeoutMs = 2600,
+                                    timeoutMs = 2800,
                                 )
                             }
                             val bandwidthJob = async {
@@ -1498,10 +1518,10 @@ private suspend fun fetchFromSourceList(
                                     targetBytes = 16_384,
                                 )
                             }
-                            val httpsLatency = httpsJob.await() ?: return@async null
+                            val bypassLatency = bypassJob.await() ?: return@async null
                             val throughputKbps = bandwidthJob.await() ?: return@async null
                             if (throughputKbps < 25.0) return@async null
-                            val realPing = httpsLatency.coerceAtLeast(1L)
+                            val realPing = bypassLatency.coerceAtLeast(1L)
                             val score =
                                 (10_000.0 / realPing.toDouble()) +
                                     (throughputKbps.coerceAtMost(2500.0) * 0.85)

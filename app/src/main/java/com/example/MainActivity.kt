@@ -62,6 +62,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -93,6 +94,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppUpdateInfo
@@ -116,6 +120,8 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VazirmatnFontFamily
 import com.example.vpn.BackgroundServerScanScheduler
+import com.example.vpn.PrivateDnsDetector
+import com.example.vpn.PrivateDnsStatus
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -130,9 +136,21 @@ class MainActivity : ComponentActivity() {
         val mehViewModel: MehViewModel = viewModel()
         val uiState by mehViewModel.uiState.collectAsStateWithLifecycle()
         val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
 
         LaunchedEffect(Unit) {
           mehViewModel.loadSavedLastServer(context)
+          mehViewModel.refreshPrivateDnsStatus(context)
+        }
+
+        DisposableEffect(lifecycleOwner, context) {
+          val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+              mehViewModel.refreshPrivateDnsStatus(context)
+            }
+          }
+          lifecycleOwner.lifecycle.addObserver(observer)
+          onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
         }
 
         val vpnPermissionLauncher =
@@ -165,6 +183,7 @@ class MainActivity : ComponentActivity() {
         MehMinimalScreen(
           uiState = uiState,
           onUpdateClick = { showUpdateSheet = true },
+          onOpenPrivateDnsSettings = { PrivateDnsDetector.openPrivateDnsSettings(context) },
           onPowerToggle = {
             mehViewModel.onPowerButtonClicked(
               context = context,
@@ -195,6 +214,7 @@ fun MehMinimalScreen(
   onConnectLastServer: () -> Unit = {},
   onNextServer: () -> Unit = {},
   onUpdateClick: () -> Unit = {},
+  onOpenPrivateDnsSettings: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor by
@@ -250,22 +270,43 @@ fun MehMinimalScreen(
               .fillMaxWidth(),
           contentAlignment = Alignment.TopCenter,
         ) {
-          androidx.compose.animation.AnimatedVisibility(
-            visible = uiState.updateInfo != null,
-            enter = fadeIn(tween(320)) + expandVertically(tween(320)),
-            exit = fadeOut(tween(200)) + shrinkVertically(tween(200)),
-            modifier = Modifier.fillMaxWidth(),
+          Column(
+            modifier =
+              Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(top = 12.dp, bottom = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
           ) {
-            uiState.updateInfo?.let { updateInfo ->
-              Box(
-                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                contentAlignment = Alignment.TopCenter,
-              ) {
-                UpdateNotificationPill(
-                  versionName = updateInfo.latestVersionName,
-                  onClick = onUpdateClick,
-                )
+            androidx.compose.animation.AnimatedVisibility(
+              visible = uiState.updateInfo != null,
+              enter = fadeIn(tween(320)) + expandVertically(tween(320)),
+              exit = fadeOut(tween(200)) + shrinkVertically(tween(200)),
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              uiState.updateInfo?.let { updateInfo ->
+                Box(
+                  modifier = Modifier.fillMaxWidth(),
+                  contentAlignment = Alignment.TopCenter,
+                ) {
+                  UpdateNotificationPill(
+                    versionName = updateInfo.latestVersionName,
+                    onClick = onUpdateClick,
+                  )
+                }
               }
+            }
+
+            androidx.compose.animation.AnimatedVisibility(
+              visible = uiState.privateDnsStatus.isStrictCustomActive,
+              enter = fadeIn(tween(280)) + expandVertically(tween(280)),
+              exit = fadeOut(tween(180)) + shrinkVertically(tween(180)),
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              PrivateDnsWarningBanner(
+                status = uiState.privateDnsStatus,
+                onOpenSettings = onOpenPrivateDnsSettings,
+              )
             }
           }
         }
@@ -799,6 +840,105 @@ fun UpdateNotificationPill(
         fontWeight = FontWeight.Medium,
         color = TextPrimary,
       )
+    }
+  }
+}
+
+@Composable
+fun PrivateDnsWarningBanner(
+  status: PrivateDnsStatus,
+  onOpenSettings: () -> Unit,
+  modifier: Modifier = Modifier,
+) {
+  val haptic = LocalHapticFeedback.current
+  val host = status.hostname.orEmpty()
+  val bodyText =
+    if (status.isLikelyIranianSanctionDns && host.isNotBlank()) {
+      stringResource(R.string.private_dns_warning_iranian_body, host)
+    } else if (host.isNotBlank()) {
+      "${stringResource(R.string.private_dns_warning_body)} ($host)"
+    } else {
+      stringResource(R.string.private_dns_warning_body)
+    }
+  val settingsLabel = stringResource(R.string.private_dns_open_settings)
+
+  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+    Row(
+      modifier =
+        modifier
+          .fillMaxWidth()
+          .defaultMinSize(minHeight = 56.dp)
+          .clip(RoundedCornerShape(16.dp))
+          .background(ObsidianSurface.copy(alpha = 0.94f))
+          .border(
+            width = 1.dp,
+            color = AmberPulse.copy(alpha = 0.50f),
+            shape = RoundedCornerShape(16.dp),
+          )
+          .padding(horizontal = 12.dp, vertical = 10.dp)
+          .testTag("private_dns_warning_banner"),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+      Icon(
+        painter = painterResource(R.drawable.ic_dns_warning_rounded),
+        contentDescription = stringResource(R.string.private_dns_warning_title),
+        tint = AmberPulse,
+        modifier = Modifier.size(20.dp),
+      )
+
+      Column(
+        modifier = Modifier.weight(1f),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+      ) {
+        Text(
+          text = stringResource(R.string.private_dns_warning_title),
+          style = MaterialTheme.typography.labelMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = FontWeight.Bold,
+          color = AmberPulse,
+          maxLines = 1,
+          overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+          text = bodyText,
+          style = MaterialTheme.typography.labelSmall,
+          fontFamily = VazirmatnFontFamily,
+          fontSize = 11.sp,
+          lineHeight = 16.sp,
+          color = TextSecondary,
+          maxLines = 3,
+          overflow = TextOverflow.Ellipsis,
+        )
+      }
+
+      Box(
+        modifier =
+          Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(AmberPulse.copy(alpha = 0.16f))
+            .border(1.dp, AmberPulse.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+            .clickable {
+              haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+              onOpenSettings()
+            }
+            .semantics {
+              contentDescription = settingsLabel
+              role = Role.Button
+            }
+            .padding(horizontal = 12.dp)
+            .testTag("private_dns_settings_button"),
+        contentAlignment = Alignment.Center,
+      ) {
+        Text(
+          text = settingsLabel,
+          style = MaterialTheme.typography.labelMedium,
+          fontFamily = VazirmatnFontFamily,
+          fontWeight = FontWeight.SemiBold,
+          color = AmberPulse,
+          maxLines = 1,
+        )
+      }
     }
   }
 }

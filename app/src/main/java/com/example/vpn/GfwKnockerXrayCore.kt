@@ -618,6 +618,13 @@ object GfwKnockerXrayCore {
             {
               "type": "field",
               "ip": [
+                "10.10.34.0/24"
+              ],
+              "outboundTag": "block"
+            },
+            {
+              "type": "field",
+              "ip": [
                 "10.0.0.0/8",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
@@ -664,11 +671,18 @@ object GfwKnockerXrayCore {
     tunMtu: Int = 1400,
     tunIpv4: String = "10.10.14.1",
     mapDnsAddress: String = "10.10.14.2",
+    tunIpv6: String? = "fd00::10:10:14:1",
   ): String {
+    val ipv6Line =
+      if (!tunIpv6.isNullOrBlank()) {
+        "\n        ipv6: '$tunIpv6'"
+      } else {
+        ""
+      }
     return """
       tunnel:
         mtu: ${tunMtu.coerceIn(1280, 8500)}
-        ipv4: $tunIpv4
+        ipv4: $tunIpv4$ipv6Line
       socks5:
         port: $socksPort
         address: 127.0.0.1

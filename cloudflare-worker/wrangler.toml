@@ -1,0 +1,9 @@
+name = "meh-vpn-analytics-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# Android Firebase App ID (from app/google-services.json -> client_info.mobilesdk_app_id for com.meh.vpn)
+# Replace if you switch Firebase projects. Never put GA4_API_SECRET here; set it via:
+#   wrangler secret put GA4_API_SECRET
+FIREBASE_APP_ID = "1:468881393461:android:51d7f54ba9686ce0606e7c"

@@ -27,6 +27,7 @@ object MehTelemetry {
   private const val TAG = "MehTelemetry"
   private const val PREFS_NAME = "meh_telemetry_store"
   private const val KEY_CLIENT_ID = "client_user_id"
+  private const val KEY_APP_INSTANCE_ID = "ga4_app_instance_id"
   private const val KEY_PENDING_ERRORS = "pending_error_reports"
   private const val KEY_TOTAL_SESSIONS = "total_active_sessions"
   private const val KEY_TOTAL_ERRORS = "total_error_reports"
@@ -52,6 +53,9 @@ object MehTelemetry {
   @Volatile private var isTelemetryInitialized = false
   @Volatile private var crashHandlerInstalled = false
   @Volatile private var clientUserId: String = ""
+  @Volatile private var appInstanceId: String = ""
+  @Volatile private var appVersionName: String = "1.0"
+  @Volatile private var currentSessionId: Long = System.currentTimeMillis() / 1000L
   @Volatile private var currentVpnStatus: String = "disconnected"
 
   private val recentEventsBuffer = CopyOnWriteArrayList<RecordedTelemetryEvent>()
@@ -72,6 +76,15 @@ object MehTelemetry {
       }
       clientUserId = storedId
 
+      val storedInstanceId = prefs?.getString(KEY_APP_INSTANCE_ID, null)
+      val normalizedInstanceId = Ga4TelemetryRelay.normalizeAppInstanceId(storedInstanceId)
+      if (normalizedInstanceId != storedInstanceId) {
+        prefs?.edit()?.putString(KEY_APP_INSTANCE_ID, normalizedInstanceId)?.apply()
+      }
+      appInstanceId = normalizedInstanceId
+      appVersionName = resolveAppVersion(ctx)
+      currentSessionId = System.currentTimeMillis() / 1000L
+
       if (prefs != null) {
         sessionCounter.set(prefs.getInt(KEY_TOTAL_SESSIONS, 0))
         errorCounter.set(prefs.getInt(KEY_TOTAL_ERRORS, 0))
@@ -79,6 +92,12 @@ object MehTelemetry {
 
       isTelemetryInitialized = true
       flushPendingErrorReports()
+      Ga4TelemetryRelay.flushAsync(
+        context = ctx,
+        appInstanceId = appInstanceId,
+        sessionId = currentSessionId,
+        appVersion = appVersionName,
+      )
     } catch (t: Throwable) {
       Log.w(TAG, "Telemetry init warning: ${t.message}")
     }
@@ -158,13 +177,20 @@ object MehTelemetry {
         putLong("latency_ms", latencyMs)
       }
     logEvent("vpn_connected", bundle)
-    // Now that the VPN tunnel is up, flush any errors that occurred while disconnected/filtered
+    // Now that the VPN tunnel is up, flush any errors and queued analytics via direct/SOCKS5 relay
     flushPendingErrorReports()
+    appContext?.let { ctx ->
+      Ga4TelemetryRelay.flushAsync(
+        context = ctx,
+        appInstanceId = appInstanceId,
+        sessionId = currentSessionId,
+        appVersion = appVersionName,
+      )
+    }
   }
 
   /**
-   * Logs periodic active tunnel engagement while the VPN is connected in the background, for
-   * local session tracking only.
+   * Logs periodic active tunnel engagement while the VPN is connected in the background.
    */
   fun logActiveSessionHeartbeat(
     serverName: String,
@@ -182,6 +208,14 @@ object MehTelemetry {
       }
     logEvent("vpn_active_heartbeat", bundle)
     flushPendingErrorReports()
+    appContext?.let { ctx ->
+      Ga4TelemetryRelay.flushAsync(
+        context = ctx,
+        appInstanceId = appInstanceId,
+        sessionId = currentSessionId,
+        appVersion = appVersionName,
+      )
+    }
   }
 
   fun logDisconnected() {
@@ -367,6 +401,7 @@ object MehTelemetry {
   }
 
   private fun logEvent(name: String, params: Bundle) {
+    val typedParams = LinkedHashMap<String, Any>()
     try {
       val map = LinkedHashMap<String, String>()
       for (key in params.keySet()) {
@@ -374,6 +409,7 @@ object MehTelemetry {
         val v = params.get(key)
         if (v != null) {
           map[key] = v.toString()
+          typedParams[key] = v
         }
       }
       while (recentEventsBuffer.size >= 50) {
@@ -382,6 +418,21 @@ object MehTelemetry {
       recentEventsBuffer.add(RecordedTelemetryEvent(name = name, params = map))
     } catch (_: Throwable) {}
 
-    Log.d(TAG, "Telemetry event (local only): $name")
+    val ctx = appContext
+    if (ctx != null && Ga4TelemetryRelay.isConfigured()) {
+      val instanceId =
+        if (appInstanceId.isNotBlank()) appInstanceId else Ga4TelemetryRelay.normalizeAppInstanceId(null)
+      Ga4TelemetryRelay.enqueueAndFlushAsync(
+        context = ctx,
+        appInstanceId = instanceId,
+        sessionId = currentSessionId,
+        appVersion = appVersionName,
+        eventName = name,
+        params = typedParams,
+      )
+      Log.d(TAG, "Telemetry event queued for GA4 relay: $name")
+    } else {
+      Log.d(TAG, "Telemetry event (local only): $name")
+    }
   }
 }

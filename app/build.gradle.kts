@@ -18,6 +18,12 @@ android {
     versionCode = appVersionCode
     versionName = appVersionName
 
+    val analyticsRelayUrl =
+      (project.findProperty("analyticsRelayUrl") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        ?: System.getenv("ANALYTICS_RELAY_URL")?.trim()?.takeIf { it.isNotEmpty() }
+        ?: ""
+    buildConfigField("String", "ANALYTICS_RELAY_URL", "\"${analyticsRelayUrl.replace("\"", "")}\"")
+
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 

@@ -17,6 +17,8 @@ import com.example.telemetry.MehTelemetry
 import com.example.vpn.BackgroundServerScanScheduler
 import com.example.vpn.BackgroundServerScannerJobService
 import com.example.vpn.MehVpnService
+import com.example.vpn.PrivateDnsDetector
+import com.example.vpn.PrivateDnsStatus
 import com.example.vpn.V2RayOutboundClient
 import java.util.ArrayList
 import java.util.concurrent.atomic.AtomicLong
@@ -66,6 +68,7 @@ data class MehUiState(
   val lastConnectedConfig: V2RayConfig? = null,
   val activeMethod: MehConnectionMethod? = null,
   val updateInfo: AppUpdateInfo? = null,
+  val privateDnsStatus: PrivateDnsStatus = PrivateDnsStatus(),
 ) {
   val isBusy: Boolean
     get() =
@@ -202,6 +205,17 @@ class MehViewModel(
     _uiState.update { it.copy(updateInfo = null) }
   }
 
+  /**
+   * Checks whether Android has a strict custom Private DNS hostname active (e.g., Iranian
+   * anti-sanction DNS like Shecan/403/Electro) that bypasses our TUN `mapdns` resolver.
+   */
+  fun refreshPrivateDnsStatus(context: Context) {
+    val status = PrivateDnsDetector.detect(context)
+    _uiState.update { current ->
+      if (current.privateDnsStatus == status) current else current.copy(privateDnsStatus = status)
+    }
+  }
+
   fun loadSavedLastServer(context: Context) {
     try {
       val prefs = context.applicationContext.getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
@@ -334,6 +348,7 @@ class MehViewModel(
     onRequestVpnPermission: (Intent) -> Unit,
   ) {
     if (_uiState.value.isActiveOrBusy) return
+    refreshPrivateDnsStatus(context)
     val lastPrimary = _uiState.value.lastConnectedConfig ?: cachedLastCandidates.firstOrNull() ?: return
     val candidatesToUse =
       (if (cachedLastCandidates.isNotEmpty()) cachedLastCandidates else listOf(lastPrimary))
@@ -409,6 +424,7 @@ class MehViewModel(
     context: Context,
     onRequestVpnPermission: (Intent) -> Unit,
   ) {
+    refreshPrivateDnsStatus(context)
     workflowJob?.cancel()
     workflowJob =
       viewModelScope.launch {

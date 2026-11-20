@@ -211,7 +211,7 @@ object NativeXrayEngine {
     datDir: String,
     tempDir: File,
     config: V2RayConfig,
-    url: String = "https://connectivitycheck.gstatic.com/generate_204",
+    url: String = "https://www.youtube.com/generate_204",
     timeoutSec: Int = 5,
     protectFd: ((Int) -> Boolean)? = null,
   ): Long? {

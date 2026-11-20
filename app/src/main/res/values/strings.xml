@@ -17,4 +17,8 @@
     <string name="update_btn_direct">دانلود مستقیم (گیت‌هاب)</string>
     <string name="update_btn_telegram">کانال تلگرام</string>
     <string name="update_btn_dismiss">فعلاً نه</string>
+    <string name="private_dns_warning_title">DNS خصوصی گوشی فعال است</string>
+    <string name="private_dns_warning_body">ممکن است مانع عبور از فیلترینگ شود؛ در تنظیمات روی خاموش یا خودکار بگذارید.</string>
+    <string name="private_dns_warning_iranian_body">DNS داخلی (%1$s) جلوی عبور از فیلترینگ را می‌گیرد؛ آن را خاموش کنید.</string>
+    <string name="private_dns_open_settings">تنظیمات</string>
 </resources>

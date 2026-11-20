@@ -968,6 +968,39 @@ object V2RayOutboundClient {
   }
 
   /**
+   * Verifies that this V2Ray server bypasses censorship by reaching `www.youtube.com:443`
+   * (`/generate_204`) with strict system-CA TLS validation. Unlike `google.com` or `cloudflare.com`,
+   * YouTube is filtered in Iran, so domestic relays or leaked direct paths cannot pass.
+   */
+  fun verifyYouTubeCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2600,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    return verifyTlsTargetHostCapability(
+      config = config,
+      targetHost = "www.youtube.com",
+      requestPath = "/generate_204",
+      timeoutMs = timeoutMs,
+      protector = protector,
+      requireStatus204Or200 = true,
+    )
+  }
+
+  /**
+   * Verifies genuine censorship bypass by requiring at least one filtered destination
+   * (`www.youtube.com:443` or fallback `i.instagram.com:443`) to answer over strict CA-verified TLS.
+   */
+  fun verifyCensorshipBypassCapability(
+    config: V2RayConfig,
+    timeoutMs: Int = 2600,
+    protector: ((Socket) -> Boolean)? = null,
+  ): Long? {
+    return verifyYouTubeCapability(config, timeoutMs = timeoutMs, protector = protector)
+      ?: verifyInstagramCapability(config, timeoutMs = timeoutMs, protector = protector)
+  }
+
+  /**
    * Verifies that this V2Ray server can establish a real end-to-end TLS 443 session to Twitter/X
    * (`api.x.com:443`) and receive an HTTP response.
    */
@@ -1009,6 +1042,7 @@ object V2RayOutboundClient {
     requestPath: String,
     timeoutMs: Int = 2600,
     protector: ((Socket) -> Boolean)? = null,
+    requireStatus204Or200: Boolean = false,
   ): Long? {
     if (!isSupportedByEngine(config)) return null
     val resolvedIp = config.resolvedIp.ifBlank { resolveEndpointIpv4(config.address).orEmpty() }
@@ -1026,9 +1060,11 @@ object V2RayOutboundClient {
             protector = protector,
             usePrewarmedPool = false,
           ).use { tunnel ->
+            // Inner public targets (YouTube, Instagram, X) always present valid CA-signed certs.
+            // Strict validation prevents forged/intercepted filtering block pages from passing.
             val (tlsIn, tlsOut) =
               GfwKnockerXrayCore.openSslEngineOverStreams(
-                sslContext = createSmartSslContext(targetHost, allowInsecureFallback = true),
+                sslContext = createSmartSslContext(targetHost, allowInsecureFallback = false),
                 rawIn = tunnel.inputStream,
                 rawOut = tunnel.outputStream,
                 sniHost = targetHost,
@@ -1048,6 +1084,15 @@ object V2RayOutboundClient {
             val statusLine = String(buf, 0, n, Charsets.US_ASCII)
             if (!statusLine.startsWith("HTTP/1.1 ") && !statusLine.startsWith("HTTP/2")) {
               throw IOException("Unexpected $targetHost status: ${statusLine.take(24)}")
+            }
+            val code = statusLine.split(" ").getOrNull(1)?.toIntOrNull()
+              ?: throw IOException("Missing HTTP status from $targetHost")
+            if (requireStatus204Or200) {
+              if (code != 204 && code != 200) {
+                throw IOException("Unexpected $targetHost status code: $code")
+              }
+            } else if (code !in 200..499) {
+              throw IOException("Unexpected $targetHost status code: $code")
             }
           }
         }

@@ -33,10 +33,10 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_PAT }}
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          java-version: "17"
+          java-version: "21"
           distribution: temurin
 
       # No android-actions/setup-android step: on ubuntu-24.04 the
@@ -51,6 +51,16 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "9.3.1"
+
+      # Automatic regression gate: abort immediately before building or releasing
+      # an APK if any VPN tunnel, routing, censorship-bypass, Private DNS, or UI test fails.
+      - name: Run VPN & UI regression tests
+        run: |
+          gradle :app:testDebugUnitTest \
+            --tests "com.example.vpn.VpnTunnelRegressionTest" \
+            --tests "com.example.ExampleRobolectricTest" \
+            --tests "com.example.telemetry.Ga4TelemetryRelayTest" \
+            --stacktrace
 
       # app/build.gradle.kts points the debug signing config at
       # ${rootDir}/debug.keystore (android / androiddebugkey), and that
@@ -76,6 +86,8 @@ jobs:
           fi
 
       - name: Build debug APK
+        env:
+          ANALYTICS_RELAY_URL: ${{ vars.ANALYTICS_RELAY_URL || secrets.ANALYTICS_RELAY_URL }}
         run: |
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then
