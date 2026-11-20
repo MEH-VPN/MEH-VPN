@@ -151,16 +151,17 @@ class VpnTunnelRegressionTest {
         tunMtu = MehVpnService.TUN_MTU,
         tunIpv4 = MehVpnService.TUN_IPV4_ADDRESS,
         mapDnsAddress = MehVpnService.MAP_DNS_ADDRESS,
-        tunIpv6 = MehVpnService.TUN_IPV6_ADDRESS,
       )
 
     // TUN IPv4 and mapdns IPv4 must be distinct hosts inside the /30 subnet so Android routes DNS into TUN.
     assertEquals("10.10.14.1", MehVpnService.TUN_IPV4_ADDRESS)
     assertEquals("10.10.14.2", MehVpnService.MAP_DNS_ADDRESS)
-    assertEquals("fd00::10:10:14:1", MehVpnService.TUN_IPV6_ADDRESS)
     assertTrue(yaml.contains("mtu: ${MehVpnService.TUN_MTU}"))
     assertTrue(yaml.contains("ipv4: ${MehVpnService.TUN_IPV4_ADDRESS}"))
-    assertTrue("hev-socks5-tunnel must capture IPv6 to prevent carrier IPv6 leaks", yaml.contains("ipv6: '${MehVpnService.TUN_IPV6_ADDRESS}'"))
+    assertFalse(
+      "hev-socks5-tunnel with IPv4-only mapdns MUST omit ipv6 by default so Android fails IPv6 fast and never stalls on AAAA/IPv4-only servers",
+      yaml.contains("ipv6:"),
+    )
     assertTrue(yaml.contains("port: $socksPort"))
     assertTrue(yaml.contains("address: 127.0.0.1"))
     assertTrue("hev-socks5-tunnel must use standard RFC1928 UDP mode for Xray", yaml.contains("udp: 'udp'"))

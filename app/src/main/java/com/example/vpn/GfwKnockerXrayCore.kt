@@ -664,14 +664,20 @@ object GfwKnockerXrayCore {
   /**
    * Builds the `hev-socks5-tunnel` YAML config that bridges Android's TUN interface to Xray's
    * local SOCKS5 inbound with built-in `mapdns` (fake-IP -> domain-name SOCKS5 CONNECT), matching
-   * v2rayNG / MahsaNG so all apps resolve domains remotely through the proxy with zero DNS stall.
+   * v2rayNG / MahsaNG default IPv4-only mode so all apps resolve domains remotely through the proxy
+   * with zero DNS stall.
+   *
+   * IMPORTANT: `tunIpv6` MUST stay `null` by default! `mapdns` is IPv4-only and cannot synthesize
+   * AAAA records, and most free V2Ray nodes lack IPv6 egress. Omitting IPv6 from `VpnService.Builder`
+   * (without calling `allowFamily(AF_INET6)`) causes Android to fail IPv6 fast (`ENETUNREACH`),
+   * preventing IPv6 leaks while forcing every app onto fast IPv4 + `mapdns`.
    */
   fun buildHevSocks5TunnelYaml(
     socksPort: Int,
     tunMtu: Int = 1400,
     tunIpv4: String = "10.10.14.1",
     mapDnsAddress: String = "10.10.14.2",
-    tunIpv6: String? = "fd00::10:10:14:1",
+    tunIpv6: String? = null,
   ): String {
     val ipv6Line =
       if (!tunIpv6.isNullOrBlank()) {

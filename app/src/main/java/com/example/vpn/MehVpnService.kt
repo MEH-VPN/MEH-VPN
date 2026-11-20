@@ -329,9 +329,11 @@ class MehVpnService : VpnService() {
         return
       }
 
-      // Establish dual-stack IPv4 + IPv6 Android TUN interface ONCE and bridge all device
-      // TCP/UDP/DNS traffic to Xray's local SOCKS5 inbound via `hev-socks5-tunnel` + `mapdns`.
-      // Capturing `::/0` prevents IPv6 leaks on dual-stack carriers (Irancell/MCI/Rightel).
+      // Establish IPv4-only Android TUN interface ONCE and bridge all device TCP/UDP/DNS traffic
+      // to Xray's local SOCKS5 inbound via `hev-socks5-tunnel` + `mapdns` (matching v2rayNG default).
+      // IMPORTANT: Do NOT add an IPv6 address/route and do NOT call `allowFamily(AF_INET6)`!
+      // Android automatically blocks IPv6 with ENETUNREACH (<1ms, zero leaks) when IPv6 is omitted,
+      // preventing AAAA stalls on IPv4-only `mapdns` and timeouts on IPv4-only V2Ray servers.
       val builder =
         Builder()
           .setSession("MEH • $effectiveName")
@@ -339,14 +341,6 @@ class MehVpnService : VpnService() {
           .addAddress(TUN_IPV4_ADDRESS, 30)
           .addRoute("0.0.0.0", 0)
           .addDnsServer(MAP_DNS_ADDRESS)
-
-      var ipv6Captured = false
-      try {
-        builder
-          .addAddress(TUN_IPV6_ADDRESS, 126)
-          .addRoute("::", 0)
-        ipv6Captured = true
-      } catch (_: Exception) {}
 
       try {
         builder.addDisallowedApplication(packageName)
@@ -366,7 +360,7 @@ class MehVpnService : VpnService() {
           tunMtu = TUN_MTU,
           tunIpv4 = TUN_IPV4_ADDRESS,
           mapDnsAddress = MAP_DNS_ADDRESS,
-          tunIpv6 = if (ipv6Captured) TUN_IPV6_ADDRESS else null,
+          tunIpv6 = null,
         )
       val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
       hevConfigFile.writeText(hevYaml)
@@ -725,6 +719,7 @@ class MehVpnService : VpnService() {
 
   private fun handleManualSwitchServer() {
     val beforeCfg = currentActiveConfig() ?: return
+    val beforeFrag = activeUseFragment
     appendFreshStandbyServers(VerifiedServerPoolStore.getFastest(applicationContext))
     val poolSize = currentPoolSnapshot().size
     if (poolSize <= 1) {
@@ -762,14 +757,34 @@ class MehVpnService : VpnService() {
           return@launch
         }
         attempts++
-        if (attempts >= 3) break
         DeadServerStore.markDead(applicationContext, candidate.endpointKey)
         VerifiedServerPoolStore.removeEndpoint(applicationContext, candidate.endpointKey)
+        if (attempts >= 3) break
         val nextCfg = switchToNextHealthyNode("manual_verification") ?: break
-        if (nextCfg.endpointKey == candidate.endpointKey) break
+        if (nextCfg.endpointKey == candidate.endpointKey || nextCfg.endpointKey == beforeCfg.endpointKey) break
         candidate = nextCfg
         updateSessionAndNotification(candidate, candidate.latencyMs.coerceAtLeast(1L))
       }
+
+      // None of the switched candidates passed live verification: roll back to the previous working
+      // node instead of leaving a dead server active while showing "متصل".
+      val socksPort = localSocksPort
+      if (socksPort > 0) {
+        val restoreErr = launchNativeXraySocksCore(beforeCfg, socksPort, useFragmentOverride = beforeFrag)
+        val restoredPing = if (restoreErr == null) verifyRealPathViaProxy(socksPort, timeoutMs = 3500) else null
+        if (restoredPing != null) {
+          updateSessionAndNotification(beforeCfg, restoredPing)
+          emitRealtimeLog(
+            "سرورهای جایگزین پاسخ ندادند؛ بازگشت به سرور قبلی (${beforeCfg.cleanTitle} • ${restoredPing}ms)",
+            VpnLogLevel.SYSTEM,
+          )
+          return@launch
+        }
+      }
+      // Previous server also died -> force a fresh scan for a working replacement.
+      try {
+        refineNodesOnce(force = true)
+      } catch (_: Exception) {}
     }
   }
 
@@ -803,6 +818,7 @@ class MehVpnService : VpnService() {
         var lastPing = initialPing
         var tickCount = 0
         var consecutiveFailures = 0
+        var consecutiveSkippedProbes = 0
         var lastOtherAppsRxBytes = safeOtherAppsRxBytes()
 
         if (BuildConfig.DEBUG) {
@@ -828,11 +844,13 @@ class MehVpnService : VpnService() {
             }
           lastOtherAppsRxBytes = nowOtherRxBytes
 
-          if (rxDelta > 16_384L) {
+          if (rxDelta > 65_536L && consecutiveSkippedProbes < 2) {
+            consecutiveSkippedProbes++
             MehDiag.recordRealDownloadBytes(rxDelta)
             MehDiag.recordKeepAliveSkippedActiveTraffic()
             consecutiveFailures = 0
           } else {
+            consecutiveSkippedProbes = 0
             MehDiag.recordKeepAliveProbeRun()
             if (!NativeXrayEngine.isRunning() && localSocksPort > 0) {
               launchNativeXraySocksCore(activeCfg, localSocksPort, useFragmentOverride = activeUseFragment)
