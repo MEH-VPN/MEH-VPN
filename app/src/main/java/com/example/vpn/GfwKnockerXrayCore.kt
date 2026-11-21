@@ -469,7 +469,8 @@ object GfwKnockerXrayCore {
             "name": "tun0",
             "mtu": ${tunMtu.coerceIn(1280, 1500)},
             "gateway": [
-              "10.10.14.1/30"
+              "10.10.14.1/24",
+              "fd00::10:10:14:1/64"
             ],
             "userLevel": 8
           },
@@ -547,10 +548,10 @@ object GfwKnockerXrayCore {
           "tag": "dns-internal",
           "queryStrategy": "UseIPv4",
           "servers": [
-            "tcp://1.1.1.1",
-            "tcp://8.8.8.8",
             "1.1.1.1",
             "8.8.8.8",
+            "tcp://1.1.1.1",
+            "tcp://8.8.8.8",
             {
               "address": "localhost",
               "domains": [
@@ -639,15 +640,6 @@ object GfwKnockerXrayCore {
             {
               "type": "field",
               "ip": [
-                "10.10.14.2/32",
-                "198.18.0.2/32"
-              ],
-              "port": "853",
-              "outboundTag": "block"
-            },
-            {
-              "type": "field",
-              "ip": [
                 "10.0.0.0/8",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
@@ -686,10 +678,7 @@ object GfwKnockerXrayCore {
 
   /**
    * Builds the `hev-socks5-tunnel` YAML config bridging Android's TUN interface to Xray's local
-   * SOCKS5 inbound. Supports both:
-   * - `enableMapDns = false` (v2rayNG standard real-DNS mode; TUN DNS = 1.1.1.1/8.8.8.8 -> Xray dns-out)
-   * - `enableMapDns = true` (safe RFC 2544 `198.18.0.0/15` mapdns, avoiding CGNAT `100.64.0.0/10`
-   *   collisions on Hamrah-e Aval cellular interfaces and Class E `240.0.0.0/4` rejections).
+   * SOCKS5 inbound using real DNS (no `mapdns` / Fake-IP), matching v2rayNG's standard mode.
    *
    * IMPORTANT: `tunIpv6` MUST stay `null` by default so Android fails IPv6 fast (`ENETUNREACH`)
    * without leaks or AAAA stalls on IPv4-only free V2Ray nodes.
@@ -697,14 +686,10 @@ object GfwKnockerXrayCore {
   fun buildHevSocks5TunnelYaml(
     socksPort: Int,
     tunMtu: Int = 1400,
-    tunIpv4: String = DeviceTunnelCalibrator.SAFE_MAPDNS_TUN_IPV4,
-    mapDnsAddress: String = DeviceTunnelCalibrator.SAFE_MAPDNS_DNS_ADDR,
+    tunIpv4: String = "10.10.14.1",
     tunIpv6: String? = null,
-    enableMapDns: Boolean = true,
-    mapDnsNetwork: String = DeviceTunnelCalibrator.SAFE_MAPDNS_NETWORK,
-    mapDnsNetmask: String = DeviceTunnelCalibrator.SAFE_MAPDNS_NETMASK,
   ): String {
-    val sb = StringBuilder(256)
+    val sb = StringBuilder(220)
     sb.appendLine("tunnel:")
     sb.appendLine("  mtu: ${tunMtu.coerceIn(1280, 8500)}")
     sb.appendLine("  ipv4: $tunIpv4")
@@ -715,14 +700,6 @@ object GfwKnockerXrayCore {
     sb.appendLine("  port: $socksPort")
     sb.appendLine("  address: 127.0.0.1")
     sb.appendLine("  udp: 'udp'")
-    if (enableMapDns) {
-      sb.appendLine("mapdns:")
-      sb.appendLine("  address: $mapDnsAddress")
-      sb.appendLine("  port: 53")
-      sb.appendLine("  network: $mapDnsNetwork")
-      sb.appendLine("  netmask: $mapDnsNetmask")
-      sb.appendLine("  cache-size: 10000")
-    }
     sb.appendLine("misc:")
     sb.appendLine("  task-stack-size: 81920")
     sb.appendLine("  connect-timeout: 10000")

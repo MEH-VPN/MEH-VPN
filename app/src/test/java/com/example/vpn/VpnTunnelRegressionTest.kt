@@ -143,52 +143,35 @@ class VpnTunnelRegressionTest {
   }
 
   @Test
-  fun hevTunnelYamlAndVpnTopology_matchDirectDnsAndSafeMapDnsContracts() {
+  fun hevTunnelYamlAndVpnTopology_usesRealDnsWithoutMapDnsAndMatchesXraySocksContract() {
     val socksPort = 24808
-
-    // Profile 1: HEV_MAPDNS_SAFE (RFC 2544 198.18.0.0/15, zero collision with cellular CGNAT 100.64.0.0/10)
-    val safeMapDnsYaml =
-      GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
-        socksPort = socksPort,
-        tunMtu = MehVpnService.TUN_MTU,
-        tunIpv4 = "198.18.0.1",
-        mapDnsAddress = "198.18.0.2",
-        enableMapDns = true,
-      )
-    assertTrue(safeMapDnsYaml.contains("mtu: ${MehVpnService.TUN_MTU}"))
-    assertTrue(safeMapDnsYaml.contains("ipv4: 198.18.0.1"))
-    assertFalse(
-      "hev-socks5-tunnel MUST omit ipv6 by default so Android fails IPv6 fast",
-      safeMapDnsYaml.contains("ipv6:"),
-    )
-    assertTrue(safeMapDnsYaml.contains("port: $socksPort"))
-    assertTrue(safeMapDnsYaml.contains("address: 127.0.0.1"))
-    assertTrue("hev-socks5-tunnel must use standard RFC1928 UDP mode for Xray", safeMapDnsYaml.contains("udp: 'udp'"))
-    assertFalse("udp: 'tcp' is unsupported by Xray socks inbound", safeMapDnsYaml.contains("udp: 'tcp'"))
-    assertTrue(safeMapDnsYaml.contains("mapdns:"))
-    assertTrue(safeMapDnsYaml.contains("address: 198.18.0.2"))
-    assertTrue("Safe MapDNS must use RFC 2544 198.19.0.0/16", safeMapDnsYaml.contains("network: 198.19.0.0"))
-    assertTrue(safeMapDnsYaml.contains("netmask: 255.255.0.0"))
-    assertFalse("Must NEVER collide with Iranian cellular CGNAT 100.64.0.0/10", safeMapDnsYaml.contains("100.64.0.0"))
-    assertFalse("Avoid reserved Class E 240.0.0.0/4 on Android kernels", safeMapDnsYaml.contains("240.0.0.0"))
-    assertTrue("Must use valid hev-socks5-tunnel key read-write-timeout", safeMapDnsYaml.contains("read-write-timeout:"))
-    assertTrue("connect-timeout should allow 10s for high-latency mobile handshakes", safeMapDnsYaml.contains("connect-timeout: 10000"))
-    assertFalse("tcp-read-write-timeout is rejected by libhev-socks5-tunnel.so", safeMapDnsYaml.contains("tcp-read-write-timeout:"))
-    // Ensure clean 0-column YAML top-level sections (no broken indentation).
-    assertTrue(safeMapDnsYaml.startsWith("tunnel:\n  mtu: ${MehVpnService.TUN_MTU}\n"))
-
-    // Profile 2: HEV_DIRECT_DNS (v2rayNG standard mode: zero mapdns, real IPs through Xray dns-out)
-    val directDnsYaml =
+    val yaml =
       GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
         socksPort = socksPort,
         tunMtu = MehVpnService.TUN_MTU,
         tunIpv4 = MehVpnService.TUN_IPV4_ADDRESS,
-        enableMapDns = false,
       )
-    assertTrue(directDnsYaml.contains("ipv4: 10.10.14.1"))
-    assertTrue(directDnsYaml.contains("udp: 'udp'"))
-    assertFalse("Direct DNS profile MUST omit mapdns section completely", directDnsYaml.contains("mapdns:"))
-    assertFalse("Direct DNS profile must not emit fake-IP network", directDnsYaml.contains("network:"))
+
+    assertEquals("10.10.14.1", MehVpnService.TUN_IPV4_ADDRESS)
+    assertEquals("1.1.1.1", MehVpnService.PRIMARY_DNS_ADDRESS)
+    assertEquals("8.8.8.8", MehVpnService.SECONDARY_DNS_ADDRESS)
+    assertTrue(yaml.contains("mtu: ${MehVpnService.TUN_MTU}"))
+    assertTrue(yaml.contains("ipv4: ${MehVpnService.TUN_IPV4_ADDRESS}"))
+    assertFalse(
+      "hev-socks5-tunnel MUST omit ipv6 by default so Android fails IPv6 fast and never stalls on AAAA/IPv4-only servers",
+      yaml.contains("ipv6:"),
+    )
+    assertTrue(yaml.contains("port: $socksPort"))
+    assertTrue(yaml.contains("address: 127.0.0.1"))
+    assertTrue("hev-socks5-tunnel must use standard RFC1928 UDP mode for Xray", yaml.contains("udp: 'udp'"))
+    assertFalse("udp: 'tcp' is unsupported by Xray socks inbound", yaml.contains("udp: 'tcp'"))
+    assertFalse("Fake DNS / mapdns MUST be completely removed", yaml.contains("mapdns:"))
+    assertFalse("Must NEVER allocate CGNAT fake-IP range 100.64.0.0", yaml.contains("100.64.0.0"))
+    assertFalse("Avoid reserved Class E 240.0.0.0/4 on Android kernels", yaml.contains("240.0.0.0"))
+    assertTrue("Must use valid hev-socks5-tunnel key read-write-timeout", yaml.contains("read-write-timeout:"))
+    assertTrue("connect-timeout should allow 10s for high-latency mobile handshakes", yaml.contains("connect-timeout: 10000"))
+    assertFalse("tcp-read-write-timeout is rejected by libhev-socks5-tunnel.so", yaml.contains("tcp-read-write-timeout:"))
+    assertTrue(yaml.startsWith("tunnel:\n  mtu: ${MehVpnService.TUN_MTU}\n"))
   }
 
   @Test
@@ -940,174 +923,6 @@ class VpnTunnelRegressionTest {
       VerifiedServerPoolStore.resetCachesIfAppUpdated(context, currentVersionCode = 101, installUpdateTimeMs = t2)
     )
     assertEquals(1, VerifiedServerPoolStore.getFastest(context).size)
-  }
-
-  @Test
-  fun deviceTunnelCalibrator_recommendsDirectDnsForAndroid9CellularAndCgnat_andSafeMapDnsForModernWifi() {
-    // Samsung Galaxy S8 (Android 9 / API 28) on Hamrah-e Aval (Cellular + CGNAT 100.64.x + opportunistic DoT)
-    val s8Rec =
-      DeviceTunnelCalibrator.recommendProfile(
-        sdkInt = 28,
-        isCellular = true,
-        hasCgnat100Interface = true,
-        privateDnsModeRaw = "opportunistic",
-        linkPrivateDnsActive = true,
-      )
-    assertEquals(TunnelProfile.HEV_DIRECT_DNS, s8Rec.first)
-
-    // Android 9 even on Wi-Fi -> Direct DNS (avoids Android 9 netd opportunistic DoT + Fake-IP stalls)
-    val api28Wifi =
-      DeviceTunnelCalibrator.recommendProfile(
-        sdkInt = 28,
-        isCellular = false,
-        hasCgnat100Interface = false,
-        privateDnsModeRaw = "off",
-        linkPrivateDnsActive = false,
-      )
-    assertEquals(TunnelProfile.HEV_DIRECT_DNS, api28Wifi.first)
-
-    // Android 13 on Cellular with CGNAT -> Direct DNS
-    val modernCellCgnat =
-      DeviceTunnelCalibrator.recommendProfile(
-        sdkInt = 33,
-        isCellular = true,
-        hasCgnat100Interface = true,
-        privateDnsModeRaw = "off",
-        linkPrivateDnsActive = false,
-      )
-    assertEquals(TunnelProfile.HEV_DIRECT_DNS, modernCellCgnat.first)
-
-    // Android 13 on clean Wi-Fi without CGNAT or Private DNS -> HEV_MAPDNS_SAFE (198.18/19)
-    val modernWifi =
-      DeviceTunnelCalibrator.recommendProfile(
-        sdkInt = 33,
-        isCellular = false,
-        hasCgnat100Interface = false,
-        privateDnsModeRaw = "off",
-        linkPrivateDnsActive = false,
-      )
-    assertEquals(TunnelProfile.HEV_MAPDNS_SAFE, modernWifi.first)
-
-    // CGNAT 100.64.0.0/10 range detector accuracy
-    assertTrue(DeviceTunnelCalibrator.isCgnat100Address("100.64.0.1"))
-    assertTrue(DeviceTunnelCalibrator.isCgnat100Address("100.100.55.12"))
-    assertTrue(DeviceTunnelCalibrator.isCgnat100Address("100.127.255.254"))
-    assertFalse(DeviceTunnelCalibrator.isCgnat100Address("100.63.255.255"))
-    assertFalse(DeviceTunnelCalibrator.isCgnat100Address("100.128.0.1"))
-    assertFalse(DeviceTunnelCalibrator.isCgnat100Address("192.168.1.5"))
-    assertFalse(DeviceTunnelCalibrator.isCgnat100Address("198.18.0.1"))
-  }
-
-  @Test
-  fun xrayConfig_usesTcpFirstDns_blocksLocalDotPort853_andIpv4OnlyNativeTun() {
-    val cfg =
-      V2RayConfigParser.parseSingleUri(
-        "vless://11111111-2222-3333-4444-555555555555@dns-test.example.org:443?encryption=none&security=tls&sni=dns-test.example.org&type=ws&path=%2Fws#DnsTest"
-      )!!
-
-    val root =
-      JSONObject(
-        GfwKnockerXrayCore.buildXrayCoreJson(
-          config = cfg,
-          includeTunInbound = true,
-          tunMtu = 1400,
-          localSocksPort = 20808,
-        )
-      )
-
-    // 1. Native Xray TUN inbound must be IPv4-only 10.10.14.1/30
-    val tunInbound = root.getJSONArray("inbounds").getJSONObject(0)
-    assertEquals("tun", tunInbound.getString("protocol"))
-    val gw = tunInbound.getJSONObject("settings").getJSONArray("gateway")
-    assertEquals(1, gw.length())
-    assertEquals("10.10.14.1/30", gw.getString(0))
-
-    // 2. DNS servers must try TCP-over-proxy first (works even on TCP-only free V2Ray nodes)
-    val dnsServers = root.getJSONObject("dns").getJSONArray("servers")
-    assertEquals("tcp://1.1.1.1", dnsServers.getString(0))
-    assertEquals("tcp://8.8.8.8", dnsServers.getString(1))
-
-    // 3. Routing MUST block TCP/UDP 853 to local MapDNS IPs BEFORE 10.0.0.0/8 direct rule
-    val rules = root.getJSONObject("routing").getJSONArray("rules")
-    var dotBlockIdx = -1
-    var privateDirectIdx = -1
-    for (i in 0 until rules.length()) {
-      val r = rules.getJSONObject(i)
-      if (r.has("ip")) {
-        val ipArr = r.getJSONArray("ip")
-        val ipList = (0 until ipArr.length()).map { ipArr.getString(it) }
-        if (r.optString("outboundTag") == "block" && r.optString("port") == "853") {
-          if ("10.10.14.2/32" in ipList && "198.18.0.2/32" in ipList) {
-            dotBlockIdx = i
-          }
-        }
-        if (r.optString("outboundTag") == "direct" && "10.0.0.0/8" in ipList) {
-          privateDirectIdx = i
-        }
-      }
-    }
-    assertTrue("Must block port 853 to MapDNS IPs before private direct rule", dotBlockIdx >= 0 && privateDirectIdx > dotBlockIdx)
-  }
-
-  @Test
-  fun dnsPacketHelpers_buildValidAQuery_andParseIpv4Answer() {
-    val query = MehVpnService.buildDnsAQueryPacket("i.instagram.com")
-    assertTrue(query.size >= 29)
-    // Header ID=0x4D45, RD=1, QDCOUNT=1
-    assertEquals(0x4D.toByte(), query[0])
-    assertEquals(0x45.toByte(), query[1])
-    assertEquals(0x01.toByte(), query[5])
-
-    // Construct a minimal DNS A-record response pointing to 157.240.20.174
-    val response =
-      query.copyOf(query.size + 16).also { resp ->
-        resp[2] = 0x81.toByte() // QR=1, RD=1
-        resp[3] = 0x80.toByte() // RA=1
-        resp[7] = 0x01.toByte() // ANCOUNT=1
-        val off = query.size
-        resp[off] = 0xC0.toByte() // Name pointer -> offset 12
-        resp[off + 1] = 0x0C.toByte()
-        resp[off + 2] = 0x00 // TYPE=A (1)
-        resp[off + 3] = 0x01
-        resp[off + 4] = 0x00 // CLASS=IN (1)
-        resp[off + 5] = 0x01
-        resp[off + 6] = 0x00 // TTL
-        resp[off + 7] = 0x00
-        resp[off + 8] = 0x00
-        resp[off + 9] = 0x3C
-        resp[off + 10] = 0x00 // RDLENGTH=4
-        resp[off + 11] = 0x04
-        resp[off + 12] = 157.toByte()
-        resp[off + 13] = 240.toByte()
-        resp[off + 14] = 20.toByte()
-        resp[off + 15] = 174.toByte()
-      }
-    assertEquals("157.240.20.174", MehVpnService.parseFirstIpv4FromDnsResponse(response))
-    assertNull("Truncated DNS response must return null safely", MehVpnService.parseFirstIpv4FromDnsResponse(ByteArray(4)))
-  }
-
-  @Test
-  fun mehFullLogger_buffersChronologically_redactsSecrets_andExportsFullReport() {
-    val context = ApplicationProvider.getApplicationContext<Context>()
-    MehFullLogger.clear()
-    MehFullLogger.log(FullLogCategory.CALIBRATION, "Selected HEV_DIRECT_DNS for API 28")
-    MehFullLogger.log(FullLogCategory.DNS, "SOCKS5 UDP DNS probe ok: 157.240.20.174")
-    MehFullLogger.log(FullLogCategory.ERROR, "Simulated test error", isError = true)
-
-    assertEquals(3, MehFullLogger.entries.value.size)
-
-    // Write a sample Xray config with secret UUID/password and confirm export redacts them.
-    java.io.File(context.filesDir, "active_v2ray_config.json").writeText(
-      """{"outbounds":[{"settings":{"vnext":[{"users":[{"id":"secret-uuid-123456","password":"my-trojan-password"}]}]}}]}"""
-    )
-    val report = MehFullLogger.exportFullDiagnosticReport(context)
-    assertTrue(report.contains("MEH VPN FULL DIAGNOSTIC REPORT"))
-    assertTrue(report.contains("Selected HEV_DIRECT_DNS for API 28"))
-    assertTrue(report.contains("Simulated test error"))
-    assertTrue(report.contains("\"id\": \"***\""))
-    assertTrue(report.contains("\"password\": \"***\""))
-    assertFalse("Exported report must NEVER leak raw UUID", report.contains("secret-uuid-123456"))
-    assertFalse("Exported report must NEVER leak raw password", report.contains("my-trojan-password"))
   }
 }
 

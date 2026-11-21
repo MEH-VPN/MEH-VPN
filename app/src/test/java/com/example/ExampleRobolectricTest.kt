@@ -407,8 +407,9 @@ class ExampleRobolectricTest {
     val tunInbound = inbounds.getJSONObject(0)
     org.junit.Assert.assertEquals("tun", tunInbound.getString("protocol"))
     val tunGateway = tunInbound.getJSONObject("settings").getJSONArray("gateway")
-    org.junit.Assert.assertEquals(1, tunGateway.length())
-    org.junit.Assert.assertEquals("10.10.14.1/30", tunGateway.getString(0))
+    org.junit.Assert.assertEquals(2, tunGateway.length())
+    org.junit.Assert.assertEquals("10.10.14.1/24", tunGateway.getString(0))
+    org.junit.Assert.assertEquals("fd00::10:10:14:1/64", tunGateway.getString(1))
     org.junit.Assert.assertEquals("socks", inbounds.getJSONObject(1).getString("protocol"))
     org.junit.Assert.assertEquals(20808, inbounds.getJSONObject(1).getInt("port"))
 
@@ -430,7 +431,7 @@ class ExampleRobolectricTest {
     val dnsObj = root.getJSONObject("dns")
     org.junit.Assert.assertFalse(dnsObj.optBoolean("enableParallelQuery", false))
     val dnsServers = dnsObj.getJSONArray("servers")
-    org.junit.Assert.assertEquals("tcp://1.1.1.1", dnsServers.getString(0))
+    org.junit.Assert.assertEquals("1.1.1.1", dnsServers.getString(0))
     val dnsOutbound = outbounds.getJSONObject(3)
     org.junit.Assert.assertEquals("dns-out", dnsOutbound.getString("tag"))
     org.junit.Assert.assertEquals(
@@ -474,13 +475,11 @@ class ExampleRobolectricTest {
       com.example.vpn.GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
         socksPort = 20808,
         tunMtu = 1400,
-        tunIpv4 = "198.18.0.1",
-        mapDnsAddress = "198.18.0.2",
-        enableMapDns = true,
+        tunIpv4 = "10.10.14.1",
       )
     assertTrue(hevYaml.contains("port: 20808"))
-    assertTrue(hevYaml.contains("address: 198.18.0.2"))
-    assertTrue(hevYaml.contains("network: 198.19.0.0"))
+    assertTrue(hevYaml.contains("udp: 'udp'"))
+    org.junit.Assert.assertFalse(hevYaml.contains("mapdns:"))
     assertTrue(hevYaml.contains("read-write-timeout: 60000"))
 
     val realityPubKey =

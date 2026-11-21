@@ -26,8 +26,6 @@ import com.example.telemetry.MehTelemetry
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -75,7 +73,6 @@ data class VpnTunnelSession(
   val protocolLabel: String = "",
   val currentPingMs: Long = 0L,
   val localProxyPort: Int = 0,
-  val tunnelProfileId: String = "",
   val errorMessage: String? = null,
 )
 
@@ -88,7 +85,6 @@ class MehVpnService : VpnService() {
   private val poolCursor = AtomicInteger(0)
   @Volatile private var activeConfigState: V2RayConfig? = null
   @Volatile private var activeUseFragment: Boolean = false
-  @Volatile private var activeTunnelProfile: TunnelProfile = TunnelProfile.HEV_DIRECT_DNS
   @Volatile private var localSocksPort: Int = 0
   @Volatile private var nativeCoreStarted: Boolean = false
   @Volatile private var hevTunnelRunning: Boolean = false
@@ -109,12 +105,7 @@ class MehVpnService : VpnService() {
 
   override fun onCreate() {
     super.onCreate()
-    val reset = VerifiedServerPoolStore.resetCachesIfAppUpdated(applicationContext, BuildConfig.VERSION_CODE)
-    MehFullLogger.log(
-      FullLogCategory.SYSTEM,
-      "MehVpnService.onCreate | app=${BuildConfig.VERSION_NAME}(${BuildConfig.VERSION_CODE}) cacheReset=$reset xray=${NativeXrayEngine.xrayVersion()}",
-    )
-    DeviceTunnelCalibrator.runInitialCalibration(applicationContext, "vpn_service_create")
+    VerifiedServerPoolStore.resetCachesIfAppUpdated(applicationContext, BuildConfig.VERSION_CODE)
     MehTelemetry.initialize(this)
     registerPhysicalNetworkTracker()
     BackgroundServerScanScheduler.ensurePeriodicScheduled(applicationContext)
@@ -147,14 +138,12 @@ class MehVpnService : VpnService() {
         object : ConnectivityManager.NetworkCallback() {
           override fun onAvailable(network: Network) {
             underlyingPhysicalNetwork = network
-            MehFullLogger.log(FullLogCategory.NETWORK, "Physical network available: $network")
           }
 
           override fun onLost(network: Network) {
             if (underlyingPhysicalNetwork == network) {
               underlyingPhysicalNetwork = null
             }
-            MehFullLogger.log(FullLogCategory.NETWORK, "Physical network lost: $network")
           }
         }
       cm.registerNetworkCallback(requestBuilder.build(), callback)
@@ -294,22 +283,12 @@ class MehVpnService : VpnService() {
         poolCursor.set(0)
       }
 
-      // Run fresh device + network calibration right before starting the tunnel.
-      val selectedModePref = DeviceTunnelCalibrator.getSelectedMode(applicationContext)
-      val calSnapshot = DeviceTunnelCalibrator.runInitialCalibration(applicationContext, "connect_start")
-      var chosenProfile = selectedModePref.toLockedProfileOrNull() ?: calSnapshot.recommendedProfile
-      activeTunnelProfile = chosenProfile
-      MehFullLogger.log(
-        FullLogCategory.TUNNEL,
-        "startTunnelAsync | candidates=${effectiveConfigs.size} mode=${selectedModePref.id} -> profile=${chosenProfile.id} (${chosenProfile.titleFa})",
-      )
-
       // Allocate one fixed local SOCKS5 port for this VPN session.
-      // Verify candidates on native Xray SOCKS5 FIRST (without touching TUN), then attach
-      // the calibrated TUN profile (`HEV_DIRECT_DNS`, `HEV_MAPDNS_SAFE`, or `NATIVE_XRAY_TUN`).
+      // hev-socks5-tunnel owns the Android TUN interface (`tunFd`) permanently while native Xray
+      // listens on `127.0.0.1:fixedSocksPort` (`socks-in`), so server switches hot-swap Xray
+      // seamlessly without tearing down the OS VPN interface.
       val fixedSocksPort = NativeXrayEngine.allocateLocalPort()
       localSocksPort = fixedSocksPort
-      MehFullLogger.log(FullLogCategory.XRAY, "Allocated local SOCKS5 port: 127.0.0.1:$fixedSocksPort")
 
       var startedConfig: V2RayConfig? = null
       var verifiedPingMs: Long = initialPing
@@ -319,20 +298,10 @@ class MehVpnService : VpnService() {
       var lastError: String? = null
       for (idx in effectiveConfigs.indices) {
         val candidate = effectiveConfigs[idx]
-        if (!NativeXrayEngine.supportsNativeXray(candidate)) {
-          MehFullLogger.log(
-            FullLogCategory.SERVER,
-            "Skip unsupported candidate[$idx]: ${candidate.cleanTitle} (${candidate.protocol.label}/${candidate.network})",
-          )
-          continue
-        }
+        if (!NativeXrayEngine.supportsNativeXray(candidate)) continue
         emitRealtimeLog(
           "راه‌اندازی و تست هسته Xray روی ${candidate.cleanTitle}...",
           VpnLogLevel.SCAN,
-        )
-        MehFullLogger.log(
-          FullLogCategory.SERVER,
-          "Testing candidate[$idx/${effectiveConfigs.size}]: ${candidate.cleanTitle} | proto=${candidate.protocol.label} net=${candidate.network} sec=${candidate.security} addr=${candidate.address}:${candidate.port} ip=${candidate.resolvedIp.ifBlank { "-" }} sni=${candidate.sni.ifBlank { "-" }} frag=${candidate.fragmentProfile}",
         )
         val (verifiedCfg, report, candidateErr) =
           launchVerifiedNativeXraySocksWithReport(
@@ -342,10 +311,6 @@ class MehVpnService : VpnService() {
           )
         if (verifiedCfg != null && report != null && report.anyPassed) {
           val livePing = report.bestLatencyMs ?: initialPing
-          MehFullLogger.log(
-            FullLogCategory.PROBE,
-            "Candidate PASSED [${verifiedCfg.cleanTitle}] frag=$activeUseFragment | YT=${report.youtubeMs ?: -1}ms IG=${report.instagramMs ?: -1}ms X=${report.twitterMs ?: -1}ms",
-          )
           // Prefer a server that actually opens Instagram or X/Twitter over a YouTube-only node.
           val hasMoreCandidates = idx + 1 < effectiveConfigs.size
           if (!report.socialPassed && hasMoreCandidates && extraSocialSearchTries < 2) {
@@ -366,11 +331,6 @@ class MehVpnService : VpnService() {
           synchronized(poolLock) { poolCursor.set(idx) }
           break
         }
-        MehFullLogger.log(
-          FullLogCategory.PROBE,
-          "Candidate FAILED [${candidate.cleanTitle}] err=${candidateErr ?: "probes_timed_out"}",
-          isError = true,
-        )
         stopNativeXray()
         if (candidateErr != null) {
           lastError = candidateErr
@@ -383,10 +343,6 @@ class MehVpnService : VpnService() {
 
       if (startedConfig == null && youtubeOnlyFallback != null) {
         val (fallbackCfg, fallbackFrag, fallbackReport) = youtubeOnlyFallback
-        MehFullLogger.log(
-          FullLogCategory.SERVER,
-          "Falling back to YouTube-only candidate: ${fallbackCfg.cleanTitle} (frag=$fallbackFrag)",
-        )
         val restoreErr =
           launchNativeXraySocksCore(
             config = fallbackCfg,
@@ -418,68 +374,22 @@ class MehVpnService : VpnService() {
         return
       }
 
-      // When using HEV_DIRECT_DNS (real UDP/TCP DNS through Xray dns-out), verify SOCKS5 UDP
-      // ASSOCIATE -> Xray dns-out -> tcp://1.1.1.1 right now! If UDP ASSOCIATE fails in AUTO mode,
-      // automatically switch to HEV_MAPDNS_SAFE (198.18.0.0/15, zero CGNAT 100.64 collision).
-      if (chosenProfile == TunnelProfile.HEV_DIRECT_DNS) {
-        val (resolvedIgIp, dnsProbeDetail) =
-          probeDnsViaSocksUdp(
-            proxyPort = fixedSocksPort,
-            domain = "i.instagram.com",
-            dnsServer = DeviceTunnelCalibrator.DIRECT_DNS_PRIMARY,
-            timeoutMs = 3000,
-          )
-        MehFullLogger.log(
-          FullLogCategory.DNS,
-          "SOCKS5 UDP DNS check (i.instagram.com via ${DeviceTunnelCalibrator.DIRECT_DNS_PRIMARY}:53): $dnsProbeDetail",
-          isError = resolvedIgIp == null,
-        )
-        if (resolvedIgIp == null && selectedModePref == TunnelModePreference.AUTO) {
-          chosenProfile = TunnelProfile.HEV_MAPDNS_SAFE
-          activeTunnelProfile = chosenProfile
-          MehFullLogger.log(
-            FullLogCategory.CALIBRATION,
-            "AUTO fallback: SOCKS5 UDP DNS probe failed -> switching to HEV_MAPDNS_SAFE (198.18.0.1/30 + 198.19.0.0/16)",
-          )
-        }
-      }
-
-      // Establish IPv4-only Android TUN interface tailored to `chosenProfile`.
+      // Establish IPv4-only Android TUN interface bridged by hev-socks5-tunnel using real DNS
+      // (1.1.1.1 & 8.8.8.8 routed through Xray `dns-out`, zero Fake-IP / mapdns).
       // IMPORTANT: Do NOT add an IPv6 address/route and do NOT call `allowFamily(AF_INET6)`!
       // Android automatically fails IPv6 fast (`ENETUNREACH`), preventing AAAA stalls & IPv6 leaks.
-      val tunIpv4: String
-      val dnsList: List<String>
-      when (chosenProfile) {
-        TunnelProfile.HEV_DIRECT_DNS,
-        TunnelProfile.NATIVE_XRAY_TUN -> {
-          tunIpv4 = DeviceTunnelCalibrator.DIRECT_TUN_IPV4
-          dnsList =
-            listOf(
-              DeviceTunnelCalibrator.DIRECT_DNS_PRIMARY,
-              DeviceTunnelCalibrator.DIRECT_DNS_SECONDARY,
-            )
-        }
-        TunnelProfile.HEV_MAPDNS_SAFE -> {
-          tunIpv4 = DeviceTunnelCalibrator.SAFE_MAPDNS_TUN_IPV4
-          dnsList = listOf(DeviceTunnelCalibrator.SAFE_MAPDNS_DNS_ADDR)
-        }
-      }
-
       val builder =
         Builder()
           .setSession("MEH • $effectiveName")
           .setMtu(TUN_MTU)
-          .addAddress(tunIpv4, 30)
+          .addAddress(TUN_IPV4_ADDRESS, 30)
           .addRoute("0.0.0.0", 0)
-      for (dns in dnsList) {
-        builder.addDnsServer(dns)
-      }
+          .addDnsServer(PRIMARY_DNS_ADDRESS)
+          .addDnsServer(SECONDARY_DNS_ADDRESS)
 
       try {
         builder.addDisallowedApplication(packageName)
-      } catch (e: Exception) {
-        MehFullLogger.logError(FullLogCategory.TUNNEL, "addDisallowedApplication failed", e)
-      }
+      } catch (_: Exception) {}
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         builder.setMetered(false)
@@ -488,72 +398,18 @@ class MehVpnService : VpnService() {
       val establishedPfd =
         builder.establish() ?: throw IllegalStateException("TUN establish returned null")
       vpnInterface = establishedPfd
-      MehFullLogger.log(
-        FullLogCategory.TUNNEL,
-        "TUN established | profile=${chosenProfile.id} fd=${establishedPfd.fd} mtu=$TUN_MTU ipv4=$tunIpv4/30 dns=$dnsList",
-      )
 
-      when (chosenProfile) {
-        TunnelProfile.HEV_DIRECT_DNS -> {
-          val hevYaml =
-            GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
-              socksPort = fixedSocksPort,
-              tunMtu = TUN_MTU,
-              tunIpv4 = tunIpv4,
-              enableMapDns = false,
-              tunIpv6 = null,
-            )
-          val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
-          hevConfigFile.writeText(hevYaml)
-          TProxyService.TProxyStartService(hevConfigFile.absolutePath, establishedPfd.fd)
-          hevTunnelRunning = true
-          MehFullLogger.log(
-            FullLogCategory.TUNNEL,
-            "Started hev-socks5-tunnel (DIRECT_DNS, no mapdns) -> socks=127.0.0.1:$fixedSocksPort fd=${establishedPfd.fd}",
-          )
-        }
-        TunnelProfile.HEV_MAPDNS_SAFE -> {
-          val hevYaml =
-            GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
-              socksPort = fixedSocksPort,
-              tunMtu = TUN_MTU,
-              tunIpv4 = tunIpv4,
-              mapDnsAddress = DeviceTunnelCalibrator.SAFE_MAPDNS_DNS_ADDR,
-              tunIpv6 = null,
-              enableMapDns = true,
-              mapDnsNetwork = DeviceTunnelCalibrator.SAFE_MAPDNS_NETWORK,
-              mapDnsNetmask = DeviceTunnelCalibrator.SAFE_MAPDNS_NETMASK,
-            )
-          val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
-          hevConfigFile.writeText(hevYaml)
-          TProxyService.TProxyStartService(hevConfigFile.absolutePath, establishedPfd.fd)
-          hevTunnelRunning = true
-          MehFullLogger.log(
-            FullLogCategory.TUNNEL,
-            "Started hev-socks5-tunnel (MAPDNS_SAFE ${DeviceTunnelCalibrator.SAFE_MAPDNS_DNS_ADDR} -> ${DeviceTunnelCalibrator.SAFE_MAPDNS_NETWORK}/${DeviceTunnelCalibrator.SAFE_MAPDNS_NETMASK}) fd=${establishedPfd.fd}",
-          )
-        }
-        TunnelProfile.NATIVE_XRAY_TUN -> {
-          val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
-          runCatching { if (hevConfigFile.exists()) hevConfigFile.delete() }
-          val tunStartErr =
-            launchNativeXraySocksCore(
-              config = active,
-              socksPort = fixedSocksPort,
-              useFragmentOverride = activeUseFragment,
-              includeTunInbound = true,
-              tunFd = establishedPfd.fd,
-            )
-          if (tunStartErr != null) {
-            throw IllegalStateException("Native Xray TUN failed: $tunStartErr")
-          }
-          hevTunnelRunning = false
-          MehFullLogger.log(
-            FullLogCategory.TUNNEL,
-            "Started native libXray tun-in directly on fd=${establishedPfd.fd} (without hev-socks5-tunnel)",
-          )
-        }
-      }
+      val hevYaml =
+        GfwKnockerXrayCore.buildHevSocks5TunnelYaml(
+          socksPort = fixedSocksPort,
+          tunMtu = TUN_MTU,
+          tunIpv4 = TUN_IPV4_ADDRESS,
+          tunIpv6 = null,
+        )
+      val hevConfigFile = File(filesDir, "hev_socks5_tunnel.yml")
+      hevConfigFile.writeText(hevYaml)
+      TProxyService.TProxyStartService(hevConfigFile.absolutePath, establishedPfd.fd)
+      hevTunnelRunning = true
 
       _tunnelSession.value =
         VpnTunnelSession(
@@ -564,7 +420,6 @@ class MehVpnService : VpnService() {
           protocolLabel = active.protocol.label,
           currentPingMs = effectivePing,
           localProxyPort = fixedSocksPort,
-          tunnelProfileId = chosenProfile.id,
           errorMessage = null,
         )
 
@@ -576,7 +431,7 @@ class MehVpnService : VpnService() {
       )
 
       emitRealtimeLog(
-        "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms • ${chosenProfile.shortBadgeFa})",
+        "متصل و تایید شد: $effectiveName (${active.protocol.label} • پینگ ${effectivePing}ms)",
         VpnLogLevel.SUCCESS,
       )
       connectedReport?.let { report ->
@@ -585,14 +440,12 @@ class MehVpnService : VpnService() {
           if (report.socialPassed) VpnLogLevel.SUCCESS else VpnLogLevel.SYSTEM,
         )
       }
-      MehFullLogger.recordLiveTelemetrySnapshot(applicationContext, "connected")
 
       startProtectedKeepAliveProbe(effectiveName, effectivePing)
       startBackgroundNodeRefinement(effectivePing)
     } catch (ce: CancellationException) {
       throw ce
     } catch (t: Throwable) {
-      MehFullLogger.logError(FullLogCategory.ERROR, "startTunnelAsync failed", t)
       MehTelemetry.logError(
         stage = "vpn_tunnel_establish",
         errorMessage = t.localizedMessage ?: t.javaClass.simpleName,
@@ -661,17 +514,13 @@ class MehVpnService : VpnService() {
   }
 
   /**
-   * Starts (or hot-restarts) native Go Xray-core. In `HEV_*` modes it runs in SOCKS5-only inbound
-   * mode while `hev-socks5-tunnel` owns the TUN fd; in `NATIVE_XRAY_TUN` mode it also attaches
-   * `tun-in` directly to [tunFd] (or the active [vpnInterface] fd on hot-swaps).
+   * Starts (or hot-restarts) native Go Xray-core in SOCKS5-only inbound mode while
+   * `hev-socks5-tunnel` permanently owns the Android TUN file descriptor.
    */
   private fun launchNativeXraySocksCore(
     config: V2RayConfig,
     socksPort: Int,
     useFragmentOverride: Boolean? = null,
-    includeTunInbound: Boolean =
-      activeTunnelProfile == TunnelProfile.NATIVE_XRAY_TUN && vpnInterface != null,
-    tunFd: Int? = if (includeTunInbound) vpnInterface?.fd else null,
   ): String? {
     if (socksPort <= 0) return "Invalid local SOCKS5 port"
     val resolvedConfig =
@@ -689,7 +538,7 @@ class MehVpnService : VpnService() {
     val xrayJson =
       GfwKnockerXrayCore.buildXrayCoreJson(
         config = resolvedConfig,
-        includeTunInbound = includeTunInbound,
+        includeTunInbound = false,
         tunMtu = TUN_MTU,
         localSocksPort = socksPort,
         useFragment = effectiveFragment,
@@ -701,7 +550,7 @@ class MehVpnService : VpnService() {
     val result =
       NativeXrayEngine.startTunnel(
         datDir = filesDir.absolutePath,
-        tunFd = tunFd,
+        tunFd = null,
         configJson = xrayJson,
         protectFd = { fd ->
           if (vpnInterface == null) {
@@ -715,14 +564,6 @@ class MehVpnService : VpnService() {
           }
         },
       )
-
-    MehFullLogger.log(
-      FullLogCategory.XRAY,
-      "Xray start [${resolvedConfig.cleanTitle}] proto=${resolvedConfig.protocol.label} net=${resolvedConfig.network} " +
-        "sec=${resolvedConfig.security} frag=$effectiveFragment tunIn=$includeTunInbound fd=${tunFd ?: -1} " +
-        "-> ok=${result.success} err=${result.error ?: "none"}",
-      isError = !result.success,
-    )
 
     return if (result.success) {
       nativeCoreStarted = true
@@ -1115,17 +956,12 @@ class MehVpnService : VpnService() {
             MehDiag.recordRealDownloadBytes(rxDelta)
             MehDiag.recordKeepAliveSkippedActiveTraffic()
             consecutiveFailures = 0
-            MehFullLogger.log(
-              FullLogCategory.PROBE,
-              "KeepAlive#$tickCount skipped (active traffic rxDelta=${rxDelta}B) | hev=[${MehFullLogger.readHevTunnelStatsSummary()}]",
-            )
           } else {
             consecutiveSkippedProbes = 0
             MehDiag.recordKeepAliveProbeRun()
             var coreDied = false
             if (!NativeXrayEngine.isRunning() && localSocksPort > 0) {
               coreDied = true
-              MehFullLogger.log(FullLogCategory.XRAY, "KeepAlive#$tickCount detected Xray stopped -> restarting active node", isError = true)
               launchNativeXraySocksCore(activeCfg, localSocksPort, useFragmentOverride = activeUseFragment)
             }
             var realPing = verifyRealPathViaProxy(localSocksPort, timeoutMs = 5500)
@@ -1136,17 +972,8 @@ class MehVpnService : VpnService() {
             if (realPing != null) {
               lastPing = realPing
               consecutiveFailures = 0
-              MehFullLogger.log(
-                FullLogCategory.PROBE,
-                "KeepAlive#$tickCount OK (${realPing}ms, rxDelta=${rxDelta}B) | hev=[${MehFullLogger.readHevTunnelStatsSummary()}]",
-              )
             } else {
               consecutiveFailures++
-              MehFullLogger.log(
-                FullLogCategory.PROBE,
-                "KeepAlive#$tickCount FAIL (consecutive=$consecutiveFailures, coreDied=$coreDied, rxDelta=${rxDelta}B) | hev=[${MehFullLogger.readHevTunnelStatsSummary()}]",
-                isError = true,
-              )
               // Require 2 consecutive failed keep-alive ticks (unless Xray actually exited) so a
               // temporary slowdown while Instagram/Twitter downloads media never kills live sockets.
               if (coreDied || consecutiveFailures >= 2) {
@@ -1605,7 +1432,8 @@ class MehVpnService : VpnService() {
     internal const val TUN_MTU = 1400
     internal const val TUN_IPV4_ADDRESS = "10.10.14.1"
     internal const val TUN_IPV6_ADDRESS = "fd00::10:10:14:1"
-    internal const val MAP_DNS_ADDRESS = "10.10.14.2"
+    internal const val PRIMARY_DNS_ADDRESS = "1.1.1.1"
+    internal const val SECONDARY_DNS_ADDRESS = "8.8.8.8"
     private const val CHANNEL_ID = "meh_vpn_channel"
     private const val NOTIFICATION_ID = 1001
 
@@ -1776,182 +1604,11 @@ class MehVpnService : VpnService() {
         } else {
           null
         }
-      } catch (e: Exception) {
-        MehFullLogger.log(
-          FullLogCategory.PROBE,
-          "HTTPS probe fail ($targetHost:443): ${e.javaClass.simpleName}: ${e.message ?: "timeout"}",
-        )
+      } catch (_: Exception) {
         null
       } finally {
         try { socket?.close() } catch (_: Exception) {}
       }
-    }
-
-    /**
-     * Verifies real UDP DNS resolution (`domain` A-record via `dnsServer:53`) through Xray's local
-     * SOCKS5 `UDP ASSOCIATE` inbound -> `dns-out` -> `tcp://1.1.1.1`. Returns `(resolvedIpv4OrNull, detail)`.
-     */
-    internal fun probeDnsViaSocksUdp(
-      proxyPort: Int,
-      domain: String = "i.instagram.com",
-      dnsServer: String = DeviceTunnelCalibrator.DIRECT_DNS_PRIMARY,
-      timeoutMs: Int = 3000,
-    ): Pair<String?, String> {
-      if (proxyPort <= 0) return null to "invalid_port"
-      val startedNs = System.nanoTime()
-      var tcpCtrl: Socket? = null
-      var udpSock: DatagramSocket? = null
-      return try {
-        tcpCtrl = Socket()
-        tcpCtrl.soTimeout = timeoutMs
-        tcpCtrl.connect(InetSocketAddress("127.0.0.1", proxyPort), timeoutMs)
-        val out = tcpCtrl.getOutputStream()
-        val inp = java.io.DataInputStream(tcpCtrl.getInputStream())
-
-        // 1. SOCKS5 greeting (no auth)
-        out.write(byteArrayOf(0x05, 0x01, 0x00))
-        out.flush()
-        val v = inp.readUnsignedByte()
-        val m = inp.readUnsignedByte()
-        if (v != 0x05 || m != 0x00) {
-          return null to "socks_greeting_rejected($v,$m)"
-        }
-
-        // 2. SOCKS5 UDP ASSOCIATE (0x03) with 0.0.0.0:0
-        out.write(byteArrayOf(0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-        out.flush()
-        val repVer = inp.readUnsignedByte()
-        val repCode = inp.readUnsignedByte()
-        inp.readUnsignedByte() // RSV
-        val atyp = inp.readUnsignedByte()
-        val relayHost =
-          when (atyp) {
-            0x01 -> {
-              val b = ByteArray(4)
-              inp.readFully(b)
-              val ip = b.joinToString(".") { (it.toInt() and 0xFF).toString() }
-              if (ip == "0.0.0.0") "127.0.0.1" else ip
-            }
-            0x03 -> {
-              val len = inp.readUnsignedByte()
-              val b = ByteArray(len)
-              inp.readFully(b)
-              String(b, Charsets.US_ASCII)
-            }
-            0x04 -> {
-              val b = ByteArray(16)
-              inp.readFully(b)
-              "127.0.0.1"
-            }
-            else -> return null to "udp_assoc_bad_atyp($atyp)"
-          }
-        val relayPort = inp.readUnsignedShort()
-        if (repVer != 0x05 || repCode != 0x00 || relayPort <= 0) {
-          return null to "udp_assoc_failed(rep=$repCode,port=$relayPort)"
-        }
-
-        // 3. Build DNS A query wrapped in SOCKS5 UDP header (RSV=0, FRAG=0, ATYP=IPv4, dst=dnsServer:53)
-        val dnsQuery = buildDnsAQueryPacket(domain)
-        val dnsIpBytes = InetAddress.getByName(dnsServer).address
-        val packetBytes = ByteArray(10 + dnsQuery.size)
-        packetBytes[3] = 0x01 // IPv4
-        System.arraycopy(dnsIpBytes, 0, packetBytes, 4, 4)
-        packetBytes[8] = 0x00
-        packetBytes[9] = 53.toByte()
-        System.arraycopy(dnsQuery, 0, packetBytes, 10, dnsQuery.size)
-
-        udpSock = DatagramSocket()
-        udpSock.soTimeout = timeoutMs
-        val relayAddr = InetAddress.getByName(relayHost)
-        udpSock.send(DatagramPacket(packetBytes, packetBytes.size, relayAddr, relayPort))
-
-        val respBuf = ByteArray(1024)
-        val respPkt = DatagramPacket(respBuf, respBuf.size)
-        udpSock.receive(respPkt)
-        val hdrLen =
-          if (respPkt.length >= 10 && respBuf[3].toInt() == 0x01) {
-            10
-          } else if (respPkt.length >= 22 && respBuf[3].toInt() == 0x04) {
-            22
-          } else {
-            return null to "udp_resp_short(${respPkt.length})"
-          }
-        val dnsPayload = respBuf.copyOfRange(hdrLen, respPkt.length)
-        val parsedIp = parseFirstIpv4FromDnsResponse(dnsPayload)
-        val ms = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
-        if (parsedIp != null) {
-          parsedIp to "OK -> $parsedIp (${ms}ms, relay=$relayHost:$relayPort)"
-        } else {
-          null to "dns_no_a_record(len=${dnsPayload.size}, ${ms}ms)"
-        }
-      } catch (e: Exception) {
-        null to "${e.javaClass.simpleName}: ${e.message ?: "timeout"}"
-      } finally {
-        try { udpSock?.close() } catch (_: Exception) {}
-        try { tcpCtrl?.close() } catch (_: Exception) {}
-      }
-    }
-
-    internal fun buildDnsAQueryPacket(domain: String): ByteArray {
-      val out = java.io.ByteArrayOutputStream(64)
-      // ID=0x4D45, Flags=0x0100 (RD), QDCOUNT=1, AN/NS/AR=0
-      out.write(byteArrayOf(0x4D, 0x45, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
-      for (label in domain.trim().trimEnd('.').split('.')) {
-        val bytes = label.toByteArray(Charsets.US_ASCII)
-        if (bytes.isEmpty() || bytes.size > 63) continue
-        out.write(bytes.size)
-        out.write(bytes)
-      }
-      out.write(0x00) // root terminator
-      out.write(byteArrayOf(0x00, 0x01, 0x00, 0x01)) // QTYPE=A, QCLASS=IN
-      return out.toByteArray()
-    }
-
-    internal fun parseFirstIpv4FromDnsResponse(dns: ByteArray): String? {
-      if (dns.size < 12) return null
-      val qdCount = ((dns[4].toInt() and 0xFF) shl 8) or (dns[5].toInt() and 0xFF)
-      val anCount = ((dns[6].toInt() and 0xFF) shl 8) or (dns[7].toInt() and 0xFF)
-      if (anCount <= 0) return null
-      var pos = 12
-      repeat(qdCount) {
-        while (pos < dns.size) {
-          val len = dns[pos].toInt() and 0xFF
-          if (len == 0) {
-            pos++
-            break
-          }
-          if ((len and 0xC0) == 0xC0) {
-            pos += 2
-            break
-          }
-          pos += 1 + len
-        }
-        pos += 4 // QTYPE + QCLASS
-      }
-      repeat(anCount) {
-        if (pos >= dns.size) return null
-        while (pos < dns.size) {
-          val len = dns[pos].toInt() and 0xFF
-          if (len == 0) {
-            pos++
-            break
-          }
-          if ((len and 0xC0) == 0xC0) {
-            pos += 2
-            break
-          }
-          pos += 1 + len
-        }
-        if (pos + 10 > dns.size) return null
-        val type = ((dns[pos].toInt() and 0xFF) shl 8) or (dns[pos + 1].toInt() and 0xFF)
-        val rdLen = ((dns[pos + 8].toInt() and 0xFF) shl 8) or (dns[pos + 9].toInt() and 0xFF)
-        pos += 10
-        if (type == 1 && rdLen == 4 && pos + 4 <= dns.size) {
-          return "${dns[pos].toInt() and 0xFF}.${dns[pos + 1].toInt() and 0xFF}.${dns[pos + 2].toInt() and 0xFF}.${dns[pos + 3].toInt() and 0xFF}"
-        }
-        pos += rdLen
-      }
-      return null
     }
 
     internal fun executeFailoverWithRollback(
@@ -2054,15 +1711,6 @@ class MehVpnService : VpnService() {
     val realtimeLogs: SharedFlow<VpnRealtimeLog> = _realtimeLogs.asSharedFlow()
 
     fun emitRealtimeLog(message: String, level: VpnLogLevel = VpnLogLevel.SYSTEM) {
-      val mappedCat =
-        when (level) {
-          VpnLogLevel.ERROR -> FullLogCategory.ERROR
-          VpnLogLevel.SCAN -> FullLogCategory.SERVER
-          VpnLogLevel.SOURCE -> FullLogCategory.NETWORK
-          VpnLogLevel.SUCCESS -> FullLogCategory.TUNNEL
-          VpnLogLevel.SYSTEM -> FullLogCategory.SYSTEM
-        }
-      MehFullLogger.log(mappedCat, message, isError = level == VpnLogLevel.ERROR)
       _realtimeLogs.tryEmit(VpnRealtimeLog(message = message, level = level))
     }
   }

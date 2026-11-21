@@ -102,13 +102,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.AppUpdateInfo
 import com.example.model.V2RayConfig
 import com.example.telemetry.MehTelemetry
-import com.example.ui.DeviceOptimizationSheet
-import com.example.ui.FullDiagnosticLogSheet
 import com.example.ui.HackerLogEntry
 import com.example.ui.MehPhase
 import com.example.ui.MehUiState
 import com.example.ui.MehViewModel
-import com.example.ui.TopCalibrationAndLogsBar
 import com.example.ui.theme.AmberPulse
 import com.example.ui.theme.CrimsonAlert
 import com.example.ui.theme.CyberCyan
@@ -138,21 +135,18 @@ class MainActivity : ComponentActivity() {
       MyApplicationTheme {
         val mehViewModel: MehViewModel = viewModel()
         val uiState by mehViewModel.uiState.collectAsStateWithLifecycle()
-        val fullLogs by mehViewModel.fullLogs.collectAsStateWithLifecycle()
         val context = LocalContext.current
         val lifecycleOwner = LocalLifecycleOwner.current
 
         LaunchedEffect(Unit) {
           mehViewModel.loadSavedLastServer(context)
           mehViewModel.refreshPrivateDnsStatus(context)
-          mehViewModel.runDeviceCalibration(context, trigger = "app_launch")
         }
 
         DisposableEffect(lifecycleOwner, context) {
           val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
               mehViewModel.refreshPrivateDnsStatus(context)
-              mehViewModel.runDeviceCalibration(context, trigger = "on_resume")
             }
           }
           lifecycleOwner.lifecycle.addObserver(observer)
@@ -170,8 +164,6 @@ class MainActivity : ComponentActivity() {
           }
 
         var showUpdateSheet by remember { mutableStateOf(false) }
-        var showCalibrationSheet by remember { mutableStateOf(false) }
-        var showFullLogsSheet by remember { mutableStateOf(false) }
 
         if (showUpdateSheet && uiState.updateInfo != null) {
           UpdateBottomSheet(
@@ -188,52 +180,8 @@ class MainActivity : ComponentActivity() {
           )
         }
 
-        if (showCalibrationSheet) {
-          DeviceOptimizationSheet(
-            snapshot = uiState.calibrationSnapshot,
-            selectedMode = uiState.selectedTunnelMode,
-            effectiveProfile = uiState.effectiveTunnelProfile,
-            onSelectMode = { mode ->
-              mehViewModel.selectTunnelMode(
-                context = context,
-                mode = mode,
-                onRequestVpnPermission = { prepareIntent ->
-                  vpnPermissionLauncher.launch(prepareIntent)
-                },
-              )
-            },
-            onRecalibrate = {
-              mehViewModel.runDeviceCalibration(context, trigger = "manual_recalibrate")
-            },
-            onOpenFullLogs = {
-              showCalibrationSheet = false
-              mehViewModel.captureFullLogSnapshot(context)
-              showFullLogsSheet = true
-            },
-            onDismiss = { showCalibrationSheet = false },
-          )
-        }
-
-        if (showFullLogsSheet) {
-          FullDiagnosticLogSheet(
-            entries = fullLogs,
-            onRefreshSnapshot = { mehViewModel.captureFullLogSnapshot(context) },
-            onClearLogs = { mehViewModel.clearFullLogs() },
-            onDismiss = { showFullLogsSheet = false },
-          )
-        }
-
         MehMinimalScreen(
           uiState = uiState,
-          fullLogCount = fullLogs.size,
-          onOpenCalibration = {
-            mehViewModel.runDeviceCalibration(context, trigger = "open_sheet")
-            showCalibrationSheet = true
-          },
-          onOpenFullLogs = {
-            mehViewModel.captureFullLogSnapshot(context)
-            showFullLogsSheet = true
-          },
           onUpdateClick = { showUpdateSheet = true },
           onOpenPrivateDnsSettings = { PrivateDnsDetector.openPrivateDnsSettings(context) },
           onPowerToggle = {
@@ -267,9 +215,6 @@ fun MehMinimalScreen(
   onNextServer: () -> Unit = {},
   onUpdateClick: () -> Unit = {},
   onOpenPrivateDnsSettings: () -> Unit = {},
-  fullLogCount: Int = 0,
-  onOpenCalibration: () -> Unit = {},
-  onOpenFullLogs: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor by
@@ -329,18 +274,10 @@ fun MehMinimalScreen(
             modifier =
               Modifier.fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(top = 10.dp, bottom = 8.dp),
+                .padding(top = 12.dp, bottom = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
           ) {
-            TopCalibrationAndLogsBar(
-              effectiveProfile = uiState.effectiveTunnelProfile,
-              selectedMode = uiState.selectedTunnelMode,
-              logCount = fullLogCount,
-              onOpenCalibration = onOpenCalibration,
-              onOpenFullLogs = onOpenFullLogs,
-            )
-
             androidx.compose.animation.AnimatedVisibility(
               visible = uiState.updateInfo != null,
               enter = fadeIn(tween(320)) + expandVertically(tween(320)),

@@ -21,16 +21,4 @@
     <string name="private_dns_warning_body">ممکن است مانع عبور از فیلترینگ شود؛ در تنظیمات روی خاموش یا خودکار بگذارید.</string>
     <string name="private_dns_warning_iranian_body">DNS داخلی (%1$s) جلوی عبور از فیلترینگ را می‌گیرد؛ آن را خاموش کنید.</string>
     <string name="private_dns_open_settings">تنظیمات</string>
-    <string name="device_optimize_button">بهینه‌سازی</string>
-    <string name="full_logs_button">لاگ کامل</string>
-    <string name="calibration_sheet_title">بهینه‌سازی دستگاه و حالت تونل</string>
-    <string name="calibration_sheet_subtitle">تنظیم خودکار بر اساس مدل گوشی، نسخه اندروید و شبکه</string>
-    <string name="calibration_recalibrate_btn">تحلیل و بهینه‌سازی مجدد</string>
-    <string name="calibration_view_logs_btn">مشاهده لاگ جامع نرم‌افزار</string>
-    <string name="full_logs_sheet_title">لاگ جامع و ریزبه‌ریز نرم‌افزار</string>
-    <string name="full_logs_copy_all">کپی کامل</string>
-    <string name="full_logs_copied">کپی شد ✓</string>
-    <string name="full_logs_refresh">ثبت وضعیت</string>
-    <string name="full_logs_clear">پاک کردن</string>
-    <string name="full_logs_empty">هنوز لاگی ثبت نشده است.</string>
 </resources>
