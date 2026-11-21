@@ -469,8 +469,7 @@ object GfwKnockerXrayCore {
             "name": "tun0",
             "mtu": ${tunMtu.coerceIn(1280, 1500)},
             "gateway": [
-              "10.10.14.1/24",
-              "fd00::10:10:14:1/64"
+              "10.10.14.1/30"
             ],
             "userLevel": 8
           },
@@ -548,10 +547,10 @@ object GfwKnockerXrayCore {
           "tag": "dns-internal",
           "queryStrategy": "UseIPv4",
           "servers": [
-            "1.1.1.1",
-            "8.8.8.8",
             "tcp://1.1.1.1",
             "tcp://8.8.8.8",
+            "1.1.1.1",
+            "8.8.8.8",
             {
               "address": "localhost",
               "domains": [
@@ -640,6 +639,15 @@ object GfwKnockerXrayCore {
             {
               "type": "field",
               "ip": [
+                "10.10.14.2/32",
+                "198.18.0.2/32"
+              ],
+              "port": "853",
+              "outboundTag": "block"
+            },
+            {
+              "type": "field",
+              "ip": [
                 "10.0.0.0/8",
                 "172.16.0.0/12",
                 "192.168.0.0/16",
@@ -677,49 +685,50 @@ object GfwKnockerXrayCore {
   }
 
   /**
-   * Builds the `hev-socks5-tunnel` YAML config that bridges Android's TUN interface to Xray's
-   * local SOCKS5 inbound with built-in `mapdns` (fake-IP -> domain-name SOCKS5 CONNECT), matching
-   * v2rayNG / MahsaNG default IPv4-only mode so all apps resolve domains remotely through the proxy
-   * with zero DNS stall.
+   * Builds the `hev-socks5-tunnel` YAML config bridging Android's TUN interface to Xray's local
+   * SOCKS5 inbound. Supports both:
+   * - `enableMapDns = false` (v2rayNG standard real-DNS mode; TUN DNS = 1.1.1.1/8.8.8.8 -> Xray dns-out)
+   * - `enableMapDns = true` (safe RFC 2544 `198.18.0.0/15` mapdns, avoiding CGNAT `100.64.0.0/10`
+   *   collisions on Hamrah-e Aval cellular interfaces and Class E `240.0.0.0/4` rejections).
    *
-   * IMPORTANT: `tunIpv6` MUST stay `null` by default! `mapdns` is IPv4-only and cannot synthesize
-   * AAAA records, and most free V2Ray nodes lack IPv6 egress. Omitting IPv6 from `VpnService.Builder`
-   * (without calling `allowFamily(AF_INET6)`) causes Android to fail IPv6 fast (`ENETUNREACH`),
-   * preventing IPv6 leaks while forcing every app onto fast IPv4 + `mapdns`.
+   * IMPORTANT: `tunIpv6` MUST stay `null` by default so Android fails IPv6 fast (`ENETUNREACH`)
+   * without leaks or AAAA stalls on IPv4-only free V2Ray nodes.
    */
   fun buildHevSocks5TunnelYaml(
     socksPort: Int,
     tunMtu: Int = 1400,
-    tunIpv4: String = "10.10.14.1",
-    mapDnsAddress: String = "10.10.14.2",
+    tunIpv4: String = DeviceTunnelCalibrator.SAFE_MAPDNS_TUN_IPV4,
+    mapDnsAddress: String = DeviceTunnelCalibrator.SAFE_MAPDNS_DNS_ADDR,
     tunIpv6: String? = null,
+    enableMapDns: Boolean = true,
+    mapDnsNetwork: String = DeviceTunnelCalibrator.SAFE_MAPDNS_NETWORK,
+    mapDnsNetmask: String = DeviceTunnelCalibrator.SAFE_MAPDNS_NETMASK,
   ): String {
-    val ipv6Line =
-      if (!tunIpv6.isNullOrBlank()) {
-        "\n        ipv6: '$tunIpv6'"
-      } else {
-        ""
-      }
-    return """
-      tunnel:
-        mtu: ${tunMtu.coerceIn(1280, 8500)}
-        ipv4: $tunIpv4$ipv6Line
-      socks5:
-        port: $socksPort
-        address: 127.0.0.1
-        udp: 'udp'
-      mapdns:
-        address: $mapDnsAddress
-        port: 53
-        network: 100.64.0.0
-        netmask: 255.192.0.0
-        cache-size: 10000
-      misc:
-        task-stack-size: 81920
-        connect-timeout: 10000
-        read-write-timeout: 60000
-        log-level: warn
-    """.trimIndent() + "\n"
+    val sb = StringBuilder(256)
+    sb.appendLine("tunnel:")
+    sb.appendLine("  mtu: ${tunMtu.coerceIn(1280, 8500)}")
+    sb.appendLine("  ipv4: $tunIpv4")
+    if (!tunIpv6.isNullOrBlank()) {
+      sb.appendLine("  ipv6: '$tunIpv6'")
+    }
+    sb.appendLine("socks5:")
+    sb.appendLine("  port: $socksPort")
+    sb.appendLine("  address: 127.0.0.1")
+    sb.appendLine("  udp: 'udp'")
+    if (enableMapDns) {
+      sb.appendLine("mapdns:")
+      sb.appendLine("  address: $mapDnsAddress")
+      sb.appendLine("  port: 53")
+      sb.appendLine("  network: $mapDnsNetwork")
+      sb.appendLine("  netmask: $mapDnsNetmask")
+      sb.appendLine("  cache-size: 10000")
+    }
+    sb.appendLine("misc:")
+    sb.appendLine("  task-stack-size: 81920")
+    sb.appendLine("  connect-timeout: 10000")
+    sb.appendLine("  read-write-timeout: 60000")
+    sb.appendLine("  log-level: warn")
+    return sb.toString()
   }
 
   private fun jsonStr(value: String): String = "\"${escapeJson(value)}\""

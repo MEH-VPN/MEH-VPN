@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.content.Context
 import android.content.Intent
+import android.net.VpnService
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -16,9 +17,16 @@ import com.example.model.V2RayConfigParser
 import com.example.telemetry.MehTelemetry
 import com.example.vpn.BackgroundServerScanScheduler
 import com.example.vpn.BackgroundServerScannerJobService
+import com.example.vpn.DeviceCalibrationSnapshot
+import com.example.vpn.DeviceTunnelCalibrator
+import com.example.vpn.FullLogCategory
+import com.example.vpn.FullLogEntry
+import com.example.vpn.MehFullLogger
 import com.example.vpn.MehVpnService
 import com.example.vpn.PrivateDnsDetector
 import com.example.vpn.PrivateDnsStatus
+import com.example.vpn.TunnelModePreference
+import com.example.vpn.TunnelProfile
 import com.example.vpn.V2RayOutboundClient
 import java.util.ArrayList
 import java.util.concurrent.atomic.AtomicLong
@@ -69,6 +77,9 @@ data class MehUiState(
   val activeMethod: MehConnectionMethod? = null,
   val updateInfo: AppUpdateInfo? = null,
   val privateDnsStatus: PrivateDnsStatus = PrivateDnsStatus(),
+  val calibrationSnapshot: DeviceCalibrationSnapshot? = null,
+  val selectedTunnelMode: TunnelModePreference = TunnelModePreference.AUTO,
+  val effectiveTunnelProfile: TunnelProfile = TunnelProfile.HEV_DIRECT_DNS,
 ) {
   val isBusy: Boolean
     get() =
@@ -98,6 +109,7 @@ class MehViewModel(
 
   private val _uiState = MutableStateFlow(MehUiState())
   val uiState: StateFlow<MehUiState> = _uiState.asStateFlow()
+  val fullLogs: StateFlow<List<FullLogEntry>> = MehFullLogger.entries
 
   private var workflowJob: Job? = null
   private var pendingCandidatesForPermission: List<V2RayConfig> = emptyList()
@@ -120,7 +132,7 @@ class MehViewModel(
             com.example.vpn.VpnLogLevel.SCAN -> HackerLogLevel.SCAN
             com.example.vpn.VpnLogLevel.SYSTEM -> HackerLogLevel.SYSTEM
           }
-        appendLogLine(message = event.message, level = mappedLevel)
+        appendLogLine(message = event.message, level = mappedLevel, mirrorToFullLog = false)
       }
     }
 
@@ -216,9 +228,77 @@ class MehViewModel(
     }
   }
 
+  /** Runs initial/manual device & network calibration and refreshes the UI profile badge. */
+  fun runDeviceCalibration(context: Context, trigger: String = "app_launch") {
+    viewModelScope.launch(Dispatchers.IO) {
+      val snapshot = DeviceTunnelCalibrator.runInitialCalibration(context, trigger)
+      val mode = DeviceTunnelCalibrator.getSelectedMode(context)
+      val effective = mode.toLockedProfileOrNull() ?: snapshot.recommendedProfile
+      _uiState.update { current ->
+        current.copy(
+          calibrationSnapshot = snapshot,
+          selectedTunnelMode = mode,
+          effectiveTunnelProfile = effective,
+        )
+      }
+    }
+  }
+
+  /** Persists a new tunnel mode preference; if currently connected, reconnects cleanly to apply it. */
+  fun selectTunnelMode(
+    context: Context,
+    mode: TunnelModePreference,
+    onRequestVpnPermission: (Intent) -> Unit,
+  ) {
+    DeviceTunnelCalibrator.setSelectedMode(context, mode)
+    val snapshot = DeviceTunnelCalibrator.inspectDeviceAndNetwork(context)
+    val effective = mode.toLockedProfileOrNull() ?: snapshot.recommendedProfile
+    _uiState.update { current ->
+      current.copy(
+        calibrationSnapshot = snapshot,
+        selectedTunnelMode = mode,
+        effectiveTunnelProfile = effective,
+      )
+    }
+    if (_uiState.value.phase == MehPhase.CONNECTED) {
+      val activeCandidates =
+        (listOfNotNull(_uiState.value.selectedConfig) + cachedLastCandidates)
+          .distinctBy { it.endpointKey }
+      if (activeCandidates.isNotEmpty()) {
+        MehFullLogger.log(
+          FullLogCategory.CALIBRATION,
+          "Reconnecting active VPN session to apply new tunnel profile: ${effective.id}",
+        )
+        val prepareIntent = VpnService.prepare(context)
+        if (prepareIntent != null) {
+          pendingCandidatesForPermission = activeCandidates
+          onRequestVpnPermission(prepareIntent)
+        } else {
+          launchVpnService(context, activeCandidates)
+        }
+      }
+    }
+  }
+
+  fun captureFullLogSnapshot(context: Context) {
+    viewModelScope.launch(Dispatchers.IO) {
+      MehFullLogger.recordLiveTelemetrySnapshot(context, "manual_refresh")
+    }
+  }
+
+  fun clearFullLogs() {
+    MehFullLogger.clear()
+  }
+
   fun loadSavedLastServer(context: Context) {
     try {
-      VerifiedServerPoolStore.resetCachesIfAppUpdated(context, com.example.BuildConfig.VERSION_CODE)
+      val reset = VerifiedServerPoolStore.resetCachesIfAppUpdated(context, com.example.BuildConfig.VERSION_CODE)
+      if (reset) {
+        MehFullLogger.log(
+          FullLogCategory.SYSTEM,
+          "In-place APK update detected -> cleared stale server pool, last-server cache, and dead-server blacklist",
+        )
+      }
       val prefs = context.applicationContext.getSharedPreferences(PREFS_LAST_SERVER, Context.MODE_PRIVATE)
       val rawJson = prefs.getString(KEY_SAVED_CANDIDATES_JSON, null)
       if (rawJson.isNullOrBlank()) return
@@ -294,9 +374,21 @@ class MehViewModel(
   private fun appendLogLine(
     message: String,
     level: HackerLogLevel = HackerLogLevel.SYSTEM,
+    mirrorToFullLog: Boolean = true,
   ) {
     val cleanMsg = message.trim()
     if (cleanMsg.isEmpty()) return
+    if (mirrorToFullLog) {
+      val fullCat =
+        when (level) {
+          HackerLogLevel.ERROR -> FullLogCategory.ERROR
+          HackerLogLevel.SCAN -> FullLogCategory.SERVER
+          HackerLogLevel.SOURCE -> FullLogCategory.NETWORK
+          HackerLogLevel.SUCCESS -> FullLogCategory.TUNNEL
+          HackerLogLevel.SYSTEM -> FullLogCategory.SYSTEM
+        }
+      MehFullLogger.log(fullCat, cleanMsg, isError = level == HackerLogLevel.ERROR)
+    }
     if (cleanMsg == LOG_FETCHING ||
       cleanMsg == LOG_TESTING ||
       cleanMsg == LOG_CONNECTING ||
